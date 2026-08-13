@@ -176,6 +176,60 @@ interface Vm {
         uint256 created;
     }
 
+    /// A single frame of an EIP-8141 frame transaction, as reported by `FRAMEPARAM`
+    /// and `FRAMEDATALOAD`/`FRAMEDATACOPY`.
+    struct FrameTxFrame {
+        /// Frame mode: 0 DEFAULT, 1 VERIFY, 2 SENDER.
+        uint8 mode;
+        /// Frame flags. The low two bits are the approval scope.
+        uint8 flags;
+        /// The frame's target, already resolved (a null target resolves to the sender).
+        address target;
+        /// Gas limit allotted to the frame.
+        uint64 gasLimit;
+        /// Value transferred by the frame.
+        uint256 value;
+        /// Calldata supplied to the frame.
+        bytes data;
+        /// Execution status: 0 failed, 1 success, 2 skipped. Only meaningful for a
+        /// frame before the one currently executing.
+        uint8 status;
+    }
+
+    /// A signature entry of an EIP-8141 frame transaction, as reported by `SIGPARAM`.
+    struct FrameTxSignature {
+        /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256.
+        uint8 scheme;
+        /// The signer, already resolved. Ignored for ARBITRARY entries, which have
+        /// no protocol-assigned signer.
+        address signer;
+        /// Explicit 32-byte digest, or zero when the entry signs the canonical hash.
+        bytes32 msgHash;
+        /// Raw signature bytes. Only readable for ARBITRARY entries.
+        bytes signature;
+    }
+
+    /// An EIP-8141 frame transaction context. Passed to `setFrameTx`.
+    struct FrameTx {
+        /// The declared sender.
+        address sender;
+        /// The sender's nonce.
+        uint64 nonce;
+        /// The canonical signature hash, reported by `TXPARAM(0x08)`.
+        bytes32 sigHash;
+        /// Maximum cost the payer may be charged, reported by `TXPARAM(0x06)`.
+        uint256 maxCost;
+        /// Index of the frame currently executing, reported by `TXPARAM(0x0A)`.
+        uint64 frameIndex;
+        /// Scopes `APPROVE` may grant, mirroring `frame.flags & 0x3`. A frame that
+        /// asks for anything outside this reverts, as the protocol requires.
+        uint64 approvableScopes;
+        /// Every frame in the transaction, in order.
+        FrameTxFrame[] frames;
+        /// Every signature entry, in order.
+        FrameTxSignature[] signatures;
+    }
+
     /// A wallet with a public and private key.
     struct Wallet {
         /// The wallet's address.
@@ -529,6 +583,17 @@ interface Vm {
     /// Sets `block.chainid`.
     #[cheatcode(group = Evm, safety = Unsafe)]
     function chainId(uint256 newChainId) external;
+
+    /// Installs an EIP-8141 frame transaction context, so that the frame opcodes
+    /// (`APPROVE`, `TXPARAM`, `FRAMEDATALOAD`, `FRAMEDATACOPY`, `FRAMEPARAM`,
+    /// `SIGPARAM`) resolve. Without a context they halt, which is what the spec
+    /// requires outside a frame transaction.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function setFrameTx(FrameTx calldata frameTx) external;
+
+    /// Removes the EIP-8141 frame transaction context. The frame opcodes halt again.
+    #[cheatcode(group = Evm, safety = Unsafe)]
+    function clearFrameTx() external;
 
     /// Sets `block.coinbase`.
     #[cheatcode(group = Evm, safety = Unsafe)]

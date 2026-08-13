@@ -5,6 +5,7 @@ use crate::{
     Vm::*, inspector::RecordDebugStepInfo,
 };
 use alloy_consensus::transaction::SignerRecoverable;
+use revm::context_interface::host::{FrameInfo, FrameSigInfo, FrameTxContext};
 use alloy_evm::FromRecoveredTx;
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_network::eip2718::EIP4844_TX_TYPE_ID;
@@ -568,6 +569,61 @@ impl Cheatcode for chainIdCall {
         let Self { newChainId } = self;
         ensure!(*newChainId <= U256::from(u64::MAX), "chain ID must be less than 2^64");
         ccx.ecx.cfg_env_mut().chain_id = newChainId.to();
+        Ok(Default::default())
+    }
+}
+
+impl Cheatcode for setFrameTxCall {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self { frameTx } = self;
+        let frames = frameTx
+            .frames
+            .iter()
+            .map(|f| FrameInfo {
+                resolved_target: f.target,
+                gas_limit: f.gasLimit,
+                mode: f.mode,
+                flags: f.flags,
+                value: f.value,
+                status: f.status,
+                data: f.data.clone(),
+            })
+            .collect();
+        let signatures = frameTx
+            .signatures
+            .iter()
+            .map(|sig| FrameSigInfo {
+                // ARBITRARY entries have no protocol-assigned signer, so the
+                // address field is ignored rather than reported as the signer.
+                resolved_signer: (sig.scheme != 0).then_some(sig.signer),
+                scheme: sig.scheme,
+                msg: sig.msgHash,
+                signature: sig.signature.clone(),
+            })
+            .collect();
+        ccx.ecx.tx_mut().frame_tx = Some(FrameTxContext {
+            sender: frameTx.sender,
+            nonce: frameTx.nonce,
+            sig_hash: frameTx.sigHash,
+            max_cost: frameTx.maxCost,
+            max_priority_fee_per_gas: U256::ZERO,
+            max_fee_per_gas: U256::ZERO,
+            max_fee_per_blob_gas: U256::ZERO,
+            blob_count: 0,
+            frame_index: frameTx.frameIndex,
+            frames,
+            signatures,
+            approvable_scopes: frameTx.approvableScopes,
+            approved_scope: 0,
+        });
+        Ok(Default::default())
+    }
+}
+
+impl Cheatcode for clearFrameTxCall {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+        let Self {} = self;
+        ccx.ecx.tx_mut().frame_tx = None;
         Ok(Default::default())
     }
 }

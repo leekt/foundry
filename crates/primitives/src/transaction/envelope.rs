@@ -1,8 +1,8 @@
 #[cfg(feature = "optimism")]
-use alloy_consensus::{Sealed, Transaction as _};
+use alloy_consensus::Transaction as _;
 use alloy_consensus::{
-    SignableTransaction, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope, TxLegacy,
-    TxType, Typed2718,
+    Sealed, SignableTransaction, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope,
+    TxLegacy, TxType, Typed2718,
     crypto::RecoveryError,
     transaction::{
         SignerRecoverable, TxEip7702, TxHashRef,
@@ -18,6 +18,8 @@ use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, POST_EXEC_TX_TYPE_ID, TxDeposit, Tx
 use revm::context::TxEnv;
 use tempo_primitives::{AASigned, TempoSignature, TempoTransaction};
 use tempo_revm::TempoTxEnv;
+
+use super::frame::TxFrame;
 
 //
 /// Container type for signed, typed transactions.
@@ -67,6 +69,14 @@ pub enum FoundryTxEnvelope {
     /// See <https://docs.tempo.xyz/protocol/transactions>.
     #[envelope(ty = 0x76, typed = TempoTransaction)]
     Tempo(AASigned),
+    /// [EIP-8141] frame transaction.
+    ///
+    /// Carries an explicit `sender` and no outer ECDSA signature, so it is
+    /// sealed with its hash rather than signed.
+    ///
+    /// [EIP-8141]: https://eips.ethereum.org/EIPS/eip-8141
+    #[envelope(ty = 6, typed = TxFrame)]
+    Frame(Sealed<TxFrame>),
 }
 
 impl FoundryTxEnvelope {
@@ -129,6 +139,7 @@ impl FoundryTxEnvelope {
             #[cfg(feature = "optimism")]
             Self::PostExec(_) => Err(self),
             Self::Tempo(_) => Err(self),
+            Self::Frame(_) => Err(self),
         }
     }
 
@@ -168,6 +179,20 @@ impl FoundryTxEnvelope {
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => t.tx_hash(),
             Self::Tempo(t) => *t.hash(),
+            Self::Frame(t) => t.hash(),
+        }
+    }
+
+    /// Returns `true` if this is an EIP-8141 frame transaction.
+    pub const fn is_frame(&self) -> bool {
+        matches!(self, Self::Frame(_))
+    }
+
+    /// Returns the inner frame transaction, if this is one.
+    pub const fn as_frame(&self) -> Option<&TxFrame> {
+        match self {
+            Self::Frame(tx) => Some(tx.inner()),
+            _ => None,
         }
     }
 
@@ -194,6 +219,10 @@ impl FoundryTxEnvelope {
             #[cfg(feature = "optimism")]
             Self::PostExec(tx) => tx.inner().signer_address(),
             Self::Tempo(tx) => tx.signature().recover_signer(&tx.signature_hash())?,
+            // EIP-8141: the sender is declared in the envelope and there is no
+            // outer ECDSA signature to recover from. Authentication happens
+            // inside the frames, against the signature entries.
+            Self::Frame(tx) => tx.inner().sender,
         })
     }
 }
@@ -214,6 +243,11 @@ impl FoundryTxType {
     /// Returns `true` if this is a Tempo transaction type.
     pub const fn is_tempo(&self) -> bool {
         matches!(self, Self::Tempo)
+    }
+
+    /// Returns `true` if this is an EIP-8141 frame transaction type.
+    pub const fn is_frame(&self) -> bool {
+        matches!(self, Self::Frame)
     }
 }
 
@@ -243,6 +277,9 @@ impl FoundryTypedTx {
                 let tempo_sig: TempoSignature = signature.into();
                 FoundryTxEnvelope::Tempo(tx.into_signed(tempo_sig))
             }
+            // A frame transaction has no outer signature to fake: its sender is
+            // already explicit, so impersonation is just sealing it as-is.
+            Self::Frame(tx) => FoundryTxEnvelope::Frame(Sealed::new(tx)),
         }
     }
 
@@ -262,6 +299,11 @@ impl FoundryTypedTx {
     pub const fn is_tempo(&self) -> bool {
         matches!(self, Self::Tempo(_))
     }
+
+    /// Returns `true` if this is an EIP-8141 frame transaction.
+    pub const fn is_frame(&self) -> bool {
+        matches!(self, Self::Frame(_))
+    }
 }
 
 impl TxHashRef for FoundryTxEnvelope {
@@ -277,6 +319,7 @@ impl TxHashRef for FoundryTxEnvelope {
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => t.hash_ref(),
             Self::Tempo(t) => t.hash(),
+            Self::Frame(t) => t.hash_ref(),
         }
     }
 }
@@ -419,7 +462,30 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
                 }
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Ethereum context"),
+            FoundryTxEnvelope::Frame(sealed_tx) => frame_tx_env(sealed_tx.inner(), caller),
         }
+    }
+}
+
+/// Builds the transaction-scoped environment for a frame transaction.
+///
+/// A frame transaction has no top-level call: each frame is executed as its own
+/// top-level call with its own target, calldata and caller. This env therefore
+/// carries only the transaction-wide fields, and the executor overrides the
+/// call-shaped ones per frame.
+pub fn frame_tx_env(tx: &TxFrame, caller: Address) -> TxEnv {
+    TxEnv {
+        tx_type: super::frame::FRAME_TX_TYPE_ID,
+        caller,
+        gas_limit: tx.max_gas(),
+        gas_price: tx.max_fee_per_gas(),
+        gas_priority_fee: tx.max_priority_fee_per_gas(),
+        max_fee_per_blob_gas: tx.max_fee_per_blob_gas().unwrap_or_default(),
+        blob_hashes: tx.blob_versioned_hashes.clone(),
+        chain_id: tx.chain_id(),
+        nonce: tx.nonce,
+        kind: alloy_primitives::TxKind::Call(tx.sender),
+        ..Default::default()
     }
 }
 
@@ -452,6 +518,9 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TempoTxEnv {
             #[cfg(feature = "optimism")]
             FoundryTxEnvelope::PostExec(_) => unreachable!("Post-exec tx in Tempo context"),
             FoundryTxEnvelope::Tempo(aa_signed) => Self::from_recovered_tx(aa_signed, caller),
+            FoundryTxEnvelope::Frame(sealed_tx) => {
+                Self::from(frame_tx_env(sealed_tx.inner(), caller))
+            }
         }
     }
 }
@@ -475,6 +544,7 @@ impl std::fmt::Display for FoundryTxType {
             #[cfg(feature = "optimism")]
             Self::PostExec => write!(f, "post-exec"),
             Self::Tempo => write!(f, "tempo"),
+            Self::Frame => write!(f, "frame"),
         }
     }
 }
@@ -504,6 +574,7 @@ impl From<FoundryTxEnvelope> for FoundryTypedTx {
             #[cfg(feature = "optimism")]
             FoundryTxEnvelope::PostExec(sealed_tx) => Self::PostExec(sealed_tx.into_inner()),
             FoundryTxEnvelope::Tempo(signed_tx) => Self::Tempo(signed_tx.strip_signature()),
+            FoundryTxEnvelope::Frame(sealed_tx) => Self::Frame(sealed_tx.into_inner()),
         }
     }
 }

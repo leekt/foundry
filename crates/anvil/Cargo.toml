@@ -76,6 +76,10 @@ revm = { workspace = true, features = [
     "serde",
     "memory_limit",
     "c-kzg",
+    # EIP-8141 runs each frame as its own top-level call priced at zero: the
+    # payer is charged once for the whole transaction after every frame has run.
+    "optional_no_base_fee",
+    "optional_fee_charge",
 ] }
 revm-inspectors.workspace = true
 op-revm = { workspace = true, optional = true }

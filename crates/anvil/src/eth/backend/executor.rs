@@ -158,6 +158,7 @@ impl FoundryReceiptBuilder {
             #[cfg(feature = "optimism")]
             FoundryTxType::PostExec => FoundryReceiptEnvelope::PostExec(receipt),
             FoundryTxType::Tempo => FoundryReceiptEnvelope::Tempo(receipt),
+            FoundryTxType::Frame => FoundryReceiptEnvelope::Frame(receipt),
         }
     }
 

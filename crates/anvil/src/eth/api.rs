@@ -4911,6 +4911,15 @@ impl EthApi<FoundryNetwork> {
             )),
             FoundryTxEnvelope::Legacy(_) => Ok(()),
             FoundryTxEnvelope::Tempo(_) => self.backend.ensure_tempo_active(),
+            // EIP-8141 envelopes are self-authenticating, so reject a malformed
+            // one here rather than letting it reach the pool. Every submission
+            // path funnels through this function, so one check covers them all.
+            FoundryTxEnvelope::Frame(tx) => {
+                let tx = tx.inner();
+                tx.validate()
+                    .and_then(|()| tx.validate_signatures())
+                    .map_err(|err| BlockchainError::InvalidTransactionRequest(err.to_string()))
+            }
         }
     }
 

@@ -6238,6 +6238,7 @@ name = "foundry-primitives"
 version = "1.8.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-evm",
  "alloy-network",
  "alloy-op-evm",
@@ -6258,6 +6259,7 @@ dependencies = [
  "tempo-alloy",
  "tempo-primitives",
  "tempo-revm",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

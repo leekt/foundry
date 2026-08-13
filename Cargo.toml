@@ -577,6 +577,8 @@ revm-interpreter = { git = "https://github.com/leekt/revm", branch = "feat/eip81
 revm-precompile = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
 revm-primitives = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
 revm-state = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
+# TxEnv gained a frame_tx field, which alloy-evm constructs literally.
+alloy-evm = { git = "https://github.com/leekt/evm", branch = "feat/eip8141-frame-tx" }
 solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-cli = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-lint = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }

@@ -7,6 +7,7 @@ mod eip2935;
 mod eip4844;
 mod eip7702;
 mod fork;
+mod frame_tx;
 mod gas;
 mod genesis;
 mod ipc;

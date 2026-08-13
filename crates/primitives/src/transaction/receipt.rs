@@ -15,7 +15,7 @@ use op_alloy_consensus::{
 use serde::{Deserialize, Serialize};
 use tempo_primitives::TEMPO_TX_TYPE_ID;
 
-use crate::FoundryTxType;
+use crate::{FoundryTxType, transaction::frame::FRAME_TX_TYPE_ID};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -38,6 +38,9 @@ pub enum FoundryReceiptEnvelope<T = Log> {
     Deposit(OpDepositReceiptWithBloom<T>),
     #[serde(rename = "0x76")]
     Tempo(ReceiptWithBloom<Receipt<T>>),
+    /// EIP-8141 frame transaction receipt.
+    #[serde(rename = "0x6", alias = "0x06")]
+    Frame(ReceiptWithBloom<Receipt<T>>),
 }
 
 impl FoundryReceiptEnvelope<alloy_rpc_types::Log> {
@@ -89,6 +92,9 @@ impl FoundryReceiptEnvelope<alloy_rpc_types::Log> {
             }
             FoundryTxType::Tempo => {
                 Self::Tempo(ReceiptWithBloom { receipt: inner_receipt, logs_bloom })
+            }
+            FoundryTxType::Frame => {
+                Self::Frame(ReceiptWithBloom { receipt: inner_receipt, logs_bloom })
             }
         }
     }
@@ -152,6 +158,11 @@ impl<T> FoundryReceiptEnvelope<T> {
         matches!(self, Self::Tempo(_))
     }
 
+    /// Returns `true` if this is an EIP-8141 frame receipt.
+    pub const fn is_frame(&self) -> bool {
+        matches!(self, Self::Frame(_))
+    }
+
     /// Return the [`FoundryTxType`] of the inner receipt.
     pub const fn tx_type(&self) -> FoundryTxType {
         match self {
@@ -165,6 +176,7 @@ impl<T> FoundryReceiptEnvelope<T> {
             #[cfg(feature = "optimism")]
             Self::Deposit(_) => FoundryTxType::Deposit,
             Self::Tempo(_) => FoundryTxType::Tempo,
+            Self::Frame(_) => FoundryTxType::Frame,
         }
     }
 
@@ -195,6 +207,7 @@ impl<T> FoundryReceiptEnvelope<T> {
                 r.map_receipt(|r: OpDepositReceipt<T>| r.map_logs(f)),
             ),
             Self::Tempo(r) => FoundryReceiptEnvelope::Tempo(r.map_logs(f)),
+            Self::Frame(r) => FoundryReceiptEnvelope::Frame(r.map_logs(f)),
         }
     }
 
@@ -221,6 +234,7 @@ impl<T> FoundryReceiptEnvelope<T> {
             #[cfg(feature = "optimism")]
             Self::Deposit(t) => &t.logs_bloom,
             Self::Tempo(t) => &t.logs_bloom,
+            Self::Frame(t) => &t.logs_bloom,
         }
     }
 
@@ -232,7 +246,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             | Self::Eip1559(t)
             | Self::Eip4844(t)
             | Self::Eip7702(t)
-            | Self::Tempo(t) => t.receipt,
+            | Self::Tempo(t)
+            | Self::Frame(t) => t.receipt,
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => t.receipt,
             #[cfg(feature = "optimism")]
@@ -248,7 +263,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             | Self::Eip1559(t)
             | Self::Eip4844(t)
             | Self::Eip7702(t)
-            | Self::Tempo(t) => &t.receipt,
+            | Self::Tempo(t)
+            | Self::Frame(t) => &t.receipt,
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => &t.receipt,
             #[cfg(feature = "optimism")]
@@ -306,6 +322,7 @@ impl Encodable for FoundryReceiptEnvelope {
                     #[cfg(feature = "optimism")]
                     Self::Deposit(r) => r.length() + 1,
                     Self::Tempo(r) => r.length() + 1,
+                    Self::Frame(r) => r.length() + 1,
                     _ => unreachable!("receipt already matched"),
                 };
 
@@ -345,6 +362,11 @@ impl Encodable for FoundryReceiptEnvelope {
                     Self::Tempo(r) => {
                         Header { list: true, payload_length: payload_len }.encode(out);
                         TEMPO_TX_TYPE_ID.encode(out);
+                        r.encode(out);
+                    }
+                    Self::Frame(r) => {
+                        Header { list: true, payload_length: payload_len }.encode(out);
+                        FRAME_TX_TYPE_ID.encode(out);
                         r.encode(out);
                     }
                     _ => unreachable!("receipt already matched"),
@@ -389,6 +411,9 @@ impl Decodable for FoundryReceiptEnvelope {
                     buf.advance(1);
                     <ReceiptWithBloom as Decodable>::decode(buf)
                         .map(FoundryReceiptEnvelope::Eip7702)
+                } else if receipt_type == FRAME_TX_TYPE_ID {
+                    buf.advance(1);
+                    <ReceiptWithBloom as Decodable>::decode(buf).map(FoundryReceiptEnvelope::Frame)
                 } else if receipt_type == TEMPO_TX_TYPE_ID {
                     buf.advance(1);
                     <ReceiptWithBloom as Decodable>::decode(buf).map(FoundryReceiptEnvelope::Tempo)
@@ -432,6 +457,7 @@ impl Typed2718 for FoundryReceiptEnvelope {
             #[cfg(feature = "optimism")]
             Self::Deposit(_) => DEPOSIT_TX_TYPE_ID,
             Self::Tempo(_) => TEMPO_TX_TYPE_ID,
+            Self::Frame(_) => FRAME_TX_TYPE_ID,
         }
     }
 }
@@ -449,6 +475,7 @@ impl Encodable2718 for FoundryReceiptEnvelope {
             #[cfg(feature = "optimism")]
             Self::Deposit(r) => 1 + r.length(),
             Self::Tempo(r) => 1 + r.length(),
+            Self::Frame(r) => 1 + r.length(),
         }
     }
 
@@ -462,7 +489,8 @@ impl Encodable2718 for FoundryReceiptEnvelope {
             | Self::Eip1559(r)
             | Self::Eip4844(r)
             | Self::Eip7702(r)
-            | Self::Tempo(r) => r.encode(out),
+            | Self::Tempo(r)
+            | Self::Frame(r) => r.encode(out),
             #[cfg(feature = "optimism")]
             Self::PostExec(r) => r.encode(out),
             #[cfg(feature = "optimism")]
@@ -481,6 +509,9 @@ impl Decodable2718 for FoundryReceiptEnvelope {
             if ty == POST_EXEC_TX_TYPE_ID {
                 return Ok(Self::PostExec(ReceiptWithBloom::decode(buf)?));
             }
+        }
+        if ty == FRAME_TX_TYPE_ID {
+            return Ok(Self::Frame(ReceiptWithBloom::decode(buf)?));
         }
         if ty == TEMPO_TX_TYPE_ID {
             return Ok(Self::Tempo(ReceiptWithBloom::decode(buf)?));

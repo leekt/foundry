@@ -18,7 +18,9 @@ use revm::{
     inspector::JournalExt,
     interpreter::{
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, CreateScheme,
-        Interpreter, interpreter::EthInterpreter,
+        Interpreter,
+        interpreter::EthInterpreter,
+        interpreter_types::{InputsTr, Jumps},
     },
 };
 use revm_inspectors::transfer::{TRANSFER_EVENT_TOPIC, TRANSFER_LOG_EMITTER, TransferInspector};
@@ -35,6 +37,39 @@ pub struct AnvilInspector {
     pub transfer: Option<TransferInspector>,
     /// Collects canonical and synthetic transfer logs for an `eth_simulateV1` response.
     simulation_logs: Option<SimulationLogCollector>,
+    /// Watches for the EIP-8141 `APPROVE` opcode while a frame is executing.
+    pub frame_approval: Option<FrameApprovalWatcher>,
+}
+
+/// The EIP-8141 `APPROVE` opcode.
+const APPROVE_OPCODE: u8 = 0xaa;
+
+/// Records the scope an executing frame asked `APPROVE` to grant.
+///
+/// A frame that merely returns and a frame that approves both succeed, so the
+/// scope cannot be recovered from the call outcome; it has to be read off the
+/// stack as the opcode executes. `APPROVE` reverts unless the scope is a
+/// non-empty subset of the frame's flags, so a scope recorded by a frame that
+/// went on to succeed is one the protocol actually granted.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameApprovalWatcher {
+    /// The resolved target of the frame currently executing. `APPROVE` only
+    /// counts from this address, matching the reference's `ADDRESS` check.
+    pub resolved_target: Address,
+    /// The scope seen on the stack, if `APPROVE` executed.
+    pub observed_scope: Option<u64>,
+}
+
+impl AnvilInspector {
+    /// Arms the approval watcher for a frame targeting `resolved_target`.
+    pub fn watch_frame_approval(&mut self, resolved_target: Address) {
+        self.frame_approval = Some(FrameApprovalWatcher { resolved_target, observed_scope: None });
+    }
+
+    /// Disarms the watcher and returns the scope `APPROVE` requested, if any.
+    pub fn take_frame_approval(&mut self) -> Option<u64> {
+        self.frame_approval.take().and_then(|watcher| watcher.observed_scope)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +328,17 @@ where
     }
 
     fn step(&mut self, interp: &mut Interpreter, ecx: &mut CTX) {
+        if let Some(watcher) = &mut self.frame_approval
+            && interp.bytecode.opcode() == APPROVE_OPCODE
+            && interp.input.target_address() == watcher.resolved_target
+        {
+            // APPROVE pops [offset, len, scope], so the scope sits third from
+            // the top of the stack.
+            let stack = interp.stack.data();
+            if let Some(scope) = stack.len().checked_sub(3).map(|i| stack[i]) {
+                watcher.observed_scope = Some(u64::try_from(scope).unwrap_or(u64::MAX));
+            }
+        }
         if let Some(collector) = &mut self.simulation_logs {
             collector.sync_journal_logs(ecx.journal().logs());
         }

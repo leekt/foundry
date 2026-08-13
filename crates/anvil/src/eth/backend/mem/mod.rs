@@ -1,4 +1,5 @@
 //! In-memory blockchain backend.
+use crate::eth::backend::frame_tx::execute_frame_tx;
 use self::{in_memory_db::StateRootDb, state::trie_storage};
 
 #[cfg(feature = "monad")]
@@ -72,7 +73,6 @@ use alloy_evm::{
     overrides::{OverrideBlockHashes, apply_state_overrides},
     precompiles::{DynPrecompile, MovePrecompileError, Precompile, PrecompilesMap},
 };
-#[cfg(feature = "monad")]
 use alloy_evm::{RecoveredTx, block::BlockExecutionError};
 #[cfg(feature = "monad")]
 use alloy_monad_evm::{MonadContext, MonadEvm, MonadEvmFactory};
@@ -164,8 +164,8 @@ use foundry_evm_networks::{NetworkConfigs, arbitrum};
 #[cfg(feature = "optimism")]
 use foundry_primitives::get_deposit_tx_parts;
 use foundry_primitives::{
-    FoundryHeader, FoundryNetwork, FoundryReceiptEnvelope, FoundryTransactionRequest,
-    FoundryTxEnvelope, FoundryTxReceipt, TempoTransactionRequest,
+    FRAME_TX_TYPE_ID, FoundryHeader, FoundryNetwork, FoundryReceiptEnvelope,
+    FoundryTransactionRequest, FoundryTxEnvelope, FoundryTxReceipt, TempoTransactionRequest,
 };
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 #[cfg(feature = "monad")]
@@ -3076,7 +3076,30 @@ impl<N: Network> Backend<N> {
         }
         let mut evm =
             EthEvmFactory::default().create_evm_with_inspector(db, evm_env.clone(), inspector);
-        run!(evm, noop_before_transaction, execute_pool_transaction, noop_on_execution_error)
+        run!(
+            evm,
+            noop_before_transaction,
+            // EIP-8141 frame transactions are not a single call: each frame runs
+            // as its own top-level call, so they need their own execution loop
+            // rather than the block executor's ordinary entry point.
+            |executor: &mut AnvilBlockExecutor<_>,
+             tx_env: TxEnv,
+             recovered: Recovered<FoundryTxEnvelope>,
+             _is_replay: bool| {
+                let Some(frame_tx) = recovered.tx().as_frame().cloned() else {
+                    return executor.execute_transaction_without_commit((tx_env, recovered));
+                };
+                executor.execute_transaction_without_commit_with(
+                    (tx_env, recovered),
+                    move |evm, _tx_env, _hash| {
+                        execute_frame_tx(evm, &frame_tx)
+                            .map(|outcome| outcome.result)
+                            .map_err(|err| BlockExecutionError::msg(err.to_string()))
+                    },
+                )
+            },
+            noop_on_execution_error
+        )
     }
 
     /// Applies Ethereum block-start transitions to a disposable simulation candidate.
@@ -9411,6 +9434,57 @@ pub fn transaction_build(
             }
             Err(_) => {
                 error!(target: "backend", "failed to serialize tempo transaction");
+            }
+        }
+    }
+
+    // An EIP-8141 frame transaction has no top-level call and no outer
+    // signature, so it cannot be expressed as an `TxEnvelope`; report it the way
+    // the other non-standard types are reported, as a typed unknown envelope.
+    if let FoundryTxEnvelope::Frame(frame_tx) = eth_transaction.as_ref() {
+        let frame_tx = frame_tx.inner();
+        let ser = serde_json::to_value(frame_tx).expect("could not serialize TxFrame");
+
+        match OtherFields::try_from(ser) {
+            Ok(mut fields) => {
+                // Fields every consumer of a transaction expects. A frame
+                // transaction has no single target, value or calldata; the
+                // frames it carries do, and they are in `fields` already.
+                fields.insert(String::from("nonce"), serde_json::json!(U64::from(frame_tx.nonce)));
+                fields
+                    .insert(String::from("gas"), serde_json::json!(U64::from(frame_tx.max_gas())));
+                fields.insert(String::from("value"), serde_json::json!(U256::ZERO));
+                fields.insert(String::from("input"), serde_json::json!(Bytes::new()));
+                fields.insert(String::from("to"), serde_json::json!(frame_tx.sender));
+
+                let inner = UnknownTypedTransaction {
+                    ty: AnyTxType(FRAME_TX_TYPE_ID),
+                    fields,
+                    memo: Default::default(),
+                };
+                let envelope = AnyTxEnvelope::Unknown(UnknownTxEnvelope {
+                    hash: tx_hash.unwrap_or_else(|| eth_transaction.hash()),
+                    inner,
+                });
+
+                let tx = Transaction {
+                    inner: Recovered::new_unchecked(
+                        envelope,
+                        mined_from.unwrap_or(frame_tx.sender),
+                    ),
+                    block_hash: block.as_ref().map(|block| block.header.hash_slow()),
+                    block_number: block.as_ref().map(|block| block.header.number()),
+                    transaction_index: info.as_ref().map(|info| info.transaction_index),
+                    effective_gas_price: Some(
+                        eth_transaction.as_ref().effective_gas_price(base_fee),
+                    ),
+                    block_timestamp: block.as_ref().map(|block| block.header.timestamp()),
+                };
+
+                return AnyRpcTransaction::from(WithOtherFields::new(tx));
+            }
+            Err(_) => {
+                error!(target: "backend", "failed to serialize frame transaction");
             }
         }
     }

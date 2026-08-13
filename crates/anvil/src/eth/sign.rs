@@ -114,6 +114,14 @@ impl Signer<foundry_primitives::FoundryNetwork> for DevSigner {
         // `anvil_setChainId`.
         signer.set_chain_id(None);
         let envelope = match tx {
+            // A frame transaction carries an explicit sender and no outer
+            // signature, so there is nothing for a node signer to sign.
+            FoundryTypedTx::Frame(_) => {
+                return Err(BlockchainError::InvalidTransactionRequest(
+                    "frame txs are self-authenticating and must be sent via eth_sendRawTransaction"
+                        .to_string(),
+                ));
+            }
             FoundryTypedTx::Legacy(mut t) => {
                 let sig = signer.sign_transaction_sync(&mut t)?;
                 FoundryTxEnvelope::Legacy(t.into_signed(sig))

@@ -175,6 +175,7 @@ impl FoundryTransactionRequest {
             #[cfg(feature = "optimism")]
             FoundryTxType::PostExec => Err(vec!["not implemented for post-exec tx"]),
             FoundryTxType::Tempo => self.complete_tempo(),
+            FoundryTxType::Frame => Err(vec!["frame txs must be sent via eth_sendRawTransaction"]),
         } {
             Err((pref, missing))
         } else {
@@ -393,6 +394,12 @@ impl From<FoundryTypedTx> for FoundryTransactionRequest {
             .try_into()
             .expect("valid OP post-exec transaction request"),
             FoundryTypedTx::Tempo(tx) => Self::Tempo(Box::new(tx.into())),
+            // A frame transaction has no flat request form: it carries a list
+            // of frames rather than a single to/value/data, so it can only be
+            // submitted raw and is never round-tripped through a request.
+            FoundryTypedTx::Frame(_) => {
+                unreachable!("frame txs have no transaction request representation")
+            }
         }
     }
 }
@@ -539,6 +546,7 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
             #[cfg(feature = "optimism")]
             FoundryTxType::PostExec => Err(vec!["not implemented for post-exec tx"]),
             FoundryTxType::Tempo => self.complete_tempo(),
+            FoundryTxType::Frame => Err(vec!["frame txs must be sent via eth_sendRawTransaction"]),
         }
     }
 
@@ -574,6 +582,7 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
             #[cfg(feature = "optimism")]
             FoundryTxType::PostExec => self.complete_type(pref).ok(),
             FoundryTxType::Tempo => self.complete_tempo().ok(),
+            FoundryTxType::Frame => Err(vec!["frame txs must be sent via eth_sendRawTransaction"]).ok(),
         }?;
         Some(pref)
     }

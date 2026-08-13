@@ -96,6 +96,7 @@ impl FromRecoveredTx<FoundryTxEnvelope> for OpTransaction<TxEnv> {
                 Self { base, enveloped_tx: None, deposit: Default::default() }
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Optimism context"),
+            FoundryTxEnvelope::Frame(_) => unreachable!("Frame tx in Optimism context"),
         }
     }
 }
@@ -165,6 +166,7 @@ impl FromTxWithEncoded<FoundryTxEnvelope> for OpTransaction<TxEnv> {
                 Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Optimism context"),
+            FoundryTxEnvelope::Frame(_) => unreachable!("Frame tx in Optimism context"),
         }
     }
 }

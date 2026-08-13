@@ -9,6 +9,7 @@ pub mod cheats;
 pub mod time;
 
 pub mod executor;
+pub mod frame_tx;
 pub mod fork;
 pub mod genesis;
 pub mod info;

@@ -600,7 +600,7 @@ impl Cheatcode for setFrameTxCall {
                 signature: sig.signature.clone(),
             })
             .collect();
-        ccx.ecx.tx_mut().frame_tx = Some(FrameTxContext {
+        revm::interpreter::instructions::frame_tx::set_frame_tx_context(Some(FrameTxContext {
             sender: frameTx.sender,
             nonce: frameTx.nonce,
             sig_hash: frameTx.sigHash,
@@ -614,7 +614,7 @@ impl Cheatcode for setFrameTxCall {
             signatures,
             approvable_scopes: frameTx.approvableScopes,
             approved_scope: 0,
-        });
+        }));
         Ok(Default::default())
     }
 }
@@ -622,7 +622,7 @@ impl Cheatcode for setFrameTxCall {
 impl Cheatcode for clearFrameTxCall {
     fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
-        ccx.ecx.tx_mut().frame_tx = None;
+        revm::interpreter::instructions::frame_tx::set_frame_tx_context(None);
         Ok(Default::default())
     }
 }

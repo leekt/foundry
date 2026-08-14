@@ -12,9 +12,9 @@
 //! Author: taek <leekt216@gmail.com>
 
 use crate::eth::backend::mem::inspector::AnvilInspector;
+use alloy_consensus::Transaction as _;
 use alloy_evm::{Evm, block::StateDB, eth::EthEvm};
 use alloy_primitives::{Address, TxKind, U256};
-use alloy_consensus::Transaction as _;
 use foundry_primitives::{ENTRY_POINT_ADDRESS, Frame, TxFrame, flags, mode};
 use revm::{
     Database as _,
@@ -25,8 +25,10 @@ use revm::{
     context_interface::host::{FrameInfo, FrameSigInfo, FrameTxContext},
     database::DatabaseCommit,
     interpreter::instructions::frame_tx::set_frame_tx_context,
-    state::EvmState,
+    primitives::{StorageKey, StorageValue},
+    state::{AccountInfo, EvmState, EvmStorageSlot, TransactionId},
 };
+use std::collections::HashMap;
 
 /// Approval scopes, mirroring the frame flags they are granted from.
 const SCOPE_PAYMENT: u64 = flags::APPROVE_PAYMENT as u64;
@@ -36,6 +38,8 @@ const SCOPE_EXECUTION_AND_PAYMENT: u64 = flags::APPROVE_EXECUTION_PAYMENT as u64
 /// Frame receipt status, matching the reference's encoding.
 const STATUS_FAILED: u8 = 0;
 const STATUS_SUCCESS: u8 = 1;
+/// A frame that never ran, because an earlier frame of its atomic batch failed.
+const STATUS_SKIPPED: u8 = 2;
 
 /// Why a frame transaction could not be executed at all.
 ///
@@ -199,6 +203,72 @@ fn merge_state(merged: &mut EvmState, frame_state: EvmState) {
     }
 }
 
+/// The state a run of frames is about to overwrite, captured as it goes.
+///
+/// The reference snapshots its journal and rewinds it on failure. anvil has no
+/// journal here: frames commit to the database as they go, because a later frame
+/// has to observe what an earlier one wrote. Rolling back therefore means
+/// replaying the values that were in place beforehand, which every commit
+/// records the first time it touches an account or a slot.
+///
+/// Two are kept at once: one for the whole transaction, which unwinds the
+/// committed frames of a transaction that turns out to be invalid, and one per
+/// multi-frame atomic batch.
+#[derive(Debug, Default)]
+struct Snapshot {
+    /// Account info as of the snapshot; `None` for an account that did not exist.
+    accounts: HashMap<Address, Option<AccountInfo>>,
+    /// Value as of the snapshot of every storage slot written since.
+    storage: HashMap<(Address, StorageKey), StorageValue>,
+}
+
+impl Snapshot {
+    /// Records the pre-existing value of everything `diff` is about to overwrite.
+    ///
+    /// Call before committing `diff`, so the account reads still see the old
+    /// values. A slot's `original_value` is the database value as of the start
+    /// of the frame that produced the diff, so for the first frame to touch it
+    /// -- the only one whose entry is kept -- it is the value the snapshot wants.
+    fn record<E>(&mut self, evm: &mut E, diff: &EvmState) -> Result<(), FrameExecutionError>
+    where
+        E: Evm<Tx = TxEnv, DB: StateDB, Inspector = AnvilInspector>,
+    {
+        for (address, account) in diff {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.accounts.entry(*address)
+            {
+                let info = evm.db_mut().basic(*address).map_err(|err| {
+                    FrameExecutionError::Evm { index: 0, message: err.to_string() }
+                })?;
+                entry.insert(info);
+            }
+            for (key, slot) in &account.storage {
+                self.storage.entry((*address, *key)).or_insert(slot.original_value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds the diff that puts everything the snapshot covers back.
+    ///
+    /// ponytail: an account that was *created* since is restored to the default
+    /// (empty) account rather than removed outright, which anvil's diff model
+    /// treats the same everywhere it matters.
+    fn undo(&self) -> EvmState {
+        let mut diff = EvmState::default();
+        for (address, info) in &self.accounts {
+            diff.insert(*address, touched_account(info.clone().unwrap_or_default()));
+        }
+        for ((address, key), value) in &self.storage {
+            if let Some(account) = diff.get_mut(address) {
+                account
+                    .storage
+                    .insert(*key, EvmStorageSlot::new_changed(*value, *value, TransactionId::ZERO));
+            }
+        }
+        diff
+    }
+}
+
 /// Builds the environment for a single frame's top-level call.
 fn frame_env(tx: &TxFrame, frame: &Frame, caller: Address, caller_nonce: u64) -> TxEnv {
     TxEnv {
@@ -234,16 +304,26 @@ where
     E: Evm<Tx = TxEnv, DB: StateDB, Inspector = AnvilInspector> + SuspendFeeRules,
 {
     let saved_fee_rules = evm.suspend_fee_rules(true);
-    let outcome = run_frames(evm, tx);
+    let mut snapshot = Snapshot::default();
+    let outcome = run_frames(evm, tx, &mut snapshot);
+    // An invalid frame transaction is dropped from the block entirely, so none
+    // of the state its frames committed before it was found invalid may
+    // survive. Nothing else undoes those commits: they went straight into the
+    // database rather than into the diff the block executor discards.
+    if outcome.is_err() {
+        evm.db_mut().commit(snapshot.undo());
+    }
     evm.restore_fee_rules(saved_fee_rules);
     outcome
 }
 
 /// Runs every frame and settles the fee. Split from [`execute_frame_tx`] so the
-/// fee rules are restored on every exit, including the error paths.
+/// fee rules are restored and the state is unwound on every exit, including the
+/// error paths.
 fn run_frames<E>(
     evm: &mut E,
     tx: &TxFrame,
+    tx_snapshot: &mut Snapshot,
 ) -> Result<FrameTxOutcome<E::HaltReason>, FrameExecutionError>
 where
     E: Evm<Tx = TxEnv, DB: StateDB, Inspector = AnvilInspector> + SuspendFeeRules,
@@ -259,84 +339,140 @@ where
     let mut frame_gas_total = 0u64;
     let mut logs = Vec::new();
 
-    for (index, frame) in tx.frames.iter().enumerate() {
-        // A SENDER frame speaks as the sender, so it may only run once some
-        // frame has approved execution on the sender's behalf.
-        let caller = if frame.mode == mode::SENDER {
-            if !approval.sender_approved {
-                return Err(FrameExecutionError::SenderBeforeApproval { index });
-            }
-            tx.sender
-        } else {
-            ENTRY_POINT_ADDRESS
-        };
-        let resolved_target = frame.resolved_target(tx.sender);
-
-        // Install the context the introspection opcodes read, and arm the
-        // watcher that records an APPROVE.
-        set_frame_tx_context(Some(build_context(tx, index, &statuses)));
-        evm.inspector_mut().watch_frame_approval(resolved_target);
-
-        let caller_nonce = evm
-            .db_mut()
-            .basic(caller)
-            .map_err(|err| FrameExecutionError::Evm { index, message: err.to_string() })?
-            .map(|info| info.nonce)
-            .unwrap_or_default();
-
-        let outcome = evm.transact_raw(frame_env(tx, frame, caller, caller_nonce));
-
-        let observed_scope = evm.inspector_mut().take_frame_approval();
-        set_frame_tx_context(None);
-
-        let ResultAndState { result, mut state } = outcome.map_err(|err| {
-            FrameExecutionError::Evm { index, message: format!("{err:?}") }
-        })?;
-
-        // revm bumps the caller's nonce for every call it runs as a
-        // transaction. EIP-8141 bumps the sender's nonce exactly once, when
-        // payment is approved, so undo the per-frame bump here.
-        if let Some(account) = state.get_mut(&caller) {
-            account.info.nonce = caller_nonce;
-        }
-
-        let succeeded = result.is_success();
-        let gas_used = result.tx_gas_used();
-        frame_gas_total = frame_gas_total.saturating_add(gas_used);
-
-        if succeeded {
-            statuses[index] = STATUS_SUCCESS;
-            logs.extend(result.logs().iter().cloned());
-            merge_state(&mut merged, state.clone());
-            evm.db_mut().commit(state);
-        } else {
-            // A failed frame keeps its gas but loses its state changes. A
-            // reverting VERIFY frame invalidates the whole transaction.
-            if frame.mode == mode::VERIFY {
-                return Err(FrameExecutionError::VerifyFailed { index });
-            }
-        }
-        frame_results.push((statuses[index], gas_used));
-
-        // An account with no code of its own still validates frame
-        // transactions, through the protocol-defined default code. In DEFAULT
-        // and SENDER mode that is a plain empty-code call, which is what just
-        // ran; only VERIFY mode carries extra semantics.
-        let observed_scope = if succeeded
-            && frame.mode == mode::VERIFY
-            && observed_scope.is_none()
-            && target_has_no_code(evm, resolved_target, index)?
+    // Frames run one atomic batch at a time. A batch is the maximal contiguous
+    // run [start, end] where frames start..end-1 carry the ATOMIC_BATCH flag and
+    // frame end does not; a lone unflagged frame is the degenerate batch
+    // [start, start]. The terminator is part of the batch, so its failure rolls
+    // the batch back just as a flagged frame's does.
+    let mut start = 0;
+    while start < tx.frames.len() {
+        let mut batch_end = start;
+        while batch_end < tx.frames.len() - 1
+            && tx.frames[batch_end].flags & flags::ATOMIC_BATCH != 0
         {
-            default_verify_scope(tx, frame, resolved_target)
-        } else {
-            observed_scope
-        };
-
-        // A scope recorded by a frame that succeeded is one APPROVE granted:
-        // APPROVE reverts unless the scope is a non-empty subset of the flags.
-        if succeeded && let Some(scope) = observed_scope {
-            apply_approval(evm, tx, frame, resolved_target, scope, max_cost, &mut approval, &mut merged)?;
+            batch_end += 1;
         }
+        // Only a multi-frame batch is rolled back: a lone frame that fails has
+        // already had its own state changes dropped.
+        let mut snapshot = (batch_end > start).then(Snapshot::default);
+        let logs_start = logs.len();
+        let mut failed = None;
+
+        for index in start..=batch_end {
+            let frame = &tx.frames[index];
+            // A SENDER frame speaks as the sender, so it may only run once some
+            // frame has approved execution on the sender's behalf.
+            let caller = if frame.mode == mode::SENDER {
+                if !approval.sender_approved {
+                    return Err(FrameExecutionError::SenderBeforeApproval { index });
+                }
+                tx.sender
+            } else {
+                ENTRY_POINT_ADDRESS
+            };
+            let resolved_target = frame.resolved_target(tx.sender);
+
+            // Install the context the introspection opcodes read, and arm the
+            // watcher that records an APPROVE.
+            set_frame_tx_context(Some(build_context(tx, index, &statuses)));
+            evm.inspector_mut().watch_frame_approval(resolved_target);
+
+            let caller_nonce = evm
+                .db_mut()
+                .basic(caller)
+                .map_err(|err| FrameExecutionError::Evm { index, message: err.to_string() })?
+                .map(|info| info.nonce)
+                .unwrap_or_default();
+
+            let outcome = evm.transact_raw(frame_env(tx, frame, caller, caller_nonce));
+
+            let observed_scope = evm.inspector_mut().take_frame_approval();
+            set_frame_tx_context(None);
+
+            let ResultAndState { result, mut state } = outcome
+                .map_err(|err| FrameExecutionError::Evm { index, message: format!("{err:?}") })?;
+
+            // revm bumps the caller's nonce for every call it runs as a
+            // transaction. EIP-8141 bumps the sender's nonce exactly once, when
+            // payment is approved, so undo the per-frame bump here.
+            if let Some(account) = state.get_mut(&caller) {
+                account.info.nonce = caller_nonce;
+            }
+
+            let succeeded = result.is_success();
+            let gas_used = result.tx_gas_used();
+            frame_gas_total = frame_gas_total.saturating_add(gas_used);
+
+            if succeeded {
+                statuses[index] = STATUS_SUCCESS;
+                logs.extend(result.logs().iter().cloned());
+                tx_snapshot.record(evm, &state)?;
+                if let Some(snapshot) = snapshot.as_mut() {
+                    snapshot.record(evm, &state)?;
+                }
+                merge_state(&mut merged, state.clone());
+                evm.db_mut().commit(state);
+            } else {
+                // A failed frame keeps its gas but loses its state changes. A
+                // reverting VERIFY frame invalidates the whole transaction.
+                if frame.mode == mode::VERIFY {
+                    return Err(FrameExecutionError::VerifyFailed { index });
+                }
+            }
+            frame_results.push((statuses[index], gas_used));
+
+            // An account with no code of its own still validates frame
+            // transactions, through the protocol-defined default code. In DEFAULT
+            // and SENDER mode that is a plain empty-code call, which is what just
+            // ran; only VERIFY mode carries extra semantics.
+            let observed_scope = if succeeded
+                && frame.mode == mode::VERIFY
+                && observed_scope.is_none()
+                && target_has_no_code(evm, resolved_target, index)?
+            {
+                default_verify_scope(tx, frame, resolved_target)
+            } else {
+                observed_scope
+            };
+
+            // A scope recorded by a frame that succeeded is one APPROVE granted:
+            // APPROVE reverts unless the scope is a non-empty subset of the flags.
+            if succeeded && let Some(scope) = observed_scope {
+                apply_approval(
+                    evm,
+                    tx,
+                    frame,
+                    resolved_target,
+                    scope,
+                    max_cost,
+                    &mut approval,
+                    &mut merged,
+                    tx_snapshot,
+                    snapshot.as_mut(),
+                )?;
+            }
+
+            if !succeeded {
+                failed = Some(index);
+                break;
+            }
+        }
+
+        // A failure anywhere in a multi-frame batch undoes the whole batch: the
+        // frames that ran keep their status and their gas but lose their logs,
+        // and the frames after the failure never ran at all.
+        if let (Some(snapshot), Some(failed)) = (snapshot, failed) {
+            let undo = snapshot.undo();
+            merge_state(&mut merged, undo.clone());
+            evm.db_mut().commit(undo);
+            logs.truncate(logs_start);
+            for status in &mut statuses[failed + 1..=batch_end] {
+                *status = STATUS_SKIPPED;
+                // A skipped frame's gas allotment is left unspent.
+                frame_results.push((STATUS_SKIPPED, 0));
+            }
+        }
+        start = batch_end + 1;
     }
 
     let payer = approval.payer.ok_or(FrameExecutionError::NoPayer)?;
@@ -357,11 +493,7 @@ where
         logs,
         output: Output::Call(Default::default()),
     };
-    Ok(FrameTxOutcome {
-        result: ResultAndState { result, state: merged },
-        payer,
-        frame_results,
-    })
+    Ok(FrameTxOutcome { result: ResultAndState { result, state: merged }, payer, frame_results })
 }
 
 /// Reports whether a frame's resolved target has no code of its own, which
@@ -426,6 +558,8 @@ fn apply_approval<E>(
     max_cost: U256,
     approval: &mut ApprovalState,
     merged: &mut EvmState,
+    tx_snapshot: &mut Snapshot,
+    mut snapshot: Option<&mut Snapshot>,
 ) -> Result<(), FrameExecutionError>
 where
     E: Evm<Tx = TxEnv, DB: StateDB, Inspector = AnvilInspector>,
@@ -444,7 +578,8 @@ where
             return Ok(());
         }
     }
-    if approves_payment && (approval.payer.is_some() || !(approval.sender_approved || approves_execution))
+    if approves_payment
+        && (approval.payer.is_some() || !(approval.sender_approved || approves_execution))
     {
         // Payment may only be approved once, and only after execution has been.
         return Ok(());
@@ -476,6 +611,10 @@ where
         let mut diff = EvmState::default();
         diff.insert(resolved_target, touched_account(payer_account.clone()));
         diff.insert(tx.sender, touched_account(sender_account));
+        tx_snapshot.record(evm, &diff)?;
+        if let Some(snapshot) = snapshot.as_mut() {
+            snapshot.record(evm, &diff)?;
+        }
         merge_state(merged, diff.clone());
         evm.db_mut().commit(diff);
 
@@ -501,9 +640,7 @@ where
     E: Evm<Tx = TxEnv, DB: StateDB, Inspector = AnvilInspector>,
 {
     let base_fee = U256::from(evm.block().basefee());
-    let tip = tx
-        .max_priority_fee_per_gas
-        .min(tx.max_fee_per_gas.saturating_sub(base_fee));
+    let tip = tx.max_priority_fee_per_gas.min(tx.max_fee_per_gas.saturating_sub(base_fee));
     let effective_gas_price = base_fee.saturating_add(tip);
     let charged = effective_gas_price.saturating_mul(U256::from(gas_used));
     let refund = max_cost.saturating_sub(charged);

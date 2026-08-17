@@ -15,7 +15,7 @@ use alloy_consensus::{Transaction, Typed2718};
 use alloy_eips::{
     Encodable2718,
     eip2718::{Decodable2718, Eip2718Error, Eip2718Result},
-    eip4844::{DATA_GAS_PER_BLOB, MAX_BLOBS_PER_BLOCK_DENCUN, VERSIONED_HASH_VERSION_KZG},
+    eip4844::{DATA_GAS_PER_BLOB, VERSIONED_HASH_VERSION_KZG},
     eip7702::SignedAuthorization,
 };
 use alloy_primitives::{
@@ -88,15 +88,20 @@ pub const ENTRY_POINT_ADDRESS: Address =
     Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa]);
 
 /// `EXPIRY_VERIFIER`: the predeploy holding the expiry verifier code.
-pub const EXPIRY_VERIFIER_ADDRESS: Address = Address::new([
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x81, 0x41,
-]);
+pub const EXPIRY_VERIFIER_ADDRESS: Address =
+    Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x81, 0x41]);
+
+/// Canonical EIP-8141 expiry verifier runtime installed at [`EXPIRY_VERIFIER_ADDRESS`].
+pub const EXPIRY_VERIFIER_RUNTIME_CODE: &[u8] =
+    &alloy_primitives::hex!("60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd");
 
 /// A single frame within a frame transaction.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Frame {
-    /// Frame mode: 0 `DEFAULT`, 1 `VERIFY`, 2 `SENDER`.
+    /// Frame mode: 0 `DEFAULT`, 1 `VERIFY`, 2 `SENDER`, 3 `POST_TX`. Mode 3 is
+    /// available to synthetic opcode contexts, but [`TxFrame::validate`] rejects
+    /// it on the real wire path until POST_TX integration exists.
     pub mode: u8,
     /// Frame flags.
     pub flags: u8,
@@ -273,6 +278,7 @@ pub struct TxFrame {
     /// EIP-155 chain id.
     pub chain_id: U256,
     /// Sender nonce.
+    #[serde(with = "alloy_serde::quantity")]
     pub nonce: u64,
     /// The declared sender. A frame transaction carries no outer signature, so
     /// this is authoritative and must never be recovered from one.
@@ -282,6 +288,9 @@ pub struct TxFrame {
     /// The signature entries.
     pub signatures: Vec<FrameSignature>,
     /// `maxPriorityFeePerGas`.
+    ///
+    /// The wire field is 256 bits, but local Alloy/REVM fee APIs use `u128`;
+    /// [`Self::validate`] rejects values that cannot be represented locally.
     pub max_priority_fee_per_gas: U256,
     /// `maxFeePerGas`.
     pub max_fee_per_gas: U256,
@@ -436,11 +445,21 @@ impl TxFrame {
         if self.frames.is_empty() || self.frames.len() > gas::MAX_FRAMES {
             return Err(FrameTxError::FrameCount(self.frames.len()));
         }
+        let max_u128 = U256::from(u128::MAX);
+        if self.max_priority_fee_per_gas > max_u128 {
+            return Err(FrameTxError::MaxPriorityFeePerGasOverflow);
+        }
+        if self.max_fee_per_gas > max_u128 {
+            return Err(FrameTxError::MaxFeePerGasOverflow);
+        }
+        if self.max_fee_per_blob_gas > max_u128 {
+            return Err(FrameTxError::MaxFeePerBlobGasOverflow);
+        }
+        if self.max_priority_fee_per_gas > self.max_fee_per_gas {
+            return Err(FrameTxError::PriorityFeeAboveMaxFee);
+        }
         // EIP-4844 blob constraints. The frame path does not run the ordinary
         // pre-check, so the versioned hashes have to be validated here.
-        if self.blob_versioned_hashes.len() > MAX_BLOBS_PER_BLOCK_DENCUN {
-            return Err(FrameTxError::TooManyBlobs(self.blob_versioned_hashes.len()));
-        }
         for (i, hash) in self.blob_versioned_hashes.iter().enumerate() {
             if hash[0] != VERSIONED_HASH_VERSION_KZG {
                 return Err(FrameTxError::BlobHashVersion(i));
@@ -556,15 +575,13 @@ impl TxFrame {
 }
 
 /// secp256k1 group order, and its halved value for the low-s check.
-const SECP256K1_N: U256 =
-    U256::from_be_bytes(alloy_primitives::hex!(
-        "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
-    ));
+const SECP256K1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
+    "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
+));
 /// P256 (secp256r1) group order.
-const SECP256R1_N: U256 =
-    U256::from_be_bytes(alloy_primitives::hex!(
-        "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
-    ));
+const SECP256R1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
+    "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+));
 
 /// Verifies a secp256k1 entry, whose 65 bytes are encoded `v || r || s` with
 /// `v` the recovery id (0 or 1) -- note this is *not* the usual `r || s || v`.
@@ -579,11 +596,7 @@ fn verify_secp256k1(signature: &[u8], msg: B256, resolved: Address) -> bool {
     // r and s must be canonical, and s low. revm's ecrecover silently
     // normalises a high s, so rejecting it here is what keeps malleable
     // signatures out rather than merely re-encoding them.
-    if v > 1
-        || r.is_zero()
-        || s.is_zero()
-        || r >= SECP256K1_N
-        || s > SECP256K1_N / U256::from(2u8)
+    if v > 1 || r.is_zero() || s.is_zero() || r >= SECP256K1_N || s > SECP256K1_N / U256::from(2u8)
     {
         return false;
     }
@@ -605,11 +618,7 @@ fn verify_p256(signature: &[u8], msg: B256, resolved: Address) -> bool {
     }
     let r = U256::from_be_slice(&signature[0..32]);
     let s = U256::from_be_slice(&signature[32..64]);
-    if r.is_zero()
-        || s.is_zero()
-        || r >= SECP256R1_N
-        || s > SECP256R1_N / U256::from(2u8)
-    {
+    if r.is_zero() || s.is_zero() || r >= SECP256R1_N || s > SECP256R1_N / U256::from(2u8) {
         return false;
     }
     let qx = &signature[64..96];
@@ -635,9 +644,18 @@ pub enum FrameTxError {
     /// The transaction has no frames, or more than `MAX_FRAMES`.
     #[error("invalid number of frames: {0}")]
     FrameCount(usize),
-    /// More blobs than a single transaction may carry.
-    #[error("{0} blobs exceeds the per-transaction limit")]
-    TooManyBlobs(usize),
+    /// `maxPriorityFeePerGas` cannot be represented by Alloy/REVM's fee API.
+    #[error("maxPriorityFeePerGas exceeds u128::MAX")]
+    MaxPriorityFeePerGasOverflow,
+    /// `maxFeePerGas` cannot be represented by Alloy/REVM's fee API.
+    #[error("maxFeePerGas exceeds u128::MAX")]
+    MaxFeePerGasOverflow,
+    /// `maxFeePerBlobGas` cannot be represented by Alloy/REVM's fee API.
+    #[error("maxFeePerBlobGas exceeds u128::MAX")]
+    MaxFeePerBlobGasOverflow,
+    /// The priority fee exceeds the total gas fee cap.
+    #[error("maxPriorityFeePerGas exceeds maxFeePerGas")]
+    PriorityFeeAboveMaxFee,
     /// A blob versioned hash uses an unknown version byte.
     #[error("blob {0} has invalid hash version")]
     BlobHashVersion(usize),
@@ -747,9 +765,12 @@ impl Decodable2718 for TxFrame {
     }
 }
 
-/// Saturating conversion for the fee accessors, which the `Transaction` trait
-/// types as `u128` while the envelope stores the full 256-bit RLP value.
-fn saturating_u128(value: U256) -> u128 {
+/// Narrows a wire fee for Alloy's generic transaction accessors.
+///
+/// Accepted frame transactions are validated to fit exactly in `u128`; raw
+/// callers may inspect an unvalidated envelope, so the public trait surface must
+/// remain total rather than panic on malformed input.
+fn saturating_fee_u128(value: U256) -> u128 {
     u128::try_from(value).unwrap_or(u128::MAX)
 }
 
@@ -773,26 +794,28 @@ impl Transaction for TxFrame {
     }
 
     fn max_fee_per_gas(&self) -> u128 {
-        saturating_u128(self.max_fee_per_gas)
+        saturating_fee_u128(self.max_fee_per_gas)
     }
 
     fn max_priority_fee_per_gas(&self) -> Option<u128> {
-        Some(saturating_u128(self.max_priority_fee_per_gas))
+        Some(saturating_fee_u128(self.max_priority_fee_per_gas))
     }
 
     fn max_fee_per_blob_gas(&self) -> Option<u128> {
-        Some(saturating_u128(self.max_fee_per_blob_gas))
+        Some(saturating_fee_u128(self.max_fee_per_blob_gas))
     }
 
     fn priority_fee_or_price(&self) -> u128 {
-        saturating_u128(self.max_priority_fee_per_gas)
+        saturating_fee_u128(self.max_priority_fee_per_gas)
     }
 
     fn effective_gas_price(&self, base_fee: Option<u64>) -> u128 {
         let max_fee = self.max_fee_per_gas();
         let Some(base_fee) = base_fee.map(u128::from) else { return max_fee };
         base_fee.saturating_add(
-            self.max_priority_fee_per_gas().unwrap_or_default().min(max_fee.saturating_sub(base_fee)),
+            self.max_priority_fee_per_gas()
+                .unwrap_or_default()
+                .min(max_fee.saturating_sub(base_fee)),
         )
     }
 
@@ -1000,10 +1023,7 @@ mod tests {
         // Only a SENDER frame may carry value.
         let mut valued_verify = base.clone();
         valued_verify.frames[0].value = U256::from(1u8);
-        assert_eq!(
-            valued_verify.validate(),
-            Err(FrameTxError::ValueOnNonSenderFrame { index: 0 })
-        );
+        assert_eq!(valued_verify.validate(), Err(FrameTxError::ValueOnNonSenderFrame { index: 0 }));
 
         // APPROVE_EXECUTION may only target the sender.
         let mut foreign_approval = base.clone();
@@ -1044,8 +1064,64 @@ mod tests {
         blob_fee.max_fee_per_blob_gas = U256::from(1u8);
         assert_eq!(blob_fee.validate(), Err(FrameTxError::BlobFeeWithoutBlobs));
 
+        // Blob count is fork-dependent and is enforced by the pool against the
+        // active BlobParams, not by this fork-agnostic envelope validation.
+        let mut fork_dependent_blob_count = base.clone();
+        fork_dependent_blob_count.blob_versioned_hashes = vec![B256::repeat_byte(0x01); 7];
+        fork_dependent_blob_count.validate().unwrap();
+
         // The unmodified vector must still pass, or the cases above prove nothing.
         base.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_fees_that_tx_env_cannot_represent() {
+        let base = signed_vector();
+        let overflow = U256::from(u128::MAX) + U256::ONE;
+
+        let mut priority_overflow = base.clone();
+        priority_overflow.max_priority_fee_per_gas = overflow;
+        assert_eq!(priority_overflow.validate(), Err(FrameTxError::MaxPriorityFeePerGasOverflow));
+
+        let mut max_fee_overflow = base.clone();
+        max_fee_overflow.max_fee_per_gas = overflow;
+        assert_eq!(max_fee_overflow.validate(), Err(FrameTxError::MaxFeePerGasOverflow));
+
+        let mut blob_fee_overflow = base.clone();
+        blob_fee_overflow.max_fee_per_blob_gas = overflow;
+        assert_eq!(blob_fee_overflow.validate(), Err(FrameTxError::MaxFeePerBlobGasOverflow));
+
+        let mut priority_above_max = base.clone();
+        priority_above_max.max_priority_fee_per_gas = U256::from(2);
+        priority_above_max.max_fee_per_gas = U256::ONE;
+        assert_eq!(priority_above_max.validate(), Err(FrameTxError::PriorityFeeAboveMaxFee));
+
+        let mut max_supported = base;
+        max_supported.max_priority_fee_per_gas = U256::from(u128::MAX);
+        max_supported.max_fee_per_gas = U256::from(u128::MAX);
+        max_supported.max_fee_per_blob_gas = U256::from(u128::MAX);
+        max_supported.blob_versioned_hashes = vec![B256::repeat_byte(VERSIONED_HASH_VERSION_KZG)];
+        max_supported.validate().unwrap();
+        assert_eq!(max_supported.max_priority_fee_per_gas(), Some(u128::MAX));
+        assert_eq!(max_supported.max_fee_per_gas(), u128::MAX);
+        assert_eq!(max_supported.max_fee_per_blob_gas(), Some(u128::MAX));
+    }
+
+    #[test]
+    fn unvalidated_fee_accessors_saturate_instead_of_panicking() {
+        let overflow = U256::from(u128::MAX) + U256::ONE;
+        let tx = TxFrame {
+            max_priority_fee_per_gas: overflow,
+            max_fee_per_gas: U256::MAX,
+            max_fee_per_blob_gas: overflow,
+            ..Default::default()
+        };
+
+        assert_eq!(tx.max_priority_fee_per_gas(), Some(u128::MAX));
+        assert_eq!(tx.max_fee_per_gas(), u128::MAX);
+        assert_eq!(tx.max_fee_per_blob_gas(), Some(u128::MAX));
+        assert_eq!(tx.priority_fee_or_price(), u128::MAX);
+        assert_eq!(tx.effective_gas_price(Some(u64::MAX)), u128::MAX);
     }
 
     #[test]
@@ -1126,8 +1202,7 @@ mod tests {
         let empty = FrameSignature::default();
         assert_eq!(empty.resolved_signer(sender), Some(sender));
 
-        let named =
-            FrameSignature { signer: Bytes::from(explicit.to_vec()), ..Default::default() };
+        let named = FrameSignature { signer: Bytes::from(explicit.to_vec()), ..Default::default() };
         assert_eq!(named.resolved_signer(sender), Some(explicit));
 
         let malformed = FrameSignature { signer: Bytes::from(vec![0u8; 7]), ..Default::default() };

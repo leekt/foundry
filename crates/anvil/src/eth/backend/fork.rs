@@ -168,6 +168,14 @@ impl<N: Network> ClientFork<N> {
         self.config.read().provider.clone()
     }
 
+    /// Fetches canonical EIP-2718 transaction bytes without re-encoding an RPC envelope.
+    pub async fn raw_transaction_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<Bytes>, TransportError> {
+        self.provider().raw_request("eth_getRawTransactionByHash".into(), (hash,)).await
+    }
+
     fn storage_read(&self) -> RwLockReadGuard<'_, RawRwLock, ForkedStorage<N>> {
         self.storage.read()
     }

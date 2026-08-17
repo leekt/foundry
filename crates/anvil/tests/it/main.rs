@@ -6,6 +6,8 @@ mod beacon_api;
 mod eip2935;
 mod eip4844;
 mod eip7702;
+mod eip7851;
+mod eip8151;
 mod fork;
 mod frame_tx;
 mod gas;

@@ -274,6 +274,13 @@ pub struct EnvArgs {
     #[arg(long, visible_alias = "tx-gas-limit")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub enable_tx_gas_limit: bool,
+
+    /// Enable experimental EIP-8151 account-code restricted ECRecover.
+    ///
+    /// Requires the Prague hardfork or later and the canonical Ethereum execution profile.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enable_eip8151: bool,
 }
 
 /// We have to serialize chain IDs and not names because when extracting an EVM `Env`, it expects
@@ -313,6 +320,18 @@ mod tests {
         let dict = data.get(&Config::selected_profile()).expect("profile dict");
         let val = dict.get("compute_units_per_second").expect("cups present");
         assert_eq!(val, &Value::from(1000u64));
+    }
+
+    #[test]
+    fn parses_enable_eip8151() {
+        let args = EvmArgs::parse_from(["forge"]);
+        assert!(!args.env.enable_eip8151);
+
+        let args = EvmArgs::parse_from(["forge", "--enable-eip8151"]);
+        assert!(args.env.enable_eip8151);
+        let data = args.data().expect("provider data");
+        let dict = data.get(&Config::selected_profile()).expect("profile dict");
+        assert_eq!(dict.get("enable_eip8151"), Some(&Value::from(true)));
     }
 
     #[test]

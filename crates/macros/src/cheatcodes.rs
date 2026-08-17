@@ -165,14 +165,14 @@ fn derive_struct(
 
     let doc = get_docstring(attrs);
     let doc = doc.trim();
+    let (doc, def) = doc.split_once("```solidity\n").expect("bad docstring");
+    let mut doc = doc.trim_end();
     let kind = match () {
         () if doc.contains("Custom error ") => StructKind::Error,
         () if doc.contains("Event ") => StructKind::Event,
         _ => StructKind::Struct,
     };
 
-    let (doc, def) = doc.split_once("```solidity\n").expect("bad docstring");
-    let mut doc = doc.trim_end();
     let def_end = def.rfind("```").expect("bad docstring");
     let def = def[..def_end].trim();
 

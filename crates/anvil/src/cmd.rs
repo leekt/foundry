@@ -283,10 +283,13 @@ impl NodeArgs {
             networks
         };
 
-        Ok(NodeConfig::default()
+        let config = NodeConfig::default()
             .with_gas_limit(self.evm.gas_limit)
             .disable_block_gas_limit(self.evm.disable_block_gas_limit)
             .enable_tx_gas_limit(self.evm.enable_tx_gas_limit)
+            .enable_eip7819(self.evm.enable_eip7819)
+            .enable_eip7851(self.evm.enable_eip7851)
+            .enable_eip8151(self.evm.enable_eip8151)
             .with_gas_price(self.evm.gas_price)
             .with_hardfork(hardfork)
             .with_blocktime(self.block_time)
@@ -342,10 +345,14 @@ impl NodeArgs {
             .with_tempo_fee_payer(self.tempo_fee_payer)
             .with_disable_default_create2_deployer(self.evm.disable_default_create2_deployer)
             .with_disable_pool_balance_checks(self.evm.disable_pool_balance_checks)
+            .with_frame_transactions(self.evm.enable_frame_transactions)
             .with_slots_in_an_epoch(self.slots_in_an_epoch)
             .with_memory_limit(self.evm.memory_limit)
             .with_cache_path(self.cache_path)
-            .with_funded_accounts(funded_accounts))
+            .with_funded_accounts(funded_accounts);
+        config.validate_eip7851_profile()?;
+        config.validate_eip8151_profile()?;
+        Ok(config)
     }
 
     fn parse_funded_accounts(&self) -> eyre::Result<HashMap<Address, U256>> {
@@ -627,6 +634,28 @@ pub struct AnvilEvmArgs {
     /// Enable the transaction gas limit check as imposed by EIP-7825 (Osaka hardfork).
     #[arg(long, visible_alias = "tx-gas-limit", help_heading = "Environment config")]
     pub enable_tx_gas_limit: bool,
+
+    /// Enable the experimental EIP-7819 SETDELEGATE instruction.
+    ///
+    /// Requires the Prague hardfork or later.
+    #[arg(long, help_heading = "Environment config")]
+    pub enable_eip7819: bool,
+
+    /// Enable experimental EIP-7851 SETSELFDELEGATE on the canonical Ethereum execution profile.
+    ///
+    /// Requires Prague or later. Uses toolkit-local opcode 0xf7 while upstream remains TBD.
+    #[arg(long, help_heading = "Environment config")]
+    pub enable_eip7851: bool,
+
+    /// Enable experimental EIP-8151 account-code restricted ECRecover.
+    ///
+    /// Requires Prague or later and the canonical Ethereum execution profile.
+    #[arg(long, help_heading = "Environment config")]
+    pub enable_eip8151: bool,
+
+    /// Enable the experimental EIP-8141 Frame transaction profile.
+    #[arg(long, help_heading = "Environment config")]
+    pub enable_frame_transactions: bool,
 
     /// EIP-170: Contract code size limit in bytes. Useful to increase this because of tests. To
     /// disable entirely, use `--disable-code-size-limit`. By default, it is 0x6000 (~25kb).
@@ -1270,6 +1299,53 @@ mod tests {
         // Also test the alias
         let args: NodeArgs = NodeArgs::parse_from(["anvil", "--tx-gas-limit"]);
         assert!(args.evm.enable_tx_gas_limit);
+    }
+
+    #[test]
+    fn can_parse_enable_frame_transactions() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--enable-frame-transactions"]);
+        assert!(args.evm.enable_frame_transactions);
+    }
+
+    #[test]
+    fn can_parse_enable_eip7819() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil"]);
+        assert!(!args.evm.enable_eip7819);
+        assert!(!args.into_node_config().unwrap().enable_eip7819);
+
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--enable-eip7819"]);
+        assert!(args.evm.enable_eip7819);
+        assert!(args.into_node_config().unwrap().enable_eip7819);
+    }
+
+    #[test]
+    fn can_parse_enable_eip7851() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil"]);
+        assert!(!args.evm.enable_eip7851);
+        assert!(!args.into_node_config().unwrap().enable_eip7851);
+
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--enable-eip7851"]);
+        assert!(args.evm.enable_eip7851);
+        assert!(args.into_node_config().unwrap().enable_eip7851);
+
+        let args = NodeArgs::parse_from(["anvil", "--enable-eip7851", "--network", "tempo"]);
+        let err = args.into_node_config().unwrap_err();
+        assert!(err.to_string().contains("active profile is `tempo`"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn can_parse_enable_eip8151() {
+        let args: NodeArgs = NodeArgs::parse_from(["anvil"]);
+        assert!(!args.evm.enable_eip8151);
+        assert!(!args.into_node_config().unwrap().enable_eip8151);
+
+        let args: NodeArgs = NodeArgs::parse_from(["anvil", "--enable-eip8151"]);
+        assert!(args.evm.enable_eip8151);
+        assert!(args.into_node_config().unwrap().enable_eip8151);
+
+        let args = NodeArgs::parse_from(["anvil", "--enable-eip8151", "--network", "tempo"]);
+        let err = args.into_node_config().unwrap_err();
+        assert!(err.to_string().contains("active profile is `tempo`"), "unexpected error: {err}");
     }
 
     #[test]

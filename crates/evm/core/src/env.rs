@@ -155,6 +155,10 @@ pub trait FoundryTransaction: Transaction {
     /// Sets the caller (sender) address.
     fn set_caller(&mut self, caller: Address);
 
+    /// Classifies whether the sender used the protocol ECDSA transaction envelope for EIP-7851.
+    /// Non-Ethereum execution profiles ignore this marker.
+    fn set_eip7851_sender_ecdsa_authenticated(&mut self, _authenticated: bool) {}
+
     /// Sets the gas limit.
     fn set_gas_limit(&mut self, gas_limit: u64);
 
@@ -270,6 +274,10 @@ impl FoundryTransaction for TxEnv {
 
     fn set_caller(&mut self, caller: Address) {
         self.caller = caller;
+    }
+
+    fn set_eip7851_sender_ecdsa_authenticated(&mut self, authenticated: bool) {
+        self.eip7851_sender_ecdsa_authenticated = authenticated;
     }
 
     fn set_gas_limit(&mut self, gas_limit: u64) {

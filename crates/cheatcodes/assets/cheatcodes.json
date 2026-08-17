@@ -307,6 +307,336 @@
       ]
     },
     {
+      "name": "FrameTxFrame",
+      "description": "A single frame of an EIP-8141 frame transaction, as reported by `FRAMEPARAM`\n and `FRAMEDATALOAD`/`FRAMEDATACOPY`.",
+      "fields": [
+        {
+          "name": "mode",
+          "ty": "uint8",
+          "description": "Frame mode: 0 DEFAULT, 1 VERIFY, 2 SENDER, 3 POST_TX."
+        },
+        {
+          "name": "flags",
+          "ty": "uint8",
+          "description": "Frame flags. The low two bits are the approval scope."
+        },
+        {
+          "name": "target",
+          "ty": "address",
+          "description": "The frame's target, already resolved (a null target resolves to the sender)."
+        },
+        {
+          "name": "gasLimit",
+          "ty": "uint64",
+          "description": "Gas limit allotted to the frame."
+        },
+        {
+          "name": "value",
+          "ty": "uint256",
+          "description": "Value transferred by the frame."
+        },
+        {
+          "name": "data",
+          "ty": "bytes",
+          "description": "Calldata supplied to the frame."
+        },
+        {
+          "name": "status",
+          "ty": "uint8",
+          "description": "Execution status: 0 failed, 1 success, 2 skipped. Only meaningful for a\n frame before the one currently executing."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxSignature",
+      "description": "A signature entry of an EIP-8141 frame transaction, as reported by `SIGPARAM`.",
+      "fields": [
+        {
+          "name": "scheme",
+          "ty": "uint8",
+          "description": "Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256."
+        },
+        {
+          "name": "signer",
+          "ty": "address",
+          "description": "The signer, already resolved. Ignored for ARBITRARY entries, which have\n no protocol-assigned signer."
+        },
+        {
+          "name": "msgHash",
+          "ty": "bytes32",
+          "description": "Explicit 32-byte digest, or zero when the entry signs the canonical hash."
+        },
+        {
+          "name": "signature",
+          "ty": "bytes",
+          "description": "Raw signature bytes. Only readable for ARBITRARY entries."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxRecentRootReference",
+      "description": "A verified EIP-8272 recent-root reference.",
+      "fields": [
+        {
+          "name": "sourceId",
+          "ty": "bytes32",
+          "description": "Root source identifier."
+        },
+        {
+          "name": "slot",
+          "ty": "uint64",
+          "description": "Consensus slot containing the root."
+        },
+        {
+          "name": "root",
+          "ty": "bytes32",
+          "description": "Opaque root committed by the source."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxBalanceDiff",
+      "description": "One net balance change. Entries must be ordered by ascending account.",
+      "fields": [
+        {
+          "name": "account",
+          "ty": "address",
+          "description": "Changed account."
+        },
+        {
+          "name": "balanceBefore",
+          "ty": "uint256",
+          "description": "Balance at transaction start."
+        },
+        {
+          "name": "balanceAfter",
+          "ty": "uint256",
+          "description": "Balance as of the POST_TX frame."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxStorageDiff",
+      "description": "One net storage change. Entries must be ordered by `(account, key)`.",
+      "fields": [
+        {
+          "name": "account",
+          "ty": "address",
+          "description": "Changed account."
+        },
+        {
+          "name": "key",
+          "ty": "uint256",
+          "description": "Changed storage key."
+        },
+        {
+          "name": "valueBefore",
+          "ty": "uint256",
+          "description": "Value at transaction start."
+        },
+        {
+          "name": "valueAfter",
+          "ty": "uint256",
+          "description": "Value as of the POST_TX frame."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxDeployedContract",
+      "description": "One newly deployed contract. Entries must be ordered by ascending account.",
+      "fields": [
+        {
+          "name": "account",
+          "ty": "address",
+          "description": "Deployed contract account."
+        },
+        {
+          "name": "codeHash",
+          "ty": "bytes32",
+          "description": "Current non-empty, non-delegation code hash."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxAccountDiff",
+      "description": "Account-level nonce and code-hash changes, ordered by ascending account.",
+      "fields": [
+        {
+          "name": "account",
+          "ty": "address",
+          "description": "Changed account."
+        },
+        {
+          "name": "nonceChanged",
+          "ty": "bool",
+          "description": "Whether the nonce differs from transaction pre-state. Nonce values are\n deliberately not exposed."
+        },
+        {
+          "name": "codeHashBefore",
+          "ty": "bytes32",
+          "description": "Code hash at transaction start."
+        },
+        {
+          "name": "codeHashAfter",
+          "ty": "bytes32",
+          "description": "Code hash as of the POST_TX frame."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxEvent",
+      "description": "One event in transaction emission order.",
+      "fields": [
+        {
+          "name": "emitter",
+          "ty": "address",
+          "description": "Contract that emitted the event."
+        },
+        {
+          "name": "topics",
+          "ty": "bytes32[]",
+          "description": "Topics in LOG order, with at most four entries."
+        },
+        {
+          "name": "data",
+          "ty": "bytes",
+          "description": "Non-indexed event data."
+        }
+      ]
+    },
+    {
+      "name": "FrameTxTrace",
+      "description": "A precomputed EIP-7906 transaction trace for POST_TX introspection.\n Balance, account, and deployment entries must be ordered by account;\n storage entries by `(account, key)`; events remain in emission order.",
+      "fields": [
+        {
+          "name": "balanceDiffs",
+          "ty": "FrameTxBalanceDiff[]",
+          "description": "Net balance changes."
+        },
+        {
+          "name": "storageDiffs",
+          "ty": "FrameTxStorageDiff[]",
+          "description": "Net storage changes."
+        },
+        {
+          "name": "deployedContracts",
+          "ty": "FrameTxDeployedContract[]",
+          "description": "Contracts deployed by the transaction."
+        },
+        {
+          "name": "accountDiffs",
+          "ty": "FrameTxAccountDiff[]",
+          "description": "Account-level nonce and code-hash changes."
+        },
+        {
+          "name": "events",
+          "ty": "FrameTxEvent[]",
+          "description": "Events in global transaction log order."
+        },
+        {
+          "name": "gasPreCharge",
+          "ty": "uint256",
+          "description": "Total gas pre-charge deducted from the payer."
+        },
+        {
+          "name": "gasPayer",
+          "ty": "address",
+          "description": "Account charged the gas pre-charge."
+        }
+      ]
+    },
+    {
+      "name": "FrameTx",
+      "description": "An EIP-8141 frame transaction context. Passed to `setFrameTx`.",
+      "fields": [
+        {
+          "name": "sender",
+          "ty": "address",
+          "description": "The declared sender."
+        },
+        {
+          "name": "nonce",
+          "ty": "uint64",
+          "description": "Shared keyed-nonce sequence (`nonce_seq`), reported by `TXPARAM(0x01)`."
+        },
+        {
+          "name": "legacyNonce",
+          "ty": "uint64",
+          "description": "Sender's legacy account nonce in the transaction pre-state, reported by\n `TXPARAM(0x0C)`."
+        },
+        {
+          "name": "nonceKeys",
+          "ty": "uint256[]",
+          "description": "Canonically ordered EIP-8250 nonce keys. Their count is reported by\n `TXPARAM(0x0D)` and the first key by `TXPARAM(0x10)`."
+        },
+        {
+          "name": "nonceKeysHash",
+          "ty": "bytes32",
+          "description": "Canonical hash of `nonceKeys`, reported by `TXPARAM(0x0E)`."
+        },
+        {
+          "name": "sigHash",
+          "ty": "bytes32",
+          "description": "The canonical signature hash, reported by `TXPARAM(0x08)`."
+        },
+        {
+          "name": "maxCost",
+          "ty": "uint256",
+          "description": "Maximum cost the payer may be charged, reported by `TXPARAM(0x06)`."
+        },
+        {
+          "name": "maxPriorityFeePerGas",
+          "ty": "uint256",
+          "description": "Maximum priority fee per gas, reported by `TXPARAM(0x03)`."
+        },
+        {
+          "name": "maxFeePerGas",
+          "ty": "uint256",
+          "description": "Maximum fee per gas, reported by `TXPARAM(0x04)`."
+        },
+        {
+          "name": "maxFeePerBlobGas",
+          "ty": "uint256",
+          "description": "Maximum fee per blob gas, reported by `TXPARAM(0x05)`."
+        },
+        {
+          "name": "blobCount",
+          "ty": "uint64",
+          "description": "Number of blob versioned hashes, reported by `TXPARAM(0x07)`."
+        },
+        {
+          "name": "frameIndex",
+          "ty": "uint64",
+          "description": "Index of the frame currently executing, reported by `TXPARAM(0x0A)`."
+        },
+        {
+          "name": "frames",
+          "ty": "FrameTxFrame[]",
+          "description": "Every frame in the transaction, in order."
+        },
+        {
+          "name": "signatures",
+          "ty": "FrameTxSignature[]",
+          "description": "Every signature entry, in order."
+        },
+        {
+          "name": "recentRootReferences",
+          "ty": "FrameTxRecentRootReference[]",
+          "description": "Verified recent-root references in transaction order. Their count is\n reported by `TXPARAM(0x0F)`."
+        },
+        {
+          "name": "trace",
+          "ty": "FrameTxTrace",
+          "description": "Transaction-local state diff and event trace as of the current frame."
+        },
+        {
+          "name": "approvableScopes",
+          "ty": "uint64",
+          "description": "Scopes `APPROVE` may grant, mirroring `frame.flags & 0x3`. A frame that\n asks for anything outside this reverts, as the protocol requires."
+        }
+      ]
+    },
+    {
       "name": "Wallet",
       "description": "A wallet with a public and private key.",
       "fields": [
@@ -3534,6 +3864,26 @@
           73,
           221,
           210
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
+    },
+    {
+      "func": {
+        "id": "clearFrameTx",
+        "description": "Removes the EIP-8141 frame transaction context. The frame opcodes halt again.",
+        "declaration": "function clearFrameTx() external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "clearFrameTx()",
+        "selector": "0x919ef806",
+        "selectorBytes": [
+          145,
+          158,
+          248,
+          6
         ]
       },
       "group": "evm",
@@ -10991,6 +11341,26 @@
       "group": "evm",
       "status": "stable",
       "safety": "safe"
+    },
+    {
+      "func": {
+        "id": "setFrameTx",
+        "description": "Installs an EIP-8141 frame transaction context, so that the frame opcodes\n(`APPROVE`, `TXPARAM`, `FRAMEDATALOAD`, `FRAMEDATACOPY`, `FRAMEPARAM`,\n`SIGPARAM`, `SIGDATACOPY`, `RECENTROOTREFLOAD`, `TXTRACE`, `TXDIFF`, and\n`EVENTDATACOPY`) resolve. Without a context they halt, which is what the\nspecs require outside a frame transaction.",
+        "declaration": "function setFrameTx(FrameTx calldata frameTx) external;",
+        "visibility": "external",
+        "mutability": "",
+        "signature": "setFrameTx((address,uint64,uint64,uint256[],bytes32,bytes32,uint256,uint256,uint256,uint256,uint64,uint64,(uint8,uint8,address,uint64,uint256,bytes,uint8)[],(uint8,address,bytes32,bytes)[],(bytes32,uint64,bytes32)[],((address,uint256,uint256)[],(address,uint256,uint256,uint256)[],(address,bytes32)[],(address,bool,bytes32,bytes32)[],(address,bytes32[],bytes)[],uint256,address),uint64))",
+        "selector": "0xdd313d9d",
+        "selectorBytes": [
+          221,
+          49,
+          61,
+          157
+        ]
+      },
+      "group": "evm",
+      "status": "stable",
+      "safety": "unsafe"
     },
     {
       "func": {

@@ -3043,11 +3043,14 @@ mod tests {
     use super::{Fork, apply_state_changeset};
     use crate::{
         backend::{Backend, ForkPosition},
-        evm::EthEvmNetwork,
+        constants::MONAD_CHEATCODE_ADDRESS,
+        evm::{EthEvmNetwork, FoundryEvmFactory},
         fork::ForkId,
         opts::EvmOpts,
+        precompiles::EC_RECOVER,
     };
     use alloy_consensus::transaction::Recovered;
+    use alloy_evm::{EthEvmFactory, Evm, EvmEnv, EvmFactory, precompiles::Precompile};
     use alloy_network::{
         AnyNetwork, AnyRpcTransaction, AnyTxEnvelope, AnyTxType, UnknownTxEnvelope,
         UnknownTypedTransaction,
@@ -3065,8 +3068,8 @@ mod tests {
         cache::{BlockchainDb, BlockchainDbMeta},
     };
     use revm::{
-        context::{BlockEnv, JournalInner, TxEnv},
-        database::{AccountState, CacheDB, DatabaseRef, DbAccount},
+        context::{BlockEnv, CfgEnv, JournalInner, TxEnv},
+        database::{AccountState, CacheDB, DatabaseRef, DbAccount, EmptyDB},
         primitives::hardfork::SpecId,
         state::{Account, AccountInfo, EvmState, EvmStorageSlot, TransactionId},
     };
@@ -3156,6 +3159,36 @@ mod tests {
             journaled_state.state[&address].storage[&missing_slot].present_value(),
             U256::from(7)
         );
+    }
+
+    #[test]
+    fn persistent_accounts_follow_the_active_network() {
+        let ethereum = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        assert!(!ethereum.inner.persistent_accounts.contains(&MONAD_CHEATCODE_ADDRESS));
+
+        #[cfg(feature = "monad")]
+        {
+            let monad = Backend::<crate::evm::MonadEvmNetwork>::spawn(None).unwrap();
+            assert!(monad.inner.persistent_accounts.contains(&MONAD_CHEATCODE_ADDRESS));
+        }
+    }
+
+    #[test]
+    fn ethereum_no_context_replay_factory_installs_stateful_eip8151() {
+        let factory = EthEvmFactory::default();
+        let mut cfg = CfgEnv::new_with_spec(SpecId::PRAGUE);
+        cfg.enable_eip8151 = true;
+
+        let raw =
+            factory.create_evm(EmptyDB::default(), EvmEnv::new(cfg.clone(), BlockEnv::default()));
+        assert!(raw.precompiles().get(&EC_RECOVER).unwrap().supports_caching());
+
+        let replay = factory.create_evm_with_context(
+            EmptyDB::default(),
+            EvmEnv::new(cfg, BlockEnv::default()),
+            (),
+        );
+        assert!(!replay.precompiles().get(&EC_RECOVER).unwrap().supports_caching());
     }
 
     #[test]

@@ -179,7 +179,7 @@ interface Vm {
     /// A single frame of an EIP-8141 frame transaction, as reported by `FRAMEPARAM`
     /// and `FRAMEDATALOAD`/`FRAMEDATACOPY`.
     struct FrameTxFrame {
-        /// Frame mode: 0 DEFAULT, 1 VERIFY, 2 SENDER.
+        /// Frame mode: 0 DEFAULT, 1 VERIFY, 2 SENDER, 3 POST_TX.
         uint8 mode;
         /// Frame flags. The low two bits are the approval scope.
         uint8 flags;
@@ -209,25 +209,129 @@ interface Vm {
         bytes signature;
     }
 
+    /// A verified EIP-8272 recent-root reference.
+    struct FrameTxRecentRootReference {
+        /// Root source identifier.
+        bytes32 sourceId;
+        /// Consensus slot containing the root.
+        uint64 slot;
+        /// Opaque root committed by the source.
+        bytes32 root;
+    }
+
+    /// One net balance change. Entries must be ordered by ascending account.
+    struct FrameTxBalanceDiff {
+        /// Changed account.
+        address account;
+        /// Balance at transaction start.
+        uint256 balanceBefore;
+        /// Balance as of the POST_TX frame.
+        uint256 balanceAfter;
+    }
+
+    /// One net storage change. Entries must be ordered by `(account, key)`.
+    struct FrameTxStorageDiff {
+        /// Changed account.
+        address account;
+        /// Changed storage key.
+        uint256 key;
+        /// Value at transaction start.
+        uint256 valueBefore;
+        /// Value as of the POST_TX frame.
+        uint256 valueAfter;
+    }
+
+    /// One newly deployed contract. Entries must be ordered by ascending account.
+    struct FrameTxDeployedContract {
+        /// Deployed contract account.
+        address account;
+        /// Current non-empty, non-delegation code hash.
+        bytes32 codeHash;
+    }
+
+    /// Account-level nonce and code-hash changes, ordered by ascending account.
+    struct FrameTxAccountDiff {
+        /// Changed account.
+        address account;
+        /// Whether the nonce differs from transaction pre-state. Nonce values are
+        /// deliberately not exposed.
+        bool nonceChanged;
+        /// Code hash at transaction start.
+        bytes32 codeHashBefore;
+        /// Code hash as of the POST_TX frame.
+        bytes32 codeHashAfter;
+    }
+
+    /// One event in transaction emission order.
+    struct FrameTxEvent {
+        /// Contract that emitted the event.
+        address emitter;
+        /// Topics in LOG order, with at most four entries.
+        bytes32[] topics;
+        /// Non-indexed event data.
+        bytes data;
+    }
+
+    /// A precomputed EIP-7906 transaction trace for POST_TX introspection.
+    /// Balance, account, and deployment entries must be ordered by account;
+    /// storage entries by `(account, key)`; events remain in emission order.
+    struct FrameTxTrace {
+        /// Net balance changes.
+        FrameTxBalanceDiff[] balanceDiffs;
+        /// Net storage changes.
+        FrameTxStorageDiff[] storageDiffs;
+        /// Contracts deployed by the transaction.
+        FrameTxDeployedContract[] deployedContracts;
+        /// Account-level nonce and code-hash changes.
+        FrameTxAccountDiff[] accountDiffs;
+        /// Events in global transaction log order.
+        FrameTxEvent[] events;
+        /// Total gas pre-charge deducted from the payer.
+        uint256 gasPreCharge;
+        /// Account charged the gas pre-charge.
+        address gasPayer;
+    }
+
     /// An EIP-8141 frame transaction context. Passed to `setFrameTx`.
     struct FrameTx {
         /// The declared sender.
         address sender;
-        /// The sender's nonce.
+        /// Shared keyed-nonce sequence (`nonce_seq`), reported by `TXPARAM(0x01)`.
         uint64 nonce;
+        /// Sender's legacy account nonce in the transaction pre-state, reported by
+        /// `TXPARAM(0x0C)`.
+        uint64 legacyNonce;
+        /// Canonically ordered EIP-8250 nonce keys. Their count is reported by
+        /// `TXPARAM(0x0D)` and the first key by `TXPARAM(0x10)`.
+        uint256[] nonceKeys;
+        /// Canonical hash of `nonceKeys`, reported by `TXPARAM(0x0E)`.
+        bytes32 nonceKeysHash;
         /// The canonical signature hash, reported by `TXPARAM(0x08)`.
         bytes32 sigHash;
         /// Maximum cost the payer may be charged, reported by `TXPARAM(0x06)`.
         uint256 maxCost;
+        /// Maximum priority fee per gas, reported by `TXPARAM(0x03)`.
+        uint256 maxPriorityFeePerGas;
+        /// Maximum fee per gas, reported by `TXPARAM(0x04)`.
+        uint256 maxFeePerGas;
+        /// Maximum fee per blob gas, reported by `TXPARAM(0x05)`.
+        uint256 maxFeePerBlobGas;
+        /// Number of blob versioned hashes, reported by `TXPARAM(0x07)`.
+        uint64 blobCount;
         /// Index of the frame currently executing, reported by `TXPARAM(0x0A)`.
         uint64 frameIndex;
-        /// Scopes `APPROVE` may grant, mirroring `frame.flags & 0x3`. A frame that
-        /// asks for anything outside this reverts, as the protocol requires.
-        uint64 approvableScopes;
         /// Every frame in the transaction, in order.
         FrameTxFrame[] frames;
         /// Every signature entry, in order.
         FrameTxSignature[] signatures;
+        /// Verified recent-root references in transaction order. Their count is
+        /// reported by `TXPARAM(0x0F)`.
+        FrameTxRecentRootReference[] recentRootReferences;
+        /// Transaction-local state diff and event trace as of the current frame.
+        FrameTxTrace trace;
+        /// Scopes `APPROVE` may grant, mirroring `frame.flags & 0x3`. A frame that
+        /// asks for anything outside this reverts, as the protocol requires.
+        uint64 approvableScopes;
     }
 
     /// A wallet with a public and private key.
@@ -586,8 +690,9 @@ interface Vm {
 
     /// Installs an EIP-8141 frame transaction context, so that the frame opcodes
     /// (`APPROVE`, `TXPARAM`, `FRAMEDATALOAD`, `FRAMEDATACOPY`, `FRAMEPARAM`,
-    /// `SIGPARAM`) resolve. Without a context they halt, which is what the spec
-    /// requires outside a frame transaction.
+    /// `SIGPARAM`, `SIGDATACOPY`, `RECENTROOTREFLOAD`, `TXTRACE`, `TXDIFF`, and
+    /// `EVENTDATACOPY`) resolve. Without a context they halt, which is what the
+    /// specs require outside a frame transaction.
     #[cheatcode(group = Evm, safety = Unsafe)]
     function setFrameTx(FrameTx calldata frameTx) external;
 

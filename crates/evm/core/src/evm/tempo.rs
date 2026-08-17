@@ -87,19 +87,23 @@ impl FoundryEvmFactory for TempoEvmFactory {
     fn create_evm_with_context<DB: alloy_evm::Database>(
         &self,
         db: DB,
-        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
+        mut evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
         _chain_context: Self::Chain,
     ) -> Self::Evm<DB, revm::inspector::NoOpInspector> {
+        evm_env.cfg_env.enable_eip7851 = false;
+        evm_env.cfg_env.enable_eip8151 = false;
         self.create_evm(db, evm_env)
     }
 
     fn create_foundry_evm_with_inspector<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>>(
         &self,
         db: &'db mut dyn DatabaseExt<Self>,
-        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
+        mut evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
         _chain_context: Self::Chain,
         inspector: I,
     ) -> Self::FoundryEvm<'db, I> {
+        evm_env.cfg_env.enable_eip7851 = false;
+        evm_env.cfg_env.enable_eip8151 = false;
         let is_forked = db.is_forked_mode();
         let spec = *evm_env.spec_id();
         let mut tempo_evm = Self::default().create_evm_with_inspector(db, evm_env, inspector);

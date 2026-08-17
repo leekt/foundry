@@ -1,6 +1,6 @@
 //! Optimism-specific transact helpers for the in-memory backend.
 
-use super::Backend;
+use super::{Backend, without_ethereum_experimental_eips};
 use crate::eth::error::BlockchainError;
 use alloy_evm::{Database, Evm, EvmEnv, EvmFactory};
 use alloy_network::Network;
@@ -34,7 +34,9 @@ impl<N: Network> Backend<N> {
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
         let op_env = EvmEnv::new(
-            evm_env.cfg_env.clone().with_spec_and_mainnet_gas_params(self.hardfork().into()),
+            without_ethereum_experimental_eips(
+                evm_env.cfg_env.clone().with_spec_and_mainnet_gas_params(self.hardfork().into()),
+            ),
             evm_env.block_env.clone(),
         );
         let mut evm = OpEvmFactory::default().create_evm_with_inspector(

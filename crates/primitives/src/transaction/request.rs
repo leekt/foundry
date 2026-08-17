@@ -582,7 +582,9 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
             #[cfg(feature = "optimism")]
             FoundryTxType::PostExec => self.complete_type(pref).ok(),
             FoundryTxType::Tempo => self.complete_tempo().ok(),
-            FoundryTxType::Frame => Err(vec!["frame txs must be sent via eth_sendRawTransaction"]).ok(),
+            FoundryTxType::Frame => {
+                Err(vec!["frame txs must be sent via eth_sendRawTransaction"]).ok()
+            }
         }?;
         Some(pref)
     }

@@ -562,24 +562,27 @@ snapbox = { version = "1.2", features = ["json", "regex", "term-svg"] }
 idna_adapter = "=1.1.0"
 
 [patch.crates-io]
-# EIP-8141 frame transaction opcodes (APPROVE 0xaa, and TXPARAM / FRAMEDATALOAD /
-# FRAMEDATACOPY / FRAMEPARAM / SIGPARAM at 0xb0-0xb4). Without this patch revm
-# halts on them as invalid opcodes and no frame account can be executed.
+# EIP-8141 frame transaction opcodes (APPROVE 0xaa, TXPARAM through SIGPARAM at
+# 0xb0-0xb4, and native SIGDATACOPY at 0xb5), plus experimental EIP-8272/EIP-7906
+# opcodes at 0xb6-0xb9, EIP-7819 SETDELEGATE at 0xf6, and the toolkit-local,
+# non-normative EIP-7851 SETSELFDELEGATE assignment at 0xf7, plus EIP-8151
+# configuration and raw-code eligibility support. Without this patch revm halts on the
+# custom opcodes as invalid and Foundry cannot activate the experimental protocol behavior.
 #
 # Every revm crate must be patched together: patching a subset puts two versions
 # of revm-state and revm-primitives in the graph, and their types stop unifying.
-revm = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-bytecode = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-context = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-context-interface = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-database = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-database-interface = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-handler = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-inspector = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-interpreter = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-precompile = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-primitives = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
-revm-state = { git = "https://github.com/leekt/revm", branch = "feat/eip8141-frame-opcodes" }
+revm = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-bytecode = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-context = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-context-interface = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-database = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-database-interface = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-handler = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-inspector = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-interpreter = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-precompile = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-primitives = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
+revm-state = { git = "https://github.com/leekt/revm", rev = "2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba" }
 solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-cli = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-lint = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }

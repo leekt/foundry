@@ -22,6 +22,7 @@ use crate::{
     FoundryContextExt, FoundryInspectorExt,
     backend::{DatabaseExt, JournaledState},
     evm::{FoundryEvmFactory, NestedEvm, NestedEvmFor},
+    precompiles::install_eip8151_precompile,
 };
 
 type EthEvmHandler<'db, I> = MainnetHandler<EthRevmEvm<'db, I>, EVMError<DatabaseError>, EthFrame>;
@@ -47,7 +48,10 @@ impl FoundryEvmFactory for EthEvmFactory {
         evm_env: EvmEnv,
         _chain_context: Self::Chain,
     ) -> Self::Evm<DB, revm::inspector::NoOpInspector> {
-        self.create_evm(db, evm_env)
+        let mut eth_evm = self.create_evm(db, evm_env);
+        let cfg = eth_evm.cfg.clone();
+        install_eip8151_precompile(eth_evm.precompiles_mut(), &cfg);
+        eth_evm
     }
 
     fn create_foundry_evm_with_inspector<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>>(
@@ -61,6 +65,8 @@ impl FoundryEvmFactory for EthEvmFactory {
         let timestamp = evm_env.block_env.timestamp.saturating_to();
         let mut eth_evm = Self::default().create_evm_with_inspector(db, evm_env, inspector);
         eth_evm.cfg.tx_chain_id_check = true;
+        let cfg = eth_evm.cfg.clone();
+        install_eip8151_precompile(eth_evm.precompiles_mut(), &cfg);
         let networks = eth_evm.inspector().get_networks();
         networks.inject_precompiles(eth_evm.precompiles_mut());
         networks.inject_chain_precompiles(eth_evm.precompiles_mut(), chain_id, timestamp);

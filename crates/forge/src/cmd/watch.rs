@@ -1,0 +1,628 @@
+use super::{
+    build::BuildArgs, coverage::CoverageArgs, doc::DocArgs, fmt::FmtArgs,
+    snapshot::GasSnapshotArgs, test::TestArgs,
+};
+use alloy_primitives::map::HashSet;
+use clap::Parser;
+use eyre::Result;
+use foundry_cli::utils::{self, FoundryPathExt, LoadConfig};
+use foundry_config::Config;
+use parking_lot::Mutex;
+use std::{
+    io::IsTerminal,
+    path::PathBuf,
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::Duration,
+};
+use tokio::process::Command as TokioCommand;
+use watchexec::{
+    Watchexec,
+    action::ActionHandler,
+    command::{Command, Program},
+    job::{CommandState, Job},
+    paths::summarise_events_to_env,
+};
+use watchexec_events::{
+    Event, KeyCode, Keyboard, Priority, ProcessEnd, Tag,
+    filekind::{AccessKind, FileEventKind},
+};
+use watchexec_signals::Signal;
+use yansi::{Color, Paint};
+
+type SpawnHook = Arc<dyn Fn(&[Event], &mut TokioCommand) + Send + Sync + 'static>;
+type KeyboardConfig = Arc<OnceLock<Weak<watchexec::Config>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardAction {
+    Rerun,
+    Quit,
+}
+
+fn keyboard_action(events: &[Event]) -> Option<KeyboardAction> {
+    let mut rerun = false;
+
+    for tag in events.iter().flat_map(|event| &event.tags) {
+        match tag {
+            Tag::Keyboard(Keyboard::Eof) => return Some(KeyboardAction::Quit),
+            Tag::Keyboard(Keyboard::Key { key: KeyCode::Char('a'), modifiers })
+                if modifiers.is_empty() =>
+            {
+                rerun = true;
+            }
+            _ => {}
+        }
+    }
+
+    rerun.then_some(KeyboardAction::Rerun)
+}
+
+fn set_keyboard_events(config: &Option<KeyboardConfig>, enable: bool) {
+    if let Some(config) = config.as_ref().and_then(|config| config.get()).and_then(Weak::upgrade) {
+        config.keyboard_events(enable);
+    }
+}
+
+#[derive(Clone, Debug, Default, Parser)]
+#[command(next_help_heading = "Watch options")]
+pub struct WatchArgs {
+    /// Watch the given files or directories for changes.
+    ///
+    /// If no paths are provided, the source and test directories of the project are watched.
+    #[arg(long, short, num_args(0..), value_name = "PATH")]
+    pub watch: Option<Vec<PathBuf>>,
+
+    /// Do not restart the command while it's still running.
+    #[arg(long)]
+    pub no_restart: bool,
+
+    /// Explicitly re-run all tests when a change is made.
+    ///
+    /// By default, only the tests of the last modified test file are executed.
+    #[arg(long)]
+    pub run_all: bool,
+
+    /// Re-run only previously failed tests first when a change is made.
+    ///
+    /// If all previously failed tests pass, the full test suite will be run automatically.
+    /// This is particularly useful for TDD workflows where you want fast feedback on failures.
+    #[arg(long, alias = "rerun-failures")]
+    pub rerun_failed: bool,
+
+    /// File update debounce delay.
+    ///
+    /// During the delay, incoming change events are accumulated and
+    /// only once the delay has passed, is an action taken. Note that
+    /// this does not mean a command will be started: if --no-restart is
+    /// given and a command is already running, the outcome of the
+    /// action will be to do nothing.
+    ///
+    /// Defaults to 50ms. Parses as decimal seconds by default, but
+    /// using an integer with the `ms` suffix may be more convenient.
+    ///
+    /// When using --poll mode, you'll want a larger duration, or risk
+    /// overloading disk I/O.
+    #[arg(long, value_name = "DELAY")]
+    pub watch_delay: Option<String>,
+}
+
+impl WatchArgs {
+    /// Creates a new [`watchexec::Config`].
+    ///
+    /// If paths were provided as arguments the these will be used as the watcher's pathset,
+    /// otherwise the path the closure returns will be used.
+    pub fn watchexec_config<PS: IntoIterator<Item = P>, P: Into<PathBuf>>(
+        &self,
+        default_paths: impl FnOnce() -> Result<PS>,
+    ) -> Result<watchexec::Config> {
+        self.watchexec_config_generic(default_paths, None, None)
+    }
+
+    /// Creates a new [`watchexec::Config`] with a custom command spawn hook and optional keyboard
+    /// events while the command is idle.
+    ///
+    /// If paths were provided as arguments the these will be used as the watcher's pathset,
+    /// otherwise the path the closure returns will be used.
+    fn watchexec_config_with_override<PS: IntoIterator<Item = P>, P: Into<PathBuf>>(
+        &self,
+        default_paths: impl FnOnce() -> Result<PS>,
+        watch_keyboard: bool,
+        spawn_hook: impl Fn(&[Event], &mut TokioCommand) + Send + Sync + 'static,
+    ) -> Result<(watchexec::Config, Option<KeyboardConfig>)> {
+        let keyboard_config = watch_keyboard.then(|| Arc::new(OnceLock::new()));
+        let config = self.watchexec_config_generic(
+            default_paths,
+            Some(Arc::new(spawn_hook)),
+            keyboard_config.clone(),
+        )?;
+        Ok((config, keyboard_config))
+    }
+
+    fn watchexec_config_generic<PS: IntoIterator<Item = P>, P: Into<PathBuf>>(
+        &self,
+        default_paths: impl FnOnce() -> Result<PS>,
+        spawn_hook: Option<SpawnHook>,
+        keyboard_config: Option<KeyboardConfig>,
+    ) -> Result<watchexec::Config> {
+        let mut paths = self.watch.as_deref().unwrap_or_default();
+        let storage: Vec<_>;
+        if paths.is_empty() {
+            storage = default_paths()?.into_iter().map(Into::into).filter(|p| p.exists()).collect();
+            paths = &storage;
+        }
+        self.watchexec_config_inner(paths, spawn_hook, keyboard_config)
+    }
+
+    fn watchexec_config_inner(
+        &self,
+        paths: &[PathBuf],
+        spawn_hook: Option<SpawnHook>,
+        keyboard_config: Option<KeyboardConfig>,
+    ) -> Result<watchexec::Config> {
+        let config = watchexec::Config::default();
+
+        config.on_error(|err| {
+            let _ = sh_eprintln!("[[{err:?}]]");
+        });
+
+        if let Some(delay) = &self.watch_delay {
+            config.throttle(utils::parse_delay(delay)?);
+        }
+
+        config.pathset(paths.iter().map(|p| p.as_path()));
+
+        let n_path_args = self.watch.as_deref().unwrap_or_default().len();
+        let base_command = Arc::new(watch_command(cmd_args(n_path_args)));
+
+        let id = watchexec::Id::default();
+        let quit_again = Arc::new(AtomicU8::new(0));
+        let stop_timeout = Duration::from_secs(5);
+        let no_restart = self.no_restart;
+        let stop_signal = Signal::Terminate;
+        config.on_action(move |mut action| {
+            let base_command = base_command.clone();
+            let job = action.get_or_create_job(id, move || base_command.clone());
+
+            let events = action.events.clone();
+            let spawn_hook = spawn_hook.clone();
+            job.set_spawn_hook(move |command, _| {
+                // https://github.com/watchexec/watchexec/blob/72f069a8477c679e45f845219276b0bfe22fed79/crates/cli/src/emits.rs#L9
+                let env = summarise_events_to_env(events.iter());
+                for (k, v) in env {
+                    command.command_mut().env(format!("WATCHEXEC_{k}_PATH"), v);
+                }
+
+                if let Some(spawn_hook) = &spawn_hook {
+                    spawn_hook(&events, command.command_mut());
+                }
+            });
+
+            let clear_screen = || {
+                let _ = clearscreen::clear();
+            };
+
+            let quit = |mut action: ActionHandler| {
+                match quit_again.fetch_add(1, Ordering::Relaxed) {
+                    0 => {
+                        let _ = sh_eprintln!(
+                            "[Waiting {stop_timeout:?} for processes to exit before stopping... \
+                             Ctrl-C again to exit faster]"
+                        );
+                        action.quit_gracefully(stop_signal, stop_timeout);
+                    }
+                    1 => action.quit_gracefully(Signal::ForceStop, Duration::ZERO),
+                    _ => action.quit(),
+                }
+
+                action
+            };
+
+            let signals = action.signals().collect::<Vec<_>>();
+            let keyboard_action = keyboard_action(&action.events);
+
+            if signals.contains(&Signal::Terminate)
+                || signals.contains(&Signal::Interrupt)
+                || keyboard_action == Some(KeyboardAction::Quit)
+            {
+                return quit(action);
+            }
+
+            // Only filesystem, keyboard rerun, or empty synthetic events below here.
+            if action.paths().next().is_none()
+                && keyboard_action != Some(KeyboardAction::Rerun)
+                && !action.events.iter().any(|e| e.is_empty())
+            {
+                debug!("no filesystem, rerun, or synthetic events, skip without doing more");
+                return action;
+            }
+
+            if cfg!(target_os = "linux") && keyboard_action != Some(KeyboardAction::Rerun) {
+                // Reading a file now triggers `Access(Open)` events on Linux due to:
+                // https://github.com/notify-rs/notify/pull/612
+                // This causes an infinite rebuild loop: the build reads a file,
+                // which triggers a notification, which restarts the build, and so on.
+                // To prevent this, we ignore `Access(Open)` events during event processing.
+                let mut has_file_events = false;
+                let mut has_synthetic_events = false;
+                'outer: for e in action.events.iter() {
+                    if e.is_empty() {
+                        has_synthetic_events = true;
+                        break;
+                    }
+                    for tag in &e.tags {
+                        if let Tag::FileEventKind(kind) = tag
+                            && !matches!(kind, FileEventKind::Access(AccessKind::Open(_))) {
+                                has_file_events = true;
+                                break 'outer;
+                            }
+                    }
+                }
+                if !has_file_events && !has_synthetic_events {
+                    debug!("no filesystem events (other than Access(Open)) or synthetic events, skip without doing more");
+                    return action;
+                }
+            }
+
+            // Let the child own stdin while it runs. This keeps prompts and the debugger from
+            // racing Watchexec's keyboard event source for terminal input.
+            set_keyboard_events(&keyboard_config, false);
+
+            job.run({
+                let job = job.clone();
+                let keyboard_config = keyboard_config.clone();
+                move |context| {
+                    if context.current.is_running() && no_restart {
+                        return;
+                    }
+                    job.restart_with_signal(stop_signal, stop_timeout);
+                    job.run({
+                        let job = job.clone();
+                        move |context| {
+                            clear_screen();
+                            setup_process(job, &context.command, keyboard_config)
+                        }
+                    });
+                }
+            });
+
+            action
+        });
+
+        Ok(config)
+    }
+}
+
+fn setup_process(job: Job, _command: &Command, keyboard_config: Option<KeyboardConfig>) {
+    tokio::spawn(async move {
+        job.to_wait().await;
+        job.run(move |context| end_of_process(context.current, keyboard_config));
+    });
+}
+
+fn end_of_process(state: &CommandState, keyboard_config: Option<KeyboardConfig>) {
+    let CommandState::Finished { status, started, finished } = state else {
+        return;
+    };
+
+    let duration = *finished - *started;
+    let timings = true;
+    let timing = if timings { format!(", lasted {duration:?}") } else { String::new() };
+    let (msg, fg) = match status {
+        ProcessEnd::ExitError(code) => (format!("Command exited with {code}{timing}"), Color::Red),
+        ProcessEnd::ExitSignal(sig) => {
+            (format!("Command killed by {sig:?}{timing}"), Color::Magenta)
+        }
+        ProcessEnd::ExitStop(sig) => (format!("Command stopped by {sig:?}{timing}"), Color::Blue),
+        ProcessEnd::Continued => (format!("Command continued{timing}"), Color::Cyan),
+        ProcessEnd::Exception(ex) => {
+            (format!("Command ended by exception {ex:#x}{timing}"), Color::Yellow)
+        }
+        ProcessEnd::Success => (format!("Command was successful{timing}"), Color::Green),
+    };
+
+    let quiet = false;
+    set_keyboard_events(&keyboard_config, true);
+    if !quiet {
+        let _ = sh_eprintln!("{}", format!("[{msg}]").paint(fg.foreground()));
+    }
+}
+
+/// Runs the given [`watchexec::Config`].
+pub async fn run(config: watchexec::Config) -> Result<()> {
+    run_inner(config, None).await
+}
+
+async fn run_inner(
+    config: watchexec::Config,
+    keyboard_config: Option<KeyboardConfig>,
+) -> Result<()> {
+    let wx = Watchexec::with_config(config)?;
+    if let Some(config) = keyboard_config {
+        debug_assert!(config.set(Arc::downgrade(&wx.config)).is_ok());
+    }
+    wx.send_event(Event::default(), Priority::Urgent).await?;
+    wx.main().await??;
+    Ok(())
+}
+
+/// Executes a [`Watchexec`] that listens for changes in the project's src dir and reruns `forge
+/// build`
+pub async fn watch_build(args: BuildArgs) -> Result<()> {
+    let config = args.watchexec_config()?;
+    run(config).await
+}
+
+/// Executes a [`Watchexec`] that listens for changes in the project's src dir and reruns `forge
+/// snapshot`
+pub async fn watch_gas_snapshot(args: GasSnapshotArgs) -> Result<()> {
+    let config = args.watchexec_config()?;
+    run(config).await
+}
+
+/// Executes a [`Watchexec`] that listens for changes in the project's src dir and reruns `forge
+/// test`
+pub async fn watch_test(args: TestArgs) -> Result<()> {
+    let config: Config = args.build.load_config()?;
+    let filter = args.filter(&config)?;
+    // Marker to check whether to override the command.
+    let no_reconfigure = filter.args().test_pattern.is_some()
+        || filter.args().path_pattern.is_some()
+        || filter.args().contract_pattern.is_some()
+        || args.watch.run_all;
+
+    let last_test_files = Mutex::new(HashSet::<String>::default());
+    let project_root = config.root.to_string_lossy().into_owned();
+    let test_failures_file = config.test_failures_file.clone();
+    let rerun_failed = args.watch.rerun_failed;
+    let watch_keyboard = std::io::stdin().is_terminal();
+
+    let (config, keyboard_config) = args.watch.watchexec_config_with_override(
+        || Ok([&config.test, &config.src]),
+        watch_keyboard,
+        move |events, command| {
+            if keyboard_action(events) == Some(KeyboardAction::Rerun) {
+                return;
+            }
+
+            // Check if we should prioritize rerunning failed tests
+            let has_failures = rerun_failed && test_failures_file.exists();
+
+            if has_failures {
+                // Smart mode: rerun failed tests first
+                trace!("Smart watch mode: will rerun failed tests first");
+                command.arg("--rerun");
+                // Don't add file-specific filters when rerunning failures
+                return;
+            }
+
+            let mut changed_sol_test_files: HashSet<_> = events
+                .iter()
+                .flat_map(|e| e.paths())
+                .filter(|(path, _)| path.is_sol_test())
+                .filter_map(|(path, _)| path.to_str())
+                .map(str::to_string)
+                .collect();
+
+            if changed_sol_test_files.len() > 1 {
+                // Run all tests if multiple files were changed at once, for example when running
+                // `forge fmt`.
+                return;
+            }
+
+            if changed_sol_test_files.is_empty() {
+                // Reuse the old test files if a non-test file was changed.
+                let last = last_test_files.lock();
+                if last.is_empty() {
+                    return;
+                }
+                changed_sol_test_files = last.clone();
+            }
+
+            // append `--match-path` glob
+            let mut file = changed_sol_test_files.iter().next().expect("test file present").clone();
+
+            // remove the project root dir from the detected file
+            if let Some(f) = file.strip_prefix(&project_root) {
+                file = f.trim_start_matches('/').to_string();
+            }
+
+            trace!(?file, "reconfigure test command");
+
+            // Before appending `--match-path`, check if it already exists
+            if !no_reconfigure {
+                command.arg("--match-path").arg(file);
+            }
+        },
+    )?;
+
+    if watch_keyboard {
+        let _ = sh_eprintln!("[Press 'a' to rerun all tests]");
+    }
+
+    run_inner(config, keyboard_config).await
+}
+
+pub async fn watch_coverage(args: CoverageArgs) -> Result<()> {
+    args.ensure_mode_compatible()?;
+
+    let config = args.watch().watchexec_config(|| {
+        let config = args.load_config()?;
+        Ok([config.test, config.src])
+    })?;
+    run(config).await
+}
+
+pub async fn watch_fmt(args: FmtArgs) -> Result<()> {
+    let config = args.watch.watchexec_config(|| {
+        let config = args.load_config()?;
+        Ok([config.src, config.test, config.script])
+    })?;
+    run(config).await
+}
+
+/// Executes a [`Watchexec`] that listens for changes affecting the generated
+/// documentation: project sources, optionally library sources, the README that
+/// becomes the homepage, the deployments directory, and the foundry config file
+/// itself. Without these, the live preview goes silently stale on common edits.
+pub async fn watch_doc(args: DocArgs) -> Result<()> {
+    let include_libraries = args.include_libraries;
+    let deployments_arg = args.deployments.clone();
+    let config = args.watch.watchexec_config(|| {
+        let config = args.config()?;
+        let root = config.root.clone();
+
+        let mut paths = Vec::new();
+
+        // Solidity sources.
+        paths.push(config.src.clone());
+
+        // External libraries when explicitly opted in.
+        if include_libraries {
+            for lib in &config.libs {
+                paths.push(lib.clone());
+            }
+        }
+
+        // Homepage source: explicit override, else <root>/README.md when present.
+        if let Some(hp) = &config.doc.homepage {
+            let hp_path = if hp.is_absolute() { hp.clone() } else { root.join(hp) };
+            if hp_path.exists() {
+                paths.push(hp_path);
+            }
+        }
+        // Mirror vocs homepage resolution: <sources>/README.md takes priority over
+        // <root>/README.md.
+        let src_readme = config.src.join("README.md");
+        if src_readme.exists() {
+            paths.push(src_readme);
+        }
+        let readme = root.join("README.md");
+        if readme.exists() {
+            paths.push(readme);
+        }
+
+        // Deployments directory: only when the user enabled `--deployments`.
+        if let Some(dir_opt) = deployments_arg.as_ref() {
+            let dep_dir = match dir_opt {
+                Some(p) if p.is_absolute() => p.clone(),
+                Some(p) => root.join(p),
+                None => root.join("deployments"),
+            };
+            if dep_dir.exists() {
+                paths.push(dep_dir);
+            }
+        }
+
+        // Foundry config file (`foundry.toml`), when present.
+        let toml = root.join("foundry.toml");
+        if toml.exists() {
+            paths.push(toml);
+        }
+
+        Ok(paths)
+    })?;
+    run(config).await
+}
+
+/// Converts a list of arguments to a `watchexec::Command`.
+///
+/// The first index in `args` is the path to the executable.
+///
+/// # Panics
+///
+/// Panics if `args` is empty.
+fn watch_command(mut args: Vec<String>) -> Command {
+    debug_assert!(!args.is_empty());
+    let prog = args.remove(0);
+    Command { program: Program::Exec { prog: prog.into(), args }, options: Default::default() }
+}
+
+/// Returns the env args without the `--watch` flag from the args for the Watchexec command
+fn cmd_args(num: usize) -> Vec<String> {
+    clean_cmd_args(num, std::env::args().collect())
+}
+
+#[instrument(level = "debug", ret)]
+fn clean_cmd_args(num: usize, mut cmd_args: Vec<String>) -> Vec<String> {
+    if let Some(pos) = cmd_args.iter().position(|arg| arg == "--watch" || arg == "-w") {
+        cmd_args.drain(pos..=(pos + num));
+    }
+
+    // There's another edge case where short flags are combined into one which is supported by clap,
+    // like `-vw` for verbosity and watch
+    // this removes any `w` from concatenated short flags
+    if let Some(pos) = cmd_args.iter().position(|arg| {
+        fn contains_w_in_short(arg: &str) -> Option<bool> {
+            let mut iter = arg.chars().peekable();
+            if *iter.peek()? != '-' {
+                return None;
+            }
+            iter.next();
+            if *iter.peek()? == '-' {
+                return None;
+            }
+            Some(iter.any(|c| c == 'w'))
+        }
+        contains_w_in_short(arg).unwrap_or(false)
+    }) {
+        let clean_arg = cmd_args[pos].replace('w', "");
+        if clean_arg == "-" {
+            cmd_args.remove(pos);
+        } else {
+            cmd_args[pos] = clean_arg;
+        }
+    }
+
+    cmd_args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use watchexec_events::Modifiers;
+
+    fn key_event(key: char, modifiers: Modifiers) -> Event {
+        Event {
+            tags: vec![Tag::Keyboard(Keyboard::Key { key: KeyCode::Char(key), modifiers })],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classifies_keyboard_actions() {
+        assert_eq!(
+            keyboard_action(&[key_event('a', Modifiers::default())]),
+            Some(KeyboardAction::Rerun)
+        );
+        assert_eq!(keyboard_action(&[key_event('x', Modifiers::default())]), None);
+        assert_eq!(
+            keyboard_action(&[key_event('a', Modifiers { ctrl: true, ..Default::default() })]),
+            None
+        );
+
+        let eof = Event { tags: vec![Tag::Keyboard(Keyboard::Eof)], ..Default::default() };
+        assert_eq!(
+            keyboard_action(&[key_event('a', Modifiers::default()), eof]),
+            Some(KeyboardAction::Quit)
+        );
+    }
+
+    #[test]
+    fn parse_cmd_args() {
+        let args = vec!["-vw".to_string()];
+        let cleaned = clean_cmd_args(0, args);
+        assert_eq!(cleaned, vec!["-v".to_string()]);
+    }
+
+    #[test]
+    fn locked_survives_cleaning_watch_args() {
+        let args =
+            ["forge", "build", "--locked", "--watch", "src", "test"].map(str::to_string).to_vec();
+        assert_eq!(clean_cmd_args(2, args), ["forge", "build", "--locked"].map(str::to_string));
+
+        let args = ["forge", "build", "--watch", "src", "--locked"].map(str::to_string).to_vec();
+        assert_eq!(clean_cmd_args(1, args), ["forge", "build", "--locked"].map(str::to_string));
+    }
+}

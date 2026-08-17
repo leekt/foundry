@@ -1,0 +1,604 @@
+//! tests for anvil specific logic
+
+use alloy_consensus::EMPTY_ROOT_HASH;
+use alloy_eips::BlockNumberOrTag;
+use alloy_network::{ReceiptResponse, TransactionBuilder};
+use alloy_primitives::{Address, B256, Bytes, U256, address, bytes, hex};
+use alloy_provider::Provider;
+use alloy_rpc_types::{BlockId, TransactionRequest};
+use alloy_sol_types::SolCall;
+use anvil::{NodeConfig, spawn};
+use foundry_evm::{core::precompiles::P256_VERIFY, hardfork::EthereumHardfork};
+
+const BSC_MAINNET_CHAIN_ID: u64 = 56;
+const BSC_MAINNET_HABER_TIMESTAMP: u64 = 1_718_863_500;
+const P256_INPUT: [u8; 160] = hex!(
+    "4cee90eb86eaa050036147a12d49004b6b9c72bd725d39d4785011fe190f0b4d\
+     a73bd4903f0ce3b639bbbf6e8e80d16931ff4bcf5993d58468e8fb19086e8cac\
+     36dbcd03009df8c59286b162af3bd7fcc0450c9aa81be5d10d312af6c66b1d604\
+     aebd3099c618202fcfe16ae7770b0c49ab5eadf74b754204a3bb6060e44eff376\
+     18b065f9832de4ca6ca971a7a1adc826d0f7c00181a5fb2ddf79ae00b4e10e"
+);
+// Copies calldata into memory, calls P256, and stores its returned word in slot zero.
+const P256_CALLER_CODE: [u8; 26] = hex!("366000600037602060003660006101005afa5060005160005500");
+
+const SETDELEGATE_FACTORY: Address = address!("1111111111111111111111111111111111111111");
+const SETDELEGATE_LOCATION: Address = address!("7a41c03bf3062738d4ad052749101d8ec0f5639d");
+const SETDELEGATE_TARGET: Address = address!("2222222222222222222222222222222222222222");
+const SETDELEGATE_RUNTIME: Bytes = bytes!("7322222222222222222222222222222222222222225ff600");
+const UPDATED_SETDELEGATE_RUNTIME: Bytes =
+    bytes!("7333333333333333333333333333333333333333335ff600");
+const CLEAR_SETDELEGATE_RUNTIME: Bytes = bytes!("5f5ff600");
+const DELEGATION_CODE: Bytes = bytes!("ef01002222222222222222222222222222222222222222");
+const UPDATED_DELEGATION_CODE: Bytes = bytes!("ef01003333333333333333333333333333333333333333");
+const IMMEDIATE_SETDELEGATE_RUNTIME: Bytes =
+    bytes!("60205f5f5f5f7322222222222222222222222222222222222222225ff661fffff15060205ff3");
+const RETURN_42_RUNTIME: Bytes = bytes!("602a5f5260205ff3");
+const STATICCALLER: Address = address!("4444444444444444444444444444444444444444");
+const STATIC_SETDELEGATE_RUNTIME: Bytes =
+    bytes!("5f5f5f5f73111111111111111111111111111111111111111161fffffa5f5260205ff3");
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_handle_releases_http_listener() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let addr = *handle.socket_address();
+
+    drop(handle);
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    drop(listener);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("HTTP listener should shut down after NodeHandle is dropped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_can_change_mining_mode() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    assert!(api.anvil_get_auto_mine().unwrap());
+    assert!(api.anvil_get_interval_mining().unwrap().is_none());
+
+    let num = provider.get_block_number().await.unwrap();
+    assert_eq!(num, 0);
+
+    api.anvil_set_interval_mining(1).unwrap();
+    assert!(!api.anvil_get_auto_mine().unwrap());
+    assert!(matches!(api.anvil_get_interval_mining().unwrap(), Some(1)));
+    // changing the mining mode will instantly mine a new block
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let num = provider.get_block_number().await.unwrap();
+    assert_eq!(num, 0);
+
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let num = provider.get_block_number().await.unwrap();
+    assert_eq!(num, 1);
+
+    // assert that no block is mined when the interval is set to 0
+    api.anvil_set_interval_mining(0).unwrap();
+    assert!(!api.anvil_get_auto_mine().unwrap());
+    assert!(api.anvil_get_interval_mining().unwrap().is_none());
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let num = provider.get_block_number().await.unwrap();
+    assert_eq!(num, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn can_get_default_dev_keys() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    let dev_accounts = handle.dev_accounts().collect::<Vec<_>>();
+    let accounts = provider.get_accounts().await.unwrap();
+
+    assert_eq!(dev_accounts, accounts);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn can_set_empty_code() {
+    let (api, _handle) = spawn(NodeConfig::test()).await;
+    let addr = Address::random();
+    api.anvil_set_code(addr, Vec::new().into()).await.unwrap();
+    let code = api.get_code(addr, None).await.unwrap();
+    assert!(code.as_ref().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_can_set_genesis_timestamp() {
+    let genesis_timestamp = 1000u64;
+    let (_api, handle) =
+        spawn(NodeConfig::test().with_genesis_timestamp(genesis_timestamp.into())).await;
+    let provider = handle.http_provider();
+
+    assert_eq!(
+        genesis_timestamp,
+        provider.get_block(0.into()).await.unwrap().unwrap().header.timestamp
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bsc_haber_p256_is_available_for_calls_and_mining() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_chain_id(Some(BSC_MAINNET_CHAIN_ID))
+            .with_hardfork(Some(EthereumHardfork::Cancun.into()))
+            .with_genesis_timestamp(Some(BSC_MAINNET_HABER_TIMESTAMP)),
+    )
+    .await;
+    let provider = handle.http_provider();
+
+    let tx = TransactionRequest::default().with_to(P256_VERIFY).with_input(P256_INPUT);
+    assert_eq!(
+        api.config().unwrap().current.precompiles.values().find(|&&address| address == P256_VERIFY),
+        Some(&P256_VERIFY)
+    );
+    for block in [
+        BlockId::Number(BlockNumberOrTag::Latest),
+        BlockId::Number(0_u64.into()),
+        BlockId::pending(),
+    ] {
+        let output = provider.call(tx.clone().into()).block(block).await.unwrap();
+        assert_eq!(output.as_ref(), B256::with_last_byte(1).as_slice());
+    }
+
+    let caller = Address::random();
+    api.anvil_set_code(caller, P256_CALLER_CODE.to_vec().into()).await.unwrap();
+    let from = handle.dev_accounts().next().unwrap();
+    let receipt = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(caller)
+                .with_input(P256_INPUT)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(receipt.status());
+    assert_eq!(provider.get_storage_at(caller, U256::ZERO).await.unwrap(), U256::from(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_requires_explicit_prague_activation() {
+    let (api, handle) =
+        spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()))).await;
+    let provider = handle.http_provider();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let err = provider
+        .call(
+            TransactionRequest::default()
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NotActivated"), "unexpected error: {err}");
+
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Cancun.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let err = provider
+        .call(
+            TransactionRequest::default()
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NotActivated"), "unexpected error: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_updates_clears_refunds_and_survives_reset() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Prague.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    let from = handle.dev_accounts().next().unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let first = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(first.status());
+    assert_eq!(
+        provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(),
+        DELEGATION_CODE.as_ref()
+    );
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+
+    api.anvil_set_code(SETDELEGATE_FACTORY, UPDATED_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let updated = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(updated.status());
+    assert!(
+        updated.gas_used() < first.gas_used(),
+        "existing-account update used {} gas; initial install used {}",
+        updated.gas_used(),
+        first.gas_used()
+    );
+    assert_eq!(
+        provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(),
+        UPDATED_DELEGATION_CODE.as_ref()
+    );
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+
+    api.anvil_set_code(SETDELEGATE_FACTORY, CLEAR_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let cleared = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(cleared.status());
+    assert!(provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().is_empty());
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+
+    api.anvil_reset(None).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let provider = handle.http_provider();
+    let after_reset = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(after_reset.status());
+    assert_eq!(
+        provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(),
+        DELEGATION_CODE.as_ref()
+    );
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_rejects_collisions_and_static_context() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Prague.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    let from = handle.dev_accounts().next().unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_LOCATION, bytes!("00")).await.unwrap();
+
+    let collision = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(!collision.status());
+    assert_eq!(provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(), &[0]);
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 0);
+
+    api.anvil_reset(None).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_code(STATICCALLER, STATIC_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let output = provider
+        .call(TransactionRequest::default().with_to(STATICCALLER).with_gas_limit(100_000).into())
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(output.as_ref()), U256::ZERO);
+    assert!(provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_is_immediately_effective() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Prague.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    api.anvil_set_code(SETDELEGATE_TARGET, RETURN_42_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, IMMEDIATE_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let output = provider
+        .call(
+            TransactionRequest::default()
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(output.as_ref()), U256::from(42));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bsc_fork_execution_chain_override_preserves_p256() {
+    let (_origin_api, origin_handle) = spawn(
+        NodeConfig::test()
+            .with_chain_id(Some(BSC_MAINNET_CHAIN_ID))
+            .with_hardfork(Some(EthereumHardfork::Cancun.into()))
+            .with_genesis_timestamp(Some(BSC_MAINNET_HABER_TIMESTAMP)),
+    )
+    .await;
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_chain_id(Some(1u64))
+            .with_no_storage_caching(true)
+            .with_eth_rpc_url(Some(origin_handle.http_endpoint())),
+    )
+    .await;
+    let provider = handle.http_provider();
+
+    assert_eq!(provider.get_chain_id().await.unwrap(), 1);
+    assert!(
+        api.config().unwrap().current.precompiles.values().any(|&address| address == P256_VERIFY)
+    );
+    let output = provider
+        .call(TransactionRequest::default().with_to(P256_VERIFY).with_input(P256_INPUT).into())
+        .await
+        .unwrap();
+    assert_eq!(output.as_ref(), B256::with_last_byte(1).as_slice());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bsc_default_timestamp_enables_p256_immediately() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_chain_id(Some(BSC_MAINNET_CHAIN_ID))
+            .with_hardfork(Some(EthereumHardfork::Cancun.into())),
+    )
+    .await;
+    let provider = handle.http_provider();
+
+    assert!(
+        api.config().unwrap().current.precompiles.values().any(|&address| address == P256_VERIFY)
+    );
+    let output = provider
+        .call(TransactionRequest::default().with_to(P256_VERIFY).with_input(P256_INPUT).into())
+        .await
+        .unwrap();
+    assert_eq!(output.as_ref(), B256::with_last_byte(1).as_slice());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bsc_pre_haber_eth_config_omits_p256() {
+    let (api, _handle) = spawn(
+        NodeConfig::test()
+            .with_chain_id(Some(BSC_MAINNET_CHAIN_ID))
+            .with_hardfork(Some(EthereumHardfork::Osaka.into()))
+            .with_genesis_timestamp(Some(BSC_MAINNET_HABER_TIMESTAMP - 1)),
+    )
+    .await;
+
+    assert!(
+        !api.config()
+            .unwrap()
+            .current
+            .precompiles
+            .values()
+            .any(|&address| { address == P256_VERIFY })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_can_use_default_genesis_timestamp() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    assert_ne!(0u64, provider.get_block(0.into()).await.unwrap().unwrap().header.timestamp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_can_handle_large_timestamp() {
+    let (api, _handle) = spawn(NodeConfig::test()).await;
+    let num = 317071597274;
+    api.evm_set_next_block_timestamp(num).unwrap();
+    api.mine_one().await.unwrap();
+
+    let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_eq!(block.header.timestamp, num);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_shanghai_fields() {
+    let (api, _handle) =
+        spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Shanghai.into()))).await;
+    api.mine_one().await.unwrap();
+
+    let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_eq!(block.header.withdrawals_root, Some(EMPTY_ROOT_HASH));
+    assert_eq!(block.withdrawals, Some(Default::default()));
+    assert!(block.header.blob_gas_used.is_none());
+    assert!(block.header.excess_blob_gas.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cancun_fields() {
+    let (api, _handle) =
+        spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Cancun.into()))).await;
+    api.mine_one().await.unwrap();
+
+    let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_eq!(block.header.withdrawals_root, Some(EMPTY_ROOT_HASH));
+    assert_eq!(block.withdrawals, Some(Default::default()));
+    assert!(block.header.blob_gas_used.is_some());
+    assert!(block.header.excess_blob_gas.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_can_set_genesis_block_number() {
+    let (_api, handle) = spawn(NodeConfig::test().with_genesis_block_number(Some(1337u64))).await;
+    let provider = handle.http_provider();
+
+    let block_number = provider.get_block_number().await.unwrap();
+    assert_eq!(block_number, 1337u64);
+
+    assert_eq!(1337, provider.get_block(1337.into()).await.unwrap().unwrap().header.number);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_can_use_default_genesis_block_number() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    assert_eq!(0, provider.get_block(0.into()).await.unwrap().unwrap().header.number);
+}
+
+/// Verify that genesis block number affects both RPC and EVM execution layer.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_number_opcode_reflects_genesis_block_number() {
+    let genesis_number: u64 = 4242;
+    let (api, handle) =
+        spawn(NodeConfig::test().with_genesis_block_number(Some(genesis_number))).await;
+    let provider = handle.http_provider();
+
+    // RPC layer should return configured genesis number
+    let bn = provider.get_block_number().await.unwrap();
+    assert_eq!(bn, genesis_number);
+
+    // Deploy bytecode that returns block.number
+    // 0x43 (NUMBER) 0x5f (PUSH0) 0x52 (MSTORE) 0x60 0x20 (PUSH1 0x20) 0x5f (PUSH0) 0xf3 (RETURN)
+    let target = Address::random();
+    api.anvil_set_code(target, bytes!("435f5260205ff3")).await.unwrap();
+
+    // EVM execution should reflect genesis number (+ 1 for pending block)
+    let tx = alloy_rpc_types::TransactionRequest::default().with_to(target);
+    let out = provider.call(tx.into()).await.unwrap();
+    let returned = U256::from_be_slice(out.as_ref());
+    assert_eq!(returned, U256::from(genesis_number + 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_anvil_recover_signature() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+    alloy_sol_types::sol! {
+    #[sol(rpc)]
+        contract TestRecover {
+            function testRecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s, address expected) external pure {
+                address recovered = ecrecover(hash, v, r, s);
+                require(recovered == expected, "ecrecover failed: address mismatch");
+            }
+        }
+    }
+    let bytecode = hex::decode(
+        "0x60808060405234601557610125908161001a8239f35b5f80fdfe60808060405260043610156011575f80fd5b5f3560e01c63bff0b743146023575f80fd5b3460eb5760a036600319011260eb5760243560ff811680910360eb576084356001600160a01b038116929083900360eb5760805f916020936004358252848201526044356040820152606435606082015282805260015afa1560e0575f516001600160a01b031603609057005b60405162461bcd60e51b815260206004820152602260248201527f65637265636f766572206661696c65643a2061646472657373206d69736d61746044820152610c6d60f31b6064820152608490fd5b6040513d5f823e3d90fd5b5f80fdfea264697066735822122006368b42bca31c97f2c409a1cc5186dc899d4255ecc28db7bbb0ad285dc82ae464736f6c634300081c0033",
+    ).unwrap();
+
+    let tx = TransactionRequest::default().with_deploy_code(bytecode);
+    let receipt = provider.send_transaction(tx.into()).await.unwrap().get_receipt().await.unwrap();
+    let contract_address = receipt.contract_address().unwrap();
+    let contract = TestRecover::new(contract_address, &provider);
+
+    let sig = alloy_primitives::hex::decode("11".repeat(65)).unwrap();
+    let r = B256::from_slice(&sig[0..32]);
+    let s = B256::from_slice(&sig[32..64]);
+    let v = sig[64];
+    let fake_hash = B256::random();
+    let expected = alloy_primitives::address!("0x1234567890123456789012345678901234567890");
+    api.anvil_impersonate_signature(sig.clone().into(), expected).await.unwrap();
+    let result = contract.testRecover(fake_hash, v, r, s, expected).call().await;
+    assert!(result.is_ok(), "ecrecover failed: {:?}", result.err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fake_signature_transaction() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+    alloy_sol_types::sol! {
+    #[sol(rpc)]
+        contract TestRecover {
+            function testRecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s, address expected) external pure {
+                address recovered = ecrecover(hash, v, r, s);
+                require(recovered == expected, "ecrecover failed: address mismatch");
+            }
+        }
+    }
+    let bytecode = hex::decode(
+        "0x60808060405234601557610125908161001a8239f35b5f80fdfe60808060405260043610156011575f80fd5b5f3560e01c63bff0b743146023575f80fd5b3460eb5760a036600319011260eb5760243560ff811680910360eb576084356001600160a01b038116929083900360eb5760805f916020936004358252848201526044356040820152606435606082015282805260015afa1560e0575f516001600160a01b031603609057005b60405162461bcd60e51b815260206004820152602260248201527f65637265636f766572206661696c65643a2061646472657373206d69736d61746044820152610c6d60f31b6064820152608490fd5b6040513d5f823e3d90fd5b5f80fdfea264697066735822122006368b42bca31c97f2c409a1cc5186dc899d4255ecc28db7bbb0ad285dc82ae464736f6c634300081c0033",
+    ).unwrap();
+
+    let tx = TransactionRequest::default().with_deploy_code(bytecode);
+    let _receipt = provider.send_transaction(tx.into()).await.unwrap().get_receipt().await.unwrap();
+
+    let sig = alloy_primitives::hex::decode("11".repeat(65)).unwrap();
+    let r = B256::from_slice(&sig[0..32]);
+    let s = B256::from_slice(&sig[32..64]);
+    let v = sig[64];
+    let fake_hash = B256::random();
+    let expected = alloy_primitives::address!("0x1234567890123456789012345678901234567890");
+    api.anvil_impersonate_signature(sig.clone().into(), expected).await.unwrap();
+    let calldata = TestRecover::testRecoverCall { hash: fake_hash, v, r, s, expected }.abi_encode();
+    let tx = TransactionRequest::default().with_input(calldata);
+    let pending = provider.send_transaction(tx.into()).await.unwrap();
+    let result = pending.get_receipt().await;
+
+    assert!(result.is_ok(), "ecrecover failed: {:?}", result.err());
+}

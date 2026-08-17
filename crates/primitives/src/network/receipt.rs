@@ -1,0 +1,269 @@
+use alloy_consensus::ReceiptWithBloom;
+use alloy_network::{AnyReceiptEnvelope, AnyTransactionReceipt, ReceiptResponse};
+use alloy_primitives::{Address, B256, BlockHash, TxHash, logs_bloom};
+use alloy_rpc_types::{ConversionError, Log, TransactionReceipt};
+use alloy_serde::WithOtherFields;
+use derive_more::AsRef;
+use serde::{Deserialize, Serialize};
+use tempo_primitives::TEMPO_TX_TYPE_ID;
+
+#[cfg(feature = "optimism")]
+use super::optimism::build_deposit_receipt_envelope;
+use crate::{FRAME_TX_TYPE_ID, FoundryReceiptEnvelope, FrameReceipt, FrameTransactionReceipt};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, AsRef)]
+pub struct FoundryTxReceipt(pub WithOtherFields<TransactionReceipt<FoundryReceiptEnvelope<Log>>>);
+
+impl FoundryTxReceipt {
+    pub fn new(inner: TransactionReceipt<FoundryReceiptEnvelope<Log>>) -> Self {
+        Self(WithOtherFields::new(inner))
+    }
+
+    /// Creates a new receipt with a timestamp in the other fields.
+    /// This avoids extra block lookups when timestamp is needed later.
+    pub fn with_timestamp(
+        inner: TransactionReceipt<FoundryReceiptEnvelope<Log>>,
+        timestamp: u64,
+    ) -> Self {
+        let mut receipt = WithOtherFields::new(inner);
+        receipt
+            .other
+            .insert("blockTimestamp".to_string(), serde_json::to_value(timestamp).unwrap());
+        Self(receipt)
+    }
+
+    /// Adds a `feePayer` field to the receipt.
+    pub fn with_fee_payer(mut self, fee_payer: Address) -> Self {
+        self.0.other.insert("feePayer".to_string(), serde_json::to_value(fee_payer).unwrap());
+        self
+    }
+
+    /// Adds a `feeToken` field to the receipt.
+    pub fn with_fee_token(mut self, fee_token: Address) -> Self {
+        self.0.other.insert("feeToken".to_string(), serde_json::to_value(fee_token).unwrap());
+        self
+    }
+
+    /// Get block timestamp from other fields if present.
+    pub fn block_timestamp(&self) -> Option<u64> {
+        self.0.other.get_deserialized::<u64>("blockTimestamp").transpose().ok().flatten()
+    }
+}
+
+impl ReceiptResponse for FoundryTxReceipt {
+    fn contract_address(&self) -> Option<Address> {
+        self.0.contract_address
+    }
+
+    fn status(&self) -> bool {
+        self.0.inner.status()
+    }
+
+    fn block_hash(&self) -> Option<BlockHash> {
+        self.0.block_hash
+    }
+
+    fn block_number(&self) -> Option<u64> {
+        self.0.block_number
+    }
+
+    fn transaction_hash(&self) -> TxHash {
+        self.0.transaction_hash
+    }
+
+    fn transaction_index(&self) -> Option<u64> {
+        self.0.transaction_index()
+    }
+
+    fn gas_used(&self) -> u64 {
+        self.0.gas_used()
+    }
+
+    fn effective_gas_price(&self) -> u128 {
+        self.0.effective_gas_price()
+    }
+
+    fn blob_gas_used(&self) -> Option<u64> {
+        self.0.blob_gas_used()
+    }
+
+    fn blob_gas_price(&self) -> Option<u128> {
+        self.0.blob_gas_price()
+    }
+
+    fn from(&self) -> Address {
+        self.0.from()
+    }
+
+    fn to(&self) -> Option<Address> {
+        self.0.to()
+    }
+
+    fn cumulative_gas_used(&self) -> u64 {
+        self.0.cumulative_gas_used()
+    }
+
+    fn state_root(&self) -> Option<B256> {
+        self.0.state_root()
+    }
+}
+
+impl TryFrom<AnyTransactionReceipt> for FoundryTxReceipt {
+    type Error = ConversionError;
+
+    fn try_from(receipt: AnyTransactionReceipt) -> Result<Self, Self::Error> {
+        let WithOtherFields {
+            inner:
+                TransactionReceipt {
+                    transaction_hash,
+                    transaction_index,
+                    block_hash,
+                    block_number,
+                    gas_used,
+                    contract_address,
+                    effective_gas_price,
+                    from,
+                    to,
+                    blob_gas_price,
+                    blob_gas_used,
+                    inner: AnyReceiptEnvelope { inner: receipt_with_bloom, r#type },
+                },
+            mut other,
+        } = receipt.0;
+
+        Ok(Self(WithOtherFields {
+            inner: TransactionReceipt {
+                transaction_hash,
+                transaction_index,
+                block_hash,
+                block_number,
+                gas_used,
+                contract_address,
+                effective_gas_price,
+                from,
+                to,
+                blob_gas_price,
+                blob_gas_used,
+                inner: match r#type {
+                    0x00 => FoundryReceiptEnvelope::Legacy(receipt_with_bloom),
+                    0x01 => FoundryReceiptEnvelope::Eip2930(receipt_with_bloom),
+                    0x02 => FoundryReceiptEnvelope::Eip1559(receipt_with_bloom),
+                    0x03 => FoundryReceiptEnvelope::Eip4844(receipt_with_bloom),
+                    0x04 => FoundryReceiptEnvelope::Eip7702(receipt_with_bloom),
+                    FRAME_TX_TYPE_ID => {
+                        let payer = other
+                            .remove_deserialized::<Address>("payer")
+                            .transpose()
+                            .map_err(|err| {
+                                ConversionError::Custom(format!(
+                                    "Failed to deserialize frame receipt payer: {err}"
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                ConversionError::Custom("Frame receipt is missing payer".to_owned())
+                            })?;
+                        let frame_receipts = other
+                            .remove_deserialized::<Vec<FrameReceipt<Log>>>("frameReceipts")
+                            .transpose()
+                            .map_err(|err| {
+                                ConversionError::Custom(format!(
+                                    "Failed to deserialize frame receipts: {err}"
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                ConversionError::Custom(
+                                    "Frame receipt is missing frameReceipts".to_owned(),
+                                )
+                            })?;
+                        if frame_receipts.iter().any(|receipt| receipt.status > 2) {
+                            return Err(ConversionError::Custom(
+                                "Frame receipt contains an invalid status".to_owned(),
+                            ));
+                        }
+                        let receipt = FrameTransactionReceipt::new(
+                            receipt_with_bloom.receipt.cumulative_gas_used,
+                            payer,
+                            frame_receipts,
+                        );
+                        if !receipt_with_bloom.receipt.status.coerce_status() {
+                            return Err(ConversionError::Custom(
+                                "Frame transaction receipt must have successful status".to_owned(),
+                            ));
+                        }
+                        if receipt.inner.logs != receipt_with_bloom.receipt.logs {
+                            return Err(ConversionError::Custom(
+                                "Frame transaction logs do not match nested frame logs".to_owned(),
+                            ));
+                        }
+                        let canonical_bloom =
+                            logs_bloom(receipt.inner.logs.iter().map(|log| &log.inner));
+                        if canonical_bloom != receipt_with_bloom.logs_bloom {
+                            return Err(ConversionError::Custom(
+                                "Frame transaction logs bloom does not match nested frame logs"
+                                    .to_owned(),
+                            ));
+                        }
+                        FoundryReceiptEnvelope::Frame(ReceiptWithBloom {
+                            receipt,
+                            logs_bloom: canonical_bloom,
+                        })
+                    }
+                    TEMPO_TX_TYPE_ID => FoundryReceiptEnvelope::Tempo(receipt_with_bloom),
+                    #[cfg(feature = "optimism")]
+                    0x7E => build_deposit_receipt_envelope(receipt_with_bloom, &other),
+                    _ => {
+                        let tx_type = r#type;
+                        return Err(ConversionError::Custom(format!(
+                            "Unknown transaction receipt type: 0x{tx_type:02X}"
+                        )));
+                    }
+                },
+            },
+            other,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // <https://github.com/foundry-rs/foundry/issues/10852>
+    #[test]
+    fn test_receipt_convert() {
+        let s = r#"{"type":"0x4","status":"0x1","cumulativeGasUsed":"0x903fd1","logs":[{"address":"0x0000d9fcd47bf761e7287d8ee09917d7e2100000","topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x0000000000000000000000000000000000000000000000000000000000000000","0x000000000000000000000000234ce51365b9c417171b6dad280f49143e1b0547"],"data":"0x00000000000000000000000000000000000000000000032139b42c3431700000","blockHash":"0xd26b59c1d8b5bfa9362d19eb0da3819dfe0b367987a71f6d30908dd45e0d7a60","blockNumber":"0x159663e","blockTimestamp":"0x68411f7b","transactionHash":"0x17a6af73d1317e69cfc3cac9221bd98261d40f24815850a44dbfbf96652ae52a","transactionIndex":"0x22","logIndex":"0x158","removed":false}],"logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000008100000000000000000000000000000000000000000000000020000200000000000000800000000800000000000000010000000000000000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000","transactionHash":"0x17a6af73d1317e69cfc3cac9221bd98261d40f24815850a44dbfbf96652ae52a","transactionIndex":"0x22","blockHash":"0xd26b59c1d8b5bfa9362d19eb0da3819dfe0b367987a71f6d30908dd45e0d7a60","blockNumber":"0x159663e","gasUsed":"0x28ee7","effectiveGasPrice":"0x4bf02090","from":"0x234ce51365b9c417171b6dad280f49143e1b0547","to":"0x234ce51365b9c417171b6dad280f49143e1b0547","contractAddress":null}"#;
+        let receipt: AnyTransactionReceipt = serde_json::from_str(s).unwrap();
+        let _converted = FoundryTxReceipt::try_from(receipt).unwrap();
+    }
+
+    #[test]
+    fn frame_receipt_conversion_requires_and_preserves_nested_receipts() {
+        let bloom = "00".repeat(256);
+        let json = format!(
+            r#"{{"type":"0x6","status":"0x1","cumulativeGasUsed":"0x5208","logs":[],"logsBloom":"0x{bloom}","transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000001","transactionIndex":"0x0","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000002","blockNumber":"0x1","gasUsed":"0x5208","effectiveGasPrice":"0x1","from":"0x2222222222222222222222222222222222222222","to":"0x3333333333333333333333333333333333333333","contractAddress":null,"payer":"0x1111111111111111111111111111111111111111","frameReceipts":[{{"status":"0x1","gasUsed":"0x10","logs":[]}},{{"status":"0x2","gasUsed":"0x0","logs":[]}}]}}"#
+        );
+        let receipt: AnyTransactionReceipt = serde_json::from_str(&json).unwrap();
+
+        let converted = FoundryTxReceipt::try_from(receipt).unwrap();
+        let FoundryReceiptEnvelope::Frame(frame) = &converted.0.inner.inner else { unreachable!() };
+        assert_eq!(frame.receipt.payer, Address::repeat_byte(0x11));
+        assert_eq!(frame.receipt.frame_receipts.len(), 2);
+        assert_eq!(frame.receipt.frame_receipts[1].status, 2);
+
+        let encoded = serde_json::to_string(&converted).unwrap();
+        assert_eq!(encoded.matches("\"payer\"").count(), 1);
+        assert_eq!(encoded.matches("\"frameReceipts\"").count(), 1);
+        let round_trip: FoundryTxReceipt = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(round_trip, converted);
+
+        let missing_payer =
+            json.replace(",\"payer\":\"0x1111111111111111111111111111111111111111\"", "");
+        let receipt: AnyTransactionReceipt = serde_json::from_str(&missing_payer).unwrap();
+        assert!(FoundryTxReceipt::try_from(receipt).is_err());
+
+        let invalid_status =
+            json.replace(r#""status":"0x2","gasUsed":"0x0""#, r#""status":"0x3","gasUsed":"0x0""#);
+        let receipt: AnyTransactionReceipt = serde_json::from_str(&invalid_status).unwrap();
+        assert!(FoundryTxReceipt::try_from(receipt).is_err());
+    }
+}

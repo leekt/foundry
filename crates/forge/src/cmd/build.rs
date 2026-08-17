@@ -1,0 +1,392 @@
+use super::{install, watch::WatchArgs};
+use crate::Lockfile;
+use clap::Parser;
+use eyre::Result;
+use forge_lint::{
+    linter::Linter,
+    sol::{DeniedLintDiagnostics, SolidityLinter},
+};
+use foundry_cli::{
+    opts::{BuildOpts, configure_pcx_from_solc, get_solar_sources_from_compile_output},
+    utils::{Git, LoadConfig, cache_local_signatures},
+};
+use foundry_common::{
+    compile::{ContractSizeLimits, ProjectCompiler},
+    shell,
+};
+use foundry_compilers::{
+    CompilationError, FileFilter, Project, ProjectCompileOutput,
+    compilers::{Language, multi::MultiCompilerLanguage},
+    solc::SolcLanguage,
+    utils::source_files_iter,
+};
+use foundry_config::{
+    Config, SkipBuildFilters,
+    figment::{
+        self, Metadata, Profile, Provider,
+        error::Kind::InvalidType,
+        value::{Dict, Map, Value},
+    },
+    filter::expand_globs,
+};
+use serde::Serialize;
+use solar::{
+    interface::{Session, config::CompileOpts},
+    sema::Compiler,
+};
+use std::{fmt::Write, path::PathBuf};
+
+foundry_config::merge_impl_figment_convert!(BuildArgs, build);
+
+/// CLI arguments for `forge build`.
+///
+/// CLI arguments take the highest precedence in the Config/Figment hierarchy.
+/// In order to override them in the foundry `Config` they need to be merged into an existing
+/// `figment::Provider`, like `foundry_config::Config` is.
+///
+/// `BuildArgs` implements `figment::Provider` in which all config related fields are serialized and
+/// then merged into an existing `Config`, effectively overwriting them.
+///
+/// Some arguments are marked as `#[serde(skip)]` and require manual processing in
+/// `figment::Provider` implementation
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "Build options", about = None, long_about = None)] // override doc
+pub struct BuildArgs {
+    /// Build source files from specified paths.
+    #[serde(skip)]
+    pub paths: Option<Vec<PathBuf>>,
+
+    /// Print compiled contract names.
+    #[arg(long)]
+    #[serde(skip)]
+    pub names: bool,
+
+    /// Print compiled contract sizes.
+    /// Constructor argument length is not included in the calculation of initcode size.
+    #[arg(long)]
+    #[serde(skip)]
+    pub sizes: bool,
+
+    /// Ignore initcode contract bytecode size limit introduced by EIP-3860.
+    #[arg(long, alias = "ignore-initcode-size")]
+    #[serde(skip)]
+    pub ignore_eip_3860: bool,
+
+    /// Skip the post-build lint step for this invocation.
+    ///
+    /// Equivalent to setting `lint_on_build = false` under `[lint]` in foundry.toml,
+    /// but only for the current command.
+    #[arg(long, visible_alias = "skip-lint")]
+    #[serde(skip)]
+    pub no_lint: bool,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub build: BuildOpts,
+
+    #[command(flatten)]
+    #[serde(skip)]
+    pub watch: WatchArgs,
+}
+
+impl BuildArgs {
+    pub async fn run(self, locked: bool) -> Result<ProjectCompileOutput> {
+        let mut config = self.load_config()?;
+
+        if locked {
+            self.check_foundry_lock_consistency(&config, true)?;
+        }
+
+        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
+        {
+            // need to re-configure here to also catch additional remappings
+            config = self.load_config()?;
+        }
+
+        self.check_soldeer_lock_consistency(&config).await;
+        if !locked {
+            self.check_foundry_lock_consistency(&config, false)?;
+        }
+
+        let project = config.project()?;
+
+        // Collect sources to compile if build subdirectories specified.
+        let mut files = vec![];
+        if let Some(paths) = &self.paths {
+            for path in paths {
+                let joined = project.root().join(path);
+                let path = if joined.exists() { &joined } else { path };
+                files.extend(source_files_iter(path, MultiCompilerLanguage::FILE_EXTENSIONS));
+            }
+            if files.is_empty() {
+                eyre::bail!("No source files found in specified build paths.");
+            }
+        }
+
+        let format_json = shell::is_json();
+
+        let mut output = ProjectCompiler::new()
+            .files(files)
+            .dynamic_test_linking(config.dynamic_test_linking)
+            .print_names(self.names)
+            .print_sizes(self.sizes)
+            .ignore_eip_3860(self.ignore_eip_3860)
+            .size_limits(contract_size_limits(&config))
+            .bail(!format_json)
+            .compile(&project)?;
+
+        // Cache project selectors.
+        cache_local_signatures(&output)?;
+
+        if format_json && (!self.names && !self.sizes || output.has_compiler_errors()) {
+            sh_println!("{}", serde_json::to_string_pretty(&output.output())?)?;
+        }
+        if format_json && output.has_compiler_errors() {
+            std::process::exit(1);
+        }
+
+        // Only run the `SolidityLinter` if lint on build and no compilation errors.
+        if !self.no_lint
+            && config.lint.lint_on_build
+            && !output.output().errors.iter().any(|e| e.is_error())
+            && let Err(err) = self.lint(&project, &config, self.paths.as_deref(), &mut output)
+        {
+            if err.downcast_ref::<DeniedLintDiagnostics>().is_none() {
+                emit_lint_failure_notice();
+            }
+            return Err(err.wrap_err("post-build lint step failed"));
+        }
+
+        Ok(output)
+    }
+
+    fn lint(
+        &self,
+        project: &Project,
+        config: &Config,
+        files: Option<&[PathBuf]>,
+        output: &mut ProjectCompileOutput,
+    ) -> Result<()> {
+        let format_json = shell::is_json();
+        if project.compiler.solc.is_some() && !shell::is_quiet() {
+            let linter = SolidityLinter::new(config.project_paths())
+                .with_json_emitter(format_json)
+                .with_description(!format_json)
+                .with_severity(if config.lint.severity.is_empty() {
+                    None
+                } else {
+                    Some(config.lint.severity.clone())
+                })
+                .without_lints(if config.lint.exclude_lints.is_empty() {
+                    None
+                } else {
+                    Some(
+                        config
+                            .lint
+                            .exclude_lints
+                            .iter()
+                            .filter_map(|s| forge_lint::sol::SolLint::try_from(s.as_str()).ok())
+                            .collect(),
+                    )
+                })
+                .with_lint_specific(&config.lint.lint_specific);
+
+            // Expand ignore globs and canonicalize from the get go
+            let ignored = expand_globs(&config.root, config.lint.ignore.iter())?
+                .iter()
+                .flat_map(foundry_common::fs::canonicalize_path)
+                .collect::<Vec<_>>();
+
+            let skip = SkipBuildFilters::new(config.skip.clone(), config.root.clone());
+            let curr_dir = std::env::current_dir()?;
+            let input_files = config
+                .project_paths::<SolcLanguage>()
+                .input_files_iter()
+                .filter(|p| {
+                    // Lint only specified build files, if any.
+                    if let Some(files) = files {
+                        return files.iter().any(|file| &curr_dir.join(file) == p);
+                    }
+                    skip.is_match(p)
+                        && !(ignored.contains(p) || ignored.contains(&curr_dir.join(p)))
+                })
+                .collect::<Vec<_>>();
+
+            let solar_sources =
+                get_solar_sources_from_compile_output(config, output, Some(&input_files), None)?;
+            if solar_sources.input.sources.is_empty() {
+                if !input_files.is_empty() {
+                    sh_warn!("unable to lint. Solar only supports Solidity versions >=0.8.0")?;
+                }
+                return Ok(());
+            }
+
+            // NOTE(rusowsky): Once solar can drop unsupported versions, rather than creating a new
+            // compiler, we should reuse the parser from the project output.
+            let opts = CompileOpts::default();
+            let mut compiler =
+                Compiler::new(Session::builder().opts(opts).with_stderr_emitter().build());
+
+            // Load the solar-compatible sources to the pcx before linting
+            compiler.enter_mut(|compiler| {
+                let mut pcx = compiler.parse();
+                configure_pcx_from_solc(&mut pcx, &config.project_paths(), &solar_sources, true);
+                pcx.set_resolve_imports(true);
+                pcx.parse();
+            });
+
+            linter.lint(&input_files, config.deny, &mut compiler)?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns the `Project` for the current workspace
+    ///
+    /// This loads the `foundry_config::Config` for the current workspace (see
+    /// [`foundry_config::utils::find_project_root`] and merges the cli `BuildArgs` into it before
+    /// returning [`foundry_config::Config::project()`]
+    pub fn project(&self) -> Result<Project> {
+        self.build.project()
+    }
+
+    /// Returns whether `BuildArgs` was configured with `--watch`
+    pub const fn is_watch(&self) -> bool {
+        self.watch.watch.is_some()
+    }
+
+    /// Returns the [`watchexec::Config`] necessary to bootstrap a new watch loop.
+    pub(crate) fn watchexec_config(&self) -> Result<watchexec::Config> {
+        // Use the path arguments or if none where provided the `src`, `test` and `script`
+        // directories as well as the `foundry.toml` configuration file.
+        self.watch.watchexec_config(|| {
+            let config = self.load_config()?;
+            let foundry_toml: PathBuf = config.root.join(Config::FILE_NAME);
+            Ok([config.src, config.test, config.script, foundry_toml])
+        })
+    }
+
+    /// Check soldeer.lock file consistency using soldeer_core APIs
+    async fn check_soldeer_lock_consistency(&self, config: &Config) {
+        let soldeer_lock_path = config.root.join("soldeer.lock");
+        if !soldeer_lock_path.exists() {
+            return;
+        }
+
+        // Note: read_lockfile returns Ok with empty entries for malformed files
+        let Ok(lockfile) = soldeer_core::lock::read_lockfile(&soldeer_lock_path) else {
+            return;
+        };
+
+        let deps_dir = config.root.join("dependencies");
+        for entry in &lockfile.entries {
+            let dep_name = entry.name();
+
+            // Use soldeer_core's integrity check
+            match soldeer_core::install::check_dependency_integrity(entry, &deps_dir).await {
+                Ok(status) => {
+                    use soldeer_core::install::DependencyStatus;
+                    // Check if status indicates a problem
+                    if matches!(
+                        status,
+                        DependencyStatus::Missing | DependencyStatus::FailedIntegrity
+                    ) {
+                        sh_warn!("Dependency '{}' integrity check failed: {:?}", dep_name, status)
+                            .ok();
+                    }
+                }
+                Err(e) => {
+                    sh_warn!("Dependency '{}' integrity check error: {}", dep_name, e).ok();
+                }
+            }
+        }
+    }
+
+    /// Checks foundry.lock file consistency with Git submodules.
+    fn check_foundry_lock_consistency(&self, config: &Config, locked: bool) -> Result<()> {
+        let git = Git::new(&config.root);
+        let mut lockfile = Lockfile::new(&config.root).with_git(&git);
+        let mismatches = match lockfile.check() {
+            Ok(mismatches) => mismatches,
+            Err(err) if locked => return Err(err),
+            Err(err) => {
+                sh_warn!("Failed to check foundry.lock: {err}")?;
+                return Ok(());
+            }
+        };
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+
+        if locked {
+            let mut message = String::from("foundry.lock does not match installed dependencies:");
+            for mismatch in mismatches {
+                write!(message, "\n  {mismatch}")?;
+            }
+            return Err(eyre::eyre!(message));
+        }
+
+        for mismatch in mismatches {
+            sh_warn!("{mismatch}")?;
+        }
+        Ok(())
+    }
+}
+
+fn contract_size_limits(config: &Config) -> ContractSizeLimits {
+    config
+        .code_size_limit
+        .map(ContractSizeLimits::with_runtime_limit)
+        .or_else(|| {
+            config
+                .networks
+                .contract_size_limits()
+                .map(|limits| ContractSizeLimits::new(limits.runtime, limits.initcode))
+        })
+        .unwrap_or_else(|| ContractSizeLimits::for_spec_id(config.evm_spec_id()))
+}
+/// Notice shown on lint-on-build failure; printed separately so it survives single-line
+/// cause-chain rendering.
+const LINT_FAILURE_NOTICE: &str = "\
+note: internal lint engine failure (compilation itself succeeded).
+note: please file a bug report at
+      https://github.com/foundry-rs/foundry/issues/new?template=BUG-FORM.yml
+      and attach the full output above.
+help: rerun with `--no-lint` to skip linting for this build, or consider temporarily
+      disabling forge lint on build:
+      https://getfoundry.sh/forge/linting#disable-linting-on-build
+";
+
+fn emit_lint_failure_notice() {
+    if shell::is_json() {
+        return;
+    }
+    let _ = sh_eprintln!("\n{LINT_FAILURE_NOTICE}");
+}
+
+// Make this args a `figment::Provider` so that it can be merged into the `Config`
+impl Provider for BuildArgs {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("Build Args Provider")
+    }
+
+    fn data(&self) -> Result<Map<Profile, Dict>, figment::Error> {
+        let value = Value::serialize(self)?;
+        let error = InvalidType(value.to_actual(), "map".into());
+        let mut dict = value.into_dict().ok_or(error)?;
+
+        if self.names {
+            dict.insert("names".to_string(), true.into());
+        }
+
+        if self.sizes {
+            dict.insert("sizes".to_string(), true.into());
+        }
+
+        if self.ignore_eip_3860 {
+            dict.insert("ignore_eip_3860".to_string(), true.into());
+        }
+
+        Ok(Map::from([(Config::selected_profile(), dict)]))
+    }
+}

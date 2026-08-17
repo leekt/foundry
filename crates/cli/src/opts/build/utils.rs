@@ -1,0 +1,354 @@
+use eyre::Result;
+use foundry_compilers::{
+    CompilerInput, Graph, Project, ProjectCompileOutput, ProjectPathsConfig,
+    artifacts::{Source, Sources},
+    multi::{MultiCompilerLanguage, MultiCompilerParser},
+    solc::{SOLC_EXTENSIONS, SolcLanguage, SolcVersionedInput},
+};
+use foundry_config::Config;
+#[cfg(windows)]
+use path_slash::PathExt as _;
+use rayon::prelude::*;
+use solar::{interface::MIN_SOLIDITY_VERSION, sema::ParsingContext};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+use std::{
+    collections::{HashSet, VecDeque},
+    path::{Path, PathBuf},
+};
+
+/// Configures a [`ParsingContext`] from [`Config`].
+///
+/// - Configures include paths, remappings
+/// - Source files are added if `add_source_file` is set
+/// - If no `project` is provided, it will spin up a new ephemeral project.
+/// - If no `target_paths` are provided, all project files are processed.
+/// - Only processes the subset of sources with the most up-to-date Solidity version.
+pub fn configure_pcx(
+    pcx: &mut ParsingContext<'_>,
+    config: &Config,
+    project: Option<&Project>,
+    target_paths: Option<&[PathBuf]>,
+) -> Result<()> {
+    let status = configure_pcx_with_sources(pcx, config, project, target_paths, false)?;
+    if !status.has_compatible_sources && !status.has_unsupported_sources {
+        eyre::bail!("no Solidity sources");
+    }
+    Ok(())
+}
+
+/// Describes the Solidity sources encountered while configuring Solar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SolarSourceStatus {
+    /// Whether any Solar-compatible sources were configured.
+    has_compatible_sources: bool,
+    /// Whether any sources require a Solidity version unsupported by Solar.
+    has_unsupported_sources: bool,
+}
+
+impl SolarSourceStatus {
+    /// Returns whether compatible sources were configured and no unsupported sources were found.
+    pub const fn is_fully_supported(&self) -> bool {
+        self.has_compatible_sources && !self.has_unsupported_sources
+    }
+}
+
+/// Configures a Solar parsing context with all Solar-compatible project sources.
+///
+/// Returns `true` if any compatible sources were configured.
+pub fn configure_pcx_all_sources(
+    pcx: &mut ParsingContext<'_>,
+    config: &Config,
+    project: Option<&Project>,
+    target_paths: Option<&[PathBuf]>,
+) -> Result<bool> {
+    let status = configure_pcx_all_sources_with_status(pcx, config, project, target_paths)?;
+    if !status.has_compatible_sources && !status.has_unsupported_sources {
+        eyre::bail!("no Solidity sources");
+    }
+    Ok(status.has_compatible_sources)
+}
+
+/// Configures a Solar parsing context with all Solar-compatible project sources and reports
+/// whether unsupported sources were skipped.
+pub fn configure_pcx_all_sources_with_status(
+    pcx: &mut ParsingContext<'_>,
+    config: &Config,
+    project: Option<&Project>,
+    target_paths: Option<&[PathBuf]>,
+) -> Result<SolarSourceStatus> {
+    configure_pcx_with_sources(pcx, config, project, target_paths, true)
+}
+
+fn configure_pcx_with_sources(
+    pcx: &mut ParsingContext<'_>,
+    config: &Config,
+    project: Option<&Project>,
+    target_paths: Option<&[PathBuf]>,
+    all_versions: bool,
+) -> Result<SolarSourceStatus> {
+    // Process build options
+    let project = match project {
+        Some(project) => project,
+        None => &config.ephemeral_project()?,
+    };
+
+    let sources = match target_paths {
+        // If target files are provided, only process those sources
+        Some(targets) => {
+            let mut sources = Sources::new();
+            for t in targets {
+                let path = dunce::canonicalize(t)?;
+                let source = Source::read(&path)?;
+                sources.insert(path, source);
+            }
+            sources
+        }
+        // Otherwise, process all project files
+        None => {
+            let mut sources = project.paths.read_input_files()?;
+            if let Some(filter) = &project.sparse_output {
+                sources.retain(|path, _| filter.is_match(path));
+            }
+            sources
+        }
+    };
+
+    // Process Solar-compatible sources and use the latest version for the compiler input.
+    let graph = Graph::<MultiCompilerParser>::resolve_sources(&project.paths, sources)?;
+    let Some(versioned_sources) = graph
+        // Resolve graph into mapping language -> version -> sources
+        .into_sources_by_version(project)?
+        .sources
+        .into_iter()
+        // Only interested in Solidity sources
+        .find(|(lang, _)| *lang == MultiCompilerLanguage::Solc(SolcLanguage::Solidity))
+        .map(|(_, sources)| sources)
+    else {
+        return Ok(SolarSourceStatus::default());
+    };
+
+    let mut has_unsupported_sources = false;
+    let versioned_sources = versioned_sources.into_iter().filter(|(version, sources, _)| {
+        if version < &MIN_SOLIDITY_VERSION && !sources.is_empty() {
+            has_unsupported_sources = true;
+            false
+        } else {
+            true
+        }
+    });
+    let (version, sources) = if all_versions {
+        versioned_sources.fold(
+            (MIN_SOLIDITY_VERSION, Sources::default()),
+            |(version, mut sources), (source_version, version_sources, _)| {
+                sources.extend(version_sources);
+                (version.max(source_version), sources)
+            },
+        )
+    } else {
+        versioned_sources
+            .max_by(|(v1, _, _), (v2, _, _)| v1.cmp(v2))
+            .map_or((MIN_SOLIDITY_VERSION, Sources::default()), |(v, s, _)| (v, s))
+    };
+
+    let has_sources = !sources.is_empty();
+    if !all_versions && !has_sources {
+        sh_warn!("no files found. Solar doesn't support Solidity versions prior to 0.8.0")?;
+    }
+
+    let solc = SolcVersionedInput::build(
+        sources,
+        config.solc_settings()?,
+        SolcLanguage::Solidity,
+        version,
+    );
+
+    configure_pcx_from_solc(pcx, &project.paths, &solc, true);
+
+    Ok(SolarSourceStatus { has_compatible_sources: has_sources, has_unsupported_sources })
+}
+
+/// Extracts Solar-compatible sources from a [`ProjectCompileOutput`].
+///
+/// # Note:
+/// uses `output.graph().source_files()` and `output.artifact_ids()` rather than `output.sources()`
+/// because sources aren't populated when build is skipped when there are no changes in the source
+/// code. <https://github.com/foundry-rs/foundry/issues/12018>
+pub fn get_solar_sources_from_compile_output(
+    config: &Config,
+    output: &ProjectCompileOutput,
+    target_paths: Option<&[PathBuf]>,
+    ignored_paths: Option<&[PathBuf]>,
+) -> Result<SolcVersionedInput> {
+    let is_solidity_file = |path: &Path| -> bool {
+        path.extension().and_then(|s| s.to_str()).is_some_and(|ext| SOLC_EXTENSIONS.contains(&ext))
+    };
+
+    let is_ignored = |path: &Path| -> bool {
+        if let Some(ignored) = ignored_paths {
+            ignored.iter().any(|ignored_path| path == ignored_path)
+        } else {
+            false
+        }
+    };
+
+    // Collect source path targets
+    let mut source_paths: HashSet<PathBuf> = if let Some(targets) = target_paths
+        && !targets.is_empty()
+    {
+        let mut source_paths = HashSet::new();
+        let mut queue: VecDeque<PathBuf> = targets
+            .iter()
+            .filter_map(|path| {
+                is_solidity_file(path).then(|| dunce::canonicalize(path).ok()).flatten()
+            })
+            .collect();
+
+        while let Some(path) = queue.pop_front() {
+            if source_paths.insert(path.clone()) {
+                for import in output.graph().imports(path.as_path()) {
+                    // Skip ignored imports to prevent solar from trying to compile them
+                    if !is_ignored(import) {
+                        queue.push_back(import.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        source_paths
+    } else {
+        output
+            .graph()
+            .source_files()
+            .filter_map(|idx| {
+                let path = output.graph().node_path(idx).to_path_buf();
+                is_solidity_file(&path).then_some(path)
+            })
+            .collect()
+    };
+
+    // Read all sources and find the latest version.
+    let (version, sources) = {
+        let (mut max_version, mut sources) = (MIN_SOLIDITY_VERSION, Sources::new());
+        for (id, _) in output.artifact_ids() {
+            if let Ok(path) = dunce::canonicalize(&id.source)
+                && source_paths.remove(&path)
+            {
+                if id.version < MIN_SOLIDITY_VERSION {
+                    continue;
+                } else if max_version < id.version {
+                    max_version = id.version;
+                };
+
+                let source = Source::read(&path)?;
+                sources.insert(path, source);
+            }
+        }
+
+        (max_version, sources)
+    };
+
+    let solc = SolcVersionedInput::build(
+        sources,
+        config.solc_settings()?,
+        SolcLanguage::Solidity,
+        version,
+    );
+
+    Ok(solc)
+}
+
+/// Configures a [`ParsingContext`] from a [`ProjectCompileOutput`].
+pub fn configure_pcx_from_compile_output(
+    pcx: &mut ParsingContext<'_>,
+    config: &Config,
+    output: &ProjectCompileOutput,
+    target_paths: Option<&[PathBuf]>,
+) -> Result<()> {
+    let solc = get_solar_sources_from_compile_output(config, output, target_paths, None)?;
+    configure_pcx_from_solc(pcx, &config.project_paths(), &solc, true);
+    Ok(())
+}
+
+/// Converts a Windows path to Solar's slash form while retaining path prefixes and trailing
+/// directory boundaries.
+#[cfg(windows)]
+fn solar_slash_path(path: &Path) -> String {
+    let has_trailing_separator = path
+        .as_os_str()
+        .encode_wide()
+        .last()
+        .is_some_and(|c| c == u16::from(b'/') || c == u16::from(b'\\'));
+    let mut path = path.to_slash_lossy().into_owned();
+    if has_trailing_separator && !path.ends_with('/') {
+        path.push('/');
+    }
+    path
+}
+
+/// Configures a [`ParsingContext`] from [`ProjectPathsConfig`] and [`SolcVersionedInput`].
+///
+/// - Configures include paths, remappings.
+/// - Source files are added if `add_source_file` is set
+pub fn configure_pcx_from_solc(
+    pcx: &mut ParsingContext<'_>,
+    project_paths: &ProjectPathsConfig,
+    vinput: &SolcVersionedInput,
+    add_source_files: bool,
+) {
+    configure_pcx_from_solc_cli(pcx, project_paths, &vinput.cli_settings);
+    if add_source_files {
+        let sources = vinput
+            .input
+            .sources
+            .par_iter()
+            .filter_map(|(path, source)| {
+                #[cfg(windows)]
+                let path = PathBuf::from(solar_slash_path(path));
+                #[cfg(not(windows))]
+                let path = path.clone();
+                pcx.sess.source_map().new_source_file(path, source.content.as_str()).ok()
+            })
+            .collect::<Vec<_>>();
+        pcx.add_files(sources);
+    }
+}
+
+fn configure_pcx_from_solc_cli(
+    pcx: &mut ParsingContext<'_>,
+    project_paths: &ProjectPathsConfig,
+    cli_settings: &foundry_compilers::solc::CliSettings,
+) {
+    pcx.file_resolver
+        .set_current_dir(cli_settings.base_path.as_ref().unwrap_or(&project_paths.root));
+    for remapping in &project_paths.remappings {
+        let context = remapping.context.clone().unwrap_or_default();
+        // Solar compares the context directly with the parent source path. Match the slash form
+        // used above instead of allowing mixed Windows separators to change prefix semantics.
+        #[cfg(windows)]
+        let context = solar_slash_path(Path::new(&context));
+        pcx.file_resolver.add_import_remapping(solar::sema::interface::config::ImportRemapping {
+            context,
+            prefix: remapping.name.clone(),
+            path: remapping.path.clone(),
+        });
+    }
+    pcx.file_resolver.add_include_paths(cli_settings.include_paths.iter().cloned());
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solar_slash_path_preserves_windows_prefixes_and_boundaries() {
+        for (path, expected) in [
+            (r"lib\outer\", "lib/outer/"),
+            (r"\\server\share\project/", r"\\server\share/project/"),
+            (r"\\?\C:\project/", r"\\?\C:/project/"),
+            (r"\\?\UNC\server\share\project/", r"\\?\UNC\server\share/project/"),
+        ] {
+            assert_eq!(solar_slash_path(Path::new(path)), expected);
+        }
+    }
+}

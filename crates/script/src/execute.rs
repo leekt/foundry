@@ -1,0 +1,647 @@
+use super::{JsonResult, NestedValue, ScriptResult, runner::ScriptRunner};
+use crate::{
+    ScriptArgs, ScriptConfig,
+    build::{CompiledState, LinkedBuildData},
+    simulate::PreSimulationState,
+};
+use alloy_dyn_abi::FunctionExt;
+use alloy_json_abi::{Function, InternalType, JsonAbi};
+use alloy_network::{AnyNetwork, Network, TransactionBuilder};
+use alloy_primitives::{
+    Address, Bytes,
+    map::{HashMap, HashSet},
+};
+use alloy_provider::Provider;
+use alloy_rpc_types::TransactionInputKind;
+use eyre::{OptionExt, Result};
+use foundry_cheatcodes::Wallets;
+use foundry_cli::utils::{ensure_clean_constructor, needs_setup};
+use foundry_common::{
+    ContractsByArtifact,
+    fmt::{format_token, format_token_raw},
+    provider::ProviderBuilder,
+};
+use foundry_config::{Chain, FoundryHardfork, NamedChain};
+use foundry_debugger::Debugger;
+use foundry_evm::{
+    core::evm::FoundryEvmNetwork,
+    decode::decode_console_logs,
+    inspectors::cheatcodes::BroadcastableTransactions,
+    traces::{
+        CallTraceDecoder, CallTraceDecoderBuilder, DebugTraceIdentifier, TraceKind,
+        debug::ContractSources,
+        decode_trace_arena,
+        identifier::{SignaturesIdentifier, TraceIdentifiers},
+        prune_trace_depth, render_trace_arena_inner, trace_arena_at_depth,
+    },
+};
+use foundry_wallets::wallet_browser::signer::BrowserSigner;
+use futures::future::join_all;
+use itertools::Itertools;
+use std::path::Path;
+use yansi::Paint;
+
+/// State after linking, contains the linked build data along with library addresses and optional
+/// array of libraries that need to be predeployed.
+pub struct LinkedState<FEN: FoundryEvmNetwork> {
+    pub args: ScriptArgs,
+    pub script_config: ScriptConfig<FEN>,
+    pub script_wallets: Wallets,
+    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
+    pub build_data: LinkedBuildData,
+}
+
+/// Container for data we need for execution which can only be obtained after linking stage.
+#[derive(Debug)]
+pub struct ExecutionData {
+    /// Function to call.
+    pub func: Function,
+    /// Calldata to pass to the target contract.
+    pub calldata: Bytes,
+    /// Bytecode of the target contract.
+    pub bytecode: Bytes,
+    /// ABI of the target contract.
+    pub abi: JsonAbi,
+}
+
+impl<FEN: FoundryEvmNetwork> LinkedState<FEN> {
+    /// Given linked and compiled artifacts, prepares data we need for execution.
+    /// This includes the function to call and the calldata to pass to it.
+    pub async fn prepare_execution(self) -> Result<PreExecutionState<FEN>> {
+        let Self { args, script_config, script_wallets, browser_wallet, build_data } = self;
+
+        let target_contract = build_data.get_target_contract()?;
+
+        let bytecode = target_contract.bytecode().ok_or_eyre("target contract has no bytecode")?;
+
+        let (func, calldata) = args.get_method_and_calldata(&target_contract.abi)?;
+
+        ensure_clean_constructor(&target_contract.abi)?;
+
+        Ok(PreExecutionState {
+            args,
+            script_config,
+            script_wallets,
+            browser_wallet,
+            execution_data: ExecutionData {
+                func,
+                calldata,
+                bytecode: bytecode.clone(),
+                abi: target_contract.abi.clone(),
+            },
+            build_data,
+        })
+    }
+}
+
+/// Same as [LinkedState], but also contains [ExecutionData].
+#[derive(Debug)]
+pub struct PreExecutionState<FEN: FoundryEvmNetwork> {
+    pub args: ScriptArgs,
+    pub script_config: ScriptConfig<FEN>,
+    pub script_wallets: Wallets,
+    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
+    pub build_data: LinkedBuildData,
+    pub execution_data: ExecutionData,
+}
+
+impl<FEN: FoundryEvmNetwork> PreExecutionState<FEN> {
+    /// Executes the script and returns the state after execution.
+    /// Might require executing script twice in cases when we determine sender from execution.
+    pub async fn execute(self) -> Result<ExecutedState<FEN>> {
+        self.execute_inner(false).await
+    }
+
+    /// Executes an optimization candidate while blocking externally observable cheatcodes.
+    pub(crate) async fn execute_restricted(self) -> Result<ExecutedState<FEN>> {
+        self.execute_inner(true).await
+    }
+
+    async fn execute_inner(mut self, restricted: bool) -> Result<ExecutedState<FEN>> {
+        let mut runner = self
+            .script_config
+            .get_runner_with_cheatcodes(
+                self.build_data.known_contracts.clone(),
+                self.script_wallets.clone(),
+                self.args.debug,
+                self.build_data.build_data.target.clone(),
+                restricted,
+            )
+            .await?;
+        let result = self.execute_with_runner(&mut runner).await?;
+
+        // If we have a new sender from execution, we need to use it to deploy libraries and relink
+        // contracts.
+        if let Some(new_sender) = self.maybe_new_sender(result.transactions.as_ref())? {
+            self.script_config.update_sender(new_sender).await?;
+
+            // Rollback to rerun linking with the new sender.
+            let state = CompiledState {
+                args: self.args,
+                script_config: self.script_config,
+                script_wallets: self.script_wallets,
+                browser_wallet: self.browser_wallet,
+                build_data: self.build_data.build_data,
+            };
+
+            return Box::pin(
+                state.link().await?.prepare_execution().await?.execute_inner(restricted),
+            )
+            .await;
+        }
+
+        Ok(ExecutedState {
+            args: self.args,
+            script_config: self.script_config,
+            script_wallets: self.script_wallets,
+            browser_wallet: self.browser_wallet,
+            build_data: self.build_data,
+            execution_data: self.execution_data,
+            execution_result: result,
+        })
+    }
+
+    /// Executes the script using the provided runner and returns the [ScriptResult].
+    pub async fn execute_with_runner(
+        &self,
+        runner: &mut ScriptRunner<FEN>,
+    ) -> Result<ScriptResult<FEN::Network>> {
+        let (address, mut setup_result) = runner.setup(
+            &self.build_data.predeploy_libraries,
+            self.execution_data.bytecode.clone(),
+            needs_setup(&self.execution_data.abi),
+            &self.script_config,
+            self.args.broadcast,
+        )?;
+
+        if setup_result.success {
+            let script_result = runner.script(address, self.execution_data.calldata.clone())?;
+
+            setup_result.success &= script_result.success;
+            setup_result.gas_used = script_result.gas_used;
+            setup_result.logs.extend(script_result.logs);
+            setup_result.traces.extend(script_result.traces);
+            setup_result.labeled_addresses.extend(script_result.labeled_addresses);
+            setup_result.debug_bytecodes.extend(script_result.debug_bytecodes);
+            setup_result.returned = script_result.returned;
+            setup_result.exit_reason = script_result.exit_reason;
+            setup_result.breakpoints = script_result.breakpoints;
+
+            match (&mut setup_result.transactions, script_result.transactions) {
+                (Some(txs), Some(new_txs)) => {
+                    txs.extend(new_txs);
+                }
+                (None, Some(new_txs)) => {
+                    setup_result.transactions = Some(new_txs);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(setup_result)
+    }
+
+    /// It finds the deployer from the running script and uses it to predeploy libraries.
+    ///
+    /// If there are multiple candidate addresses, it skips everything and lets `--sender` deploy
+    /// them instead.
+    fn maybe_new_sender(
+        &self,
+        transactions: Option<&BroadcastableTransactions<FEN::Network>>,
+    ) -> Result<Option<Address>> {
+        let mut new_sender = None;
+
+        if let Some(txs) = transactions {
+            // If the user passed a `--sender` don't check anything.
+            if self.build_data.predeploy_libraries.libraries_count() > 0
+                && self.args.evm.sender.is_none()
+            {
+                for tx in txs {
+                    if tx.transaction.to().is_none() {
+                        let sender = tx.transaction.from().expect("no sender");
+                        if let Some(ns) = new_sender {
+                            if sender != ns {
+                                sh_warn!(
+                                    "You have more than one deployer who could predeploy libraries. Using `--sender` instead."
+                                )?;
+                                return Ok(None);
+                            }
+                        } else if sender != self.script_config.evm_opts.sender {
+                            new_sender = Some(sender);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(new_sender)
+    }
+}
+
+/// Container for information about RPC-endpoints used during script execution.
+pub struct RpcData {
+    /// Unique list of rpc urls present.
+    pub total_rpcs: HashSet<String>,
+    /// If true, one of the transactions did not have a rpc.
+    pub missing_rpc: bool,
+    /// Chain IDs already fetched for each RPC URL.
+    pub(crate) chain_ids: HashMap<String, u64>,
+}
+
+impl RpcData {
+    /// Iterates over script transactions and collects RPC urls.
+    fn from_transactions<N: Network>(txs: &BroadcastableTransactions<N>) -> Self {
+        let missing_rpc = txs.iter().any(|tx| tx.rpc.is_none());
+        let total_rpcs = txs.iter().filter_map(|tx| tx.rpc.clone()).collect::<HashSet<_>>();
+
+        Self { total_rpcs, missing_rpc, chain_ids: HashMap::default() }
+    }
+
+    /// Returns true if script might be multi-chain.
+    /// Returns false positive in case when missing rpc is the same as the only rpc present.
+    pub fn is_multi_chain(&self) -> bool {
+        self.total_rpcs.len() > 1 || (self.missing_rpc && !self.total_rpcs.is_empty())
+    }
+
+    /// Checks if all RPCs support EIP-3855. Prints a warning if not.
+    async fn check_shanghai_support(&mut self) -> Result<()> {
+        let chain_ids =
+            self.total_rpcs.iter().filter(|rpc| !self.chain_ids.contains_key(*rpc)).map(
+                |rpc| async move {
+                    let provider = ProviderBuilder::<AnyNetwork>::new(rpc).build().ok()?;
+                    Some((rpc.clone(), provider.get_chain_id().await.ok()?))
+                },
+            );
+
+        self.chain_ids.extend(join_all(chain_ids).await.into_iter().flatten());
+        let iter = self
+            .chain_ids
+            .values()
+            .filter_map(|id| NamedChain::try_from(*id).ok())
+            .map(|chain| (chain.supports_shanghai(), chain));
+        if iter.clone().any(|(s, _)| !s) {
+            let msg = format!(
+                "\
+EIP-3855 is not supported in one or more of the RPCs used.
+Unsupported Chain IDs: {}.
+Contracts deployed with a Solidity version equal or higher than 0.8.20 might not work properly.
+For more information, please see https://eips.ethereum.org/EIPS/eip-3855",
+                iter.filter(|(supported, _)| !supported)
+                    .map(|(_, chain)| chain as u64)
+                    .format(", ")
+            );
+            sh_warn!("{msg}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Container for data being collected after execution.
+pub struct ExecutionArtifacts {
+    /// Trace decoder used to decode traces.
+    pub decoder: CallTraceDecoder,
+    /// Return values from the execution result.
+    pub returns: HashMap<String, NestedValue>,
+    /// Information about RPC endpoints used during script execution.
+    pub rpc_data: RpcData,
+}
+
+/// State after the script has been executed.
+pub struct ExecutedState<FEN: FoundryEvmNetwork> {
+    pub args: ScriptArgs,
+    pub script_config: ScriptConfig<FEN>,
+    pub script_wallets: Wallets,
+    pub browser_wallet: Option<BrowserSigner<FEN::Network>>,
+    pub build_data: LinkedBuildData,
+    pub execution_data: ExecutionData,
+    pub execution_result: ScriptResult<FEN::Network>,
+}
+
+impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
+    /// Collects the data we need for simulation and various post-execution tasks.
+    pub async fn prepare_simulation(self) -> Result<PreSimulationState<FEN>> {
+        self.prepare_simulation_inner(false).await
+    }
+
+    /// Collects simulation data without emitting warnings for an optimization candidate that may
+    /// be discarded.
+    pub(crate) async fn prepare_simulation_silent(self) -> Result<PreSimulationState<FEN>> {
+        self.prepare_simulation_inner(true).await
+    }
+
+    async fn prepare_simulation_inner(self, silent: bool) -> Result<PreSimulationState<FEN>> {
+        let returns = self.get_returns()?;
+
+        let mut txs: BroadcastableTransactions<FEN::Network> =
+            self.execution_result.transactions.clone().unwrap_or_default();
+
+        // Ensure that unsigned transactions have both `data` and `input` populated to avoid
+        // issues with eth_estimateGas and eth_sendTransaction requests.
+        for tx in &mut txs {
+            if let Some(req) = tx.transaction.as_unsigned_mut()
+                && let Some(input) = req.input().cloned()
+            {
+                *req = req.clone().with_input_kind(input, TransactionInputKind::Both);
+            }
+        }
+        let mut rpc_data = RpcData::from_transactions(&txs);
+        if let Some(identity) = &self.script_config.evm_opts.fork_endpoint
+            && rpc_data.total_rpcs.contains(&identity.endpoint)
+        {
+            rpc_data.chain_ids.insert(identity.endpoint.clone(), identity.execution_chain_id);
+        }
+
+        if rpc_data.is_multi_chain() && !silent {
+            sh_warn!("Multi chain deployment is still under development. Use with caution.")?;
+            if !self.build_data.libraries.is_empty() {
+                eyre::bail!(
+                    "Multi chain deployment does not support library linking at the moment."
+                );
+            }
+        }
+        if !silent {
+            rpc_data.check_shanghai_support().await?;
+        }
+
+        let decoder = self.build_trace_decoder(&rpc_data).await?;
+
+        Ok(PreSimulationState {
+            args: self.args,
+            script_config: self.script_config,
+            script_wallets: self.script_wallets,
+            browser_wallet: self.browser_wallet,
+            build_data: self.build_data,
+            execution_data: self.execution_data,
+            execution_result: self.execution_result,
+            execution_artifacts: ExecutionArtifacts { decoder, returns, rpc_data },
+        })
+    }
+
+    /// Builds [CallTraceDecoder] from the execution result and known contracts.
+    async fn build_trace_decoder(&self, rpc_data: &RpcData) -> Result<CallTraceDecoder> {
+        let chain_id = self.script_config.source_chain_id.map(Chain::from).or_else(|| {
+            self.script_config
+                .evm_opts
+                .fork_url
+                .as_ref()
+                .and_then(|url| rpc_data.chain_ids.get(url))
+                .map(|chain_id| (*chain_id).into())
+        });
+        let chain_id = match chain_id {
+            Some(chain_id) => Some(chain_id),
+            None => self.script_config.evm_opts.get_remote_chain_id().await,
+        };
+        build_trace_decoder_for_context(
+            &self.args,
+            &self.script_config,
+            &self.build_data.known_contracts,
+            &self.build_data.sources,
+            &self.execution_result,
+            chain_id,
+        )
+    }
+
+    /// Collects the return values from the execution result.
+    fn get_returns(&self) -> Result<HashMap<String, NestedValue>> {
+        let mut returns = HashMap::default();
+        let returned = &self.execution_result.returned;
+        let func = &self.execution_data.func;
+
+        match func.abi_decode_output(returned) {
+            Ok(decoded) => {
+                for (index, (token, output)) in decoded.iter().zip(&func.outputs).enumerate() {
+                    let internal_type =
+                        output.internal_type.clone().unwrap_or(InternalType::Other {
+                            contract: None,
+                            ty: "unknown".to_string(),
+                        });
+
+                    let label = if output.name.is_empty() {
+                        index.to_string()
+                    } else {
+                        output.name.clone()
+                    };
+
+                    returns.insert(
+                        label,
+                        NestedValue {
+                            internal_type: internal_type.to_string(),
+                            value: format_token_raw(token),
+                        },
+                    );
+                }
+            }
+            Err(_) => {
+                sh_err!("Failed to decode return value: {:x?}", returned)?;
+            }
+        }
+
+        Ok(returns)
+    }
+}
+
+/// Builds a trace decoder for the exact execution context of a script runner.
+pub(crate) fn build_trace_decoder_for_context<FEN: FoundryEvmNetwork>(
+    args: &ScriptArgs,
+    script_config: &ScriptConfig<FEN>,
+    known_contracts: &ContractsByArtifact,
+    sources: &ContractSources,
+    execution_result: &ScriptResult<FEN::Network>,
+    chain_id: Option<Chain>,
+) -> Result<CallTraceDecoder> {
+    let resolved_hardfork = script_config.hardfork;
+    let mut tracing = script_config.config.tracing.clone();
+    tracing.labels.extend(execution_result.labeled_addresses.clone());
+
+    #[cfg_attr(not(feature = "monad"), allow(unused_mut))]
+    let mut builder = CallTraceDecoderBuilder::new()
+        .with_tracing_config(&tracing)
+        .with_known_contracts(known_contracts)
+        .with_signature_identifier(SignaturesIdentifier::from_config(&script_config.config)?)
+        .with_networks(script_config.config.networks)
+        .with_chain_id(chain_id.map(|chain| chain.id()))
+        .with_tempo_hardfork(resolved_hardfork.and_then(|hardfork| match hardfork {
+            FoundryHardfork::Tempo(hardfork) => Some(hardfork),
+            _ => None,
+        }));
+    #[cfg(feature = "monad")]
+    {
+        builder =
+            builder.with_monad_hardfork(resolved_hardfork.and_then(|hardfork| match hardfork {
+                FoundryHardfork::Monad(hardfork) => Some(hardfork),
+                _ => None,
+            }));
+    }
+    let mut decoder = builder.build();
+
+    if tracing.decode_internal {
+        decoder.debug_identifier = Some(DebugTraceIdentifier::new(sources.clone()));
+    }
+
+    let use_debug_bytecodes = args.debug && !execution_result.debug_bytecodes.is_empty();
+    let mut identifier = if use_debug_bytecodes {
+        TraceIdentifiers::new()
+            .with_local_and_bytecodes(known_contracts, &execution_result.debug_bytecodes)
+    } else {
+        TraceIdentifiers::new().with_local(known_contracts)
+    }
+    .with_external(&script_config.config, chain_id)?;
+
+    for (_, trace) in &execution_result.traces {
+        decoder.identify(trace, &mut identifier);
+    }
+
+    Ok(decoder)
+}
+
+impl<FEN: FoundryEvmNetwork> PreSimulationState<FEN> {
+    pub async fn show_json(&self) -> Result<()> {
+        let mut result = self.execution_result.clone();
+        let trace_depth = self.script_config.config.tracing.trace_depth;
+
+        for (_, trace) in &mut result.traces {
+            decode_trace_arena(trace, &self.execution_artifacts.decoder).await;
+            if let Some(trace_depth) = trace_depth {
+                *trace = trace_arena_at_depth(trace, trace_depth);
+            }
+        }
+
+        let json_result = JsonResult {
+            logs: decode_console_logs(&result.logs),
+            returns: &self.execution_artifacts.returns,
+            result: &result,
+        };
+        let json = serde_json::to_string(&json_result)?;
+
+        sh_println!("{json}")?;
+
+        if !self.execution_result.success {
+            return Err(eyre::eyre!(
+                "script failed: {}",
+                &self
+                    .execution_artifacts
+                    .decoder
+                    .revert_decoder
+                    .decode(&result.returned[..], result.exit_reason)
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub async fn show_traces(&self) -> Result<()> {
+        let tracing = &self.script_config.config.tracing;
+        let verbosity = tracing.verbosity;
+        let func = &self.execution_data.func;
+        let result = &self.execution_result;
+        let decoder = &self.execution_artifacts.decoder;
+
+        if !result.success || verbosity > 3 {
+            if result.traces.is_empty() {
+                warn!(verbosity, "no traces");
+            }
+
+            sh_println!("Traces:")?;
+            for (kind, trace) in &result.traces {
+                let should_include = match kind {
+                    TraceKind::Setup => verbosity >= 5,
+                    TraceKind::Execution => verbosity > 3,
+                    _ => false,
+                } || !result.success;
+
+                if should_include {
+                    let mut trace = trace.clone();
+                    decode_trace_arena(&mut trace, decoder).await;
+                    if let Some(trace_depth) = tracing.trace_depth {
+                        prune_trace_depth(&mut trace, trace_depth);
+                    }
+                    sh_println!("{}", render_trace_arena_inner(&trace, false, verbosity > 4))?;
+                }
+            }
+            sh_println!()?;
+        }
+
+        if result.success {
+            sh_println!("{}", "Script ran successfully.".green())?;
+        }
+
+        if self.script_config.evm_opts.fork_url.is_none() {
+            sh_println!("Gas used: {}", result.gas_used)?;
+        }
+
+        if result.success && !result.returned.is_empty() {
+            sh_println!("\n== Return ==")?;
+            match func.abi_decode_output(&result.returned) {
+                Ok(decoded) => {
+                    for (index, (token, output)) in decoded.iter().zip(&func.outputs).enumerate() {
+                        let internal_type =
+                            output.internal_type.clone().unwrap_or(InternalType::Other {
+                                contract: None,
+                                ty: "unknown".to_string(),
+                            });
+
+                        let label = if output.name.is_empty() {
+                            index.to_string()
+                        } else {
+                            output.name.clone()
+                        };
+                        sh_println!(
+                            "{label}: {internal_type} {value}",
+                            label = label.trim_end(),
+                            value = format_token(token)
+                        )?;
+                    }
+                }
+                Err(_) => {
+                    sh_err!("{:x?}", (&result.returned))?;
+                }
+            }
+        }
+
+        let console_logs = decode_console_logs(&result.logs);
+        if !console_logs.is_empty() {
+            sh_println!("\n== Logs ==")?;
+            for log in console_logs {
+                sh_println!("  {log}")?;
+            }
+        }
+
+        if !result.success {
+            return Err(eyre::eyre!(
+                "script failed: {}",
+                &self
+                    .execution_artifacts
+                    .decoder
+                    .revert_decoder
+                    .decode(&result.returned[..], result.exit_reason)
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn run_debugger(self) -> Result<()> {
+        self.create_debugger().try_run_tui()?;
+        Ok(())
+    }
+
+    pub fn dump_debugger(self, path: &Path) -> Result<()> {
+        self.create_debugger().dump_to_file(path)?;
+        Ok(())
+    }
+
+    fn create_debugger(self) -> Debugger {
+        Debugger::builder()
+            .traces(
+                self.execution_result
+                    .traces
+                    .into_iter()
+                    .filter(|(t, _)| t.is_execution())
+                    .collect(),
+            )
+            .decoder(&self.execution_artifacts.decoder)
+            .sources(self.build_data.sources)
+            .breakpoints(self.execution_result.breakpoints)
+            .layout(self.args.debug_layout.unwrap_or_default())
+            .build()
+    }
+}

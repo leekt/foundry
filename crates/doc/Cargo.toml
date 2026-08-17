@@ -1,0 +1,34 @@
+[package]
+name = "forge-doc"
+description = "Solidity documentation generator"
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+solar.workspace = true
+
+foundry-compilers.workspace = true
+foundry-common.workspace = true
+foundry-config.workspace = true
+
+alloy-primitives.workspace = true
+eyre.workspace = true
+markdown.workspace = true
+path-slash.workspace = true
+rayon.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+
+[features]
+default = ["optimism"]
+optimism = ["foundry-common/optimism"]

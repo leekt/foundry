@@ -2,13 +2,17 @@
 
 use crate::{
     config::ForkTransactionReplay,
-    eth::backend::executor::AnvilBlockExecutor,
+    eth::backend::{
+        executor::{AnvilBlockExecutor, AnvilExecutionOutcome, FrameReceiptData},
+        frame_tx::{SuspendFeeRules, execute_frame_tx},
+    },
     mem::inspector::{AnvilInspector, InspectorTxConfig},
 };
 use alloy_consensus::{
     BlockHeader, Transaction,
     transaction::{Recovered, SignerRecoverable, TxHashRef},
 };
+use alloy_eips::Decodable2718;
 use alloy_evm::{
     Evm, FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
     block::{BlockExecutionError, BlockExecutionResult, BlockExecutor, StateDB, TxResult},
@@ -23,6 +27,7 @@ use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope};
 use monad_revm::staking::constants::SYSTEM_ADDRESS as MONAD_SYSTEM_ADDRESS;
 use revm::{
     Database,
+    context::TxEnv,
     context_interface::result::{ExecutionResult, Output},
     interpreter::InstructionResult,
     state::EvmState,
@@ -33,6 +38,39 @@ use revm::{
 pub(crate) struct HistoricalReplayTransaction {
     pub(crate) transaction: Recovered<FoundryTxEnvelope>,
     pub(crate) source_index: usize,
+}
+
+/// Executes an Ethereum replay prefix, including native EIP-8141 frame envelopes.
+pub(crate) fn execute_historical_eth_replay<E>(
+    executor: &mut AnvilBlockExecutor<E>,
+    transactions: &[HistoricalReplayTransaction],
+    inspector_config: &InspectorTxConfig,
+) -> Result<(Vec<MaybeImpersonatedTransaction<FoundryTxEnvelope>>, Vec<TransactionInfo>)>
+where
+    E: Evm<DB: StateDB, Inspector = AnvilInspector, Tx = TxEnv> + SuspendFeeRules,
+    E::HaltReason: Clone + IntoInstructionResult,
+{
+    execute_historical_replay_with(
+        executor,
+        transactions,
+        inspector_config,
+        |evm, tx_env, transaction_hash, transaction| {
+            if let Some(frame_tx) = transaction.as_frame() {
+                return execute_frame_tx(evm, frame_tx)
+                    .map(|outcome| AnvilExecutionOutcome {
+                        result: outcome.result,
+                        frame_receipt: Some(FrameReceiptData {
+                            payer: outcome.payer,
+                            frame_receipts: outcome.frame_receipts,
+                        }),
+                    })
+                    .map_err(|err| BlockExecutionError::msg(err.to_string()));
+            }
+            evm.transact(tx_env)
+                .map(Into::into)
+                .map_err(|err| BlockExecutionError::evm(err, transaction_hash))
+        },
+    )
 }
 
 /// A validated transaction prefix together with its source block execution inputs.
@@ -93,19 +131,44 @@ pub(crate) fn prepare_fork_transaction_replay(
         .enumerate()
         .map(|(source_index, source_transaction)| {
             let source_transaction_hash = source_transaction.tx_hash();
-            let transaction = FoundryTxEnvelope::try_from(source_transaction.clone())
-                .wrap_err_with(|| {
+            let transaction = if let Some(raw) = replay.raw_frame_transactions.get(&source_index) {
+                let mut encoded = raw.as_ref();
+                let transaction = FoundryTxEnvelope::decode_2718(&mut encoded).wrap_err_with(|| {
+                    format!(
+                        "failed to decode raw frame transaction {source_transaction_hash} at index \
+                         {source_index} in block {source_hash} ({source_number})"
+                    )
+                })?;
+                eyre::ensure!(
+                    encoded.is_empty(),
+                    "raw frame transaction {source_transaction_hash} at index {source_index} in \
+                     block {source_hash} ({source_number}) has trailing bytes"
+                );
+                transaction
+            } else {
+                FoundryTxEnvelope::try_from(source_transaction.clone()).wrap_err_with(|| {
                     format!(
                         "failed to convert source transaction {source_transaction_hash} at index \
                          {source_index} in block {source_hash} ({source_number})"
                     )
-                })?;
+                })?
+            };
             eyre::ensure!(
                 transaction.tx_hash() == &source_transaction_hash,
                 "converted source transaction at index {source_index} in block {source_hash} \
                  ({source_number}) changed hash from {source_transaction_hash} to {}",
                 transaction.tx_hash()
             );
+            if let Some(frame) = transaction.as_frame() {
+                frame.validate().and_then(|()| frame.validate_signatures()).wrap_err_with(
+                    || {
+                        format!(
+                            "invalid frame transaction {source_transaction_hash} at index \
+                             {source_index} in block {source_hash} ({source_number})"
+                        )
+                    },
+                )?;
+            }
             #[cfg(feature = "monad")]
             let sender = if trust_monad_protocol_sender
                 && source_transaction.from() == MONAD_SYSTEM_ADDRESS
@@ -155,8 +218,10 @@ where
         executor,
         transactions,
         inspector_config,
-        |evm, tx_env, transaction_hash| {
-            evm.transact(tx_env).map_err(|err| BlockExecutionError::evm(err, transaction_hash))
+        |evm, tx_env, transaction_hash, _transaction| {
+            evm.transact(tx_env)
+                .map(Into::into)
+                .map_err(|err| BlockExecutionError::evm(err, transaction_hash))
         },
     )
 }
@@ -179,10 +244,8 @@ where
         &mut E,
         E::Tx,
         B256,
-    ) -> Result<
-        revm::context_interface::result::ResultAndState<E::HaltReason>,
-        BlockExecutionError,
-    >,
+        &FoundryTxEnvelope,
+    ) -> Result<AnvilExecutionOutcome<E::HaltReason>, BlockExecutionError>,
 {
     let mut stored_transactions = Vec::with_capacity(transactions.len());
     let mut transaction_infos = Vec::with_capacity(transactions.len());
@@ -207,7 +270,9 @@ where
         let result = executor
             .execute_transaction_without_commit_with(
                 replay.transaction.clone().into_encoded(),
-                &mut transact,
+                |evm, tx_env, transaction_hash| {
+                    transact(evm, tx_env, transaction_hash, transaction)
+                },
             )
             .map_err(|err| {
                 eyre::eyre!(

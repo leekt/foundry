@@ -155,6 +155,11 @@ pub async fn try_spawn(mut config: NodeConfig) -> Result<(EthApi<FoundryNetwork>
             .wrap_err("failed to replay fork transaction prefix")?;
     }
 
+    backend
+        .apply_frame_transaction_activation()
+        .await
+        .wrap_err("failed to apply EIP-8141 activation")?;
+
     backend.commit_startup_fork_cache();
     let backend = Arc::new(backend);
 

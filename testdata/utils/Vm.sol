@@ -15,6 +15,16 @@ interface Vm {
     struct EthGetLogs { address emitter; bytes32[] topics; bytes data; bytes32 blockHash; uint64 blockNumber; bytes32 transactionHash; uint64 transactionIndex; uint256 logIndex; bool removed; }
     struct DirEntry { string errorMessage; string path; uint64 depth; bool isDir; bool isSymlink; }
     struct FsMetadata { bool isDir; bool isSymlink; uint256 length; bool readOnly; uint256 modified; uint256 accessed; uint256 created; }
+    struct FrameTxFrame { uint8 mode; uint8 flags; address target; uint64 gasLimit; uint256 value; bytes data; uint8 status; }
+    struct FrameTxSignature { uint8 scheme; address signer; bytes32 msgHash; bytes signature; }
+    struct FrameTxRecentRootReference { bytes32 sourceId; uint64 slot; bytes32 root; }
+    struct FrameTxBalanceDiff { address account; uint256 balanceBefore; uint256 balanceAfter; }
+    struct FrameTxStorageDiff { address account; uint256 key; uint256 valueBefore; uint256 valueAfter; }
+    struct FrameTxDeployedContract { address account; bytes32 codeHash; }
+    struct FrameTxAccountDiff { address account; bool nonceChanged; bytes32 codeHashBefore; bytes32 codeHashAfter; }
+    struct FrameTxEvent { address emitter; bytes32[] topics; bytes data; }
+    struct FrameTxTrace { FrameTxBalanceDiff[] balanceDiffs; FrameTxStorageDiff[] storageDiffs; FrameTxDeployedContract[] deployedContracts; FrameTxAccountDiff[] accountDiffs; FrameTxEvent[] events; uint256 gasPreCharge; address gasPayer; }
+    struct FrameTx { address sender; uint64 nonce; uint64 legacyNonce; uint256[] nonceKeys; bytes32 nonceKeysHash; bytes32 sigHash; uint256 maxCost; uint256 maxPriorityFeePerGas; uint256 maxFeePerGas; uint256 maxFeePerBlobGas; uint64 blobCount; uint64 frameIndex; FrameTxFrame[] frames; FrameTxSignature[] signatures; FrameTxRecentRootReference[] recentRootReferences; FrameTxTrace trace; uint64 approvableScopes; }
     struct Wallet { address addr; uint256 publicKeyX; uint256 publicKeyY; uint256 privateKey; }
     struct FfiResult { int32 exitCode; bytes stdout; bytes stderr; }
     struct ChainInfo { uint256 forkId; uint256 chainId; }
@@ -170,6 +180,7 @@ interface Vm {
     function broadcast(address signer) external;
     function broadcast(uint256 privateKey) external;
     function chainId(uint256 newChainId) external;
+    function clearFrameTx() external;
     function clearMockedCalls() external;
     function cloneAccount(address source, address target) external;
     function closeFile(string calldata path) external;
@@ -506,6 +517,7 @@ interface Vm {
     function setBlockhash(uint256 blockNumber, bytes32 blockHash) external;
     function setEnv(string calldata name, string calldata value) external;
     function setEvmVersion(string calldata evm) external;
+    function setFrameTx(FrameTx calldata frameTx) external;
     function setLogoURI(address token, string calldata newLogoURI) external;
     function setNonce(address account, uint64 newNonce) external;
     function setNonceUnsafe(address account, uint64 newNonce) external;

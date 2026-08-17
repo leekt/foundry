@@ -58,19 +58,23 @@ impl FoundryEvmFactory for OpEvmFactory {
     fn create_evm_with_context<DB: alloy_evm::Database>(
         &self,
         db: DB,
-        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
+        mut evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
         _context_aux: Self::ContextAux,
     ) -> Self::Evm<DB, revm::inspector::NoOpInspector> {
+        evm_env.cfg_env.enable_eip7851 = false;
+        evm_env.cfg_env.enable_eip8151 = false;
         self.create_evm(db, evm_env)
     }
 
     fn create_foundry_evm_with_inspector<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>>(
         &self,
         db: &'db mut dyn DatabaseExt<Self>,
-        evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
+        mut evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
         _context_aux: Self::ContextAux,
         inspector: I,
     ) -> Self::FoundryEvm<'db, I> {
+        evm_env.cfg_env.enable_eip7851 = false;
+        evm_env.cfg_env.enable_eip8151 = false;
         let mut op_evm = Self::default().create_evm_with_inspector(db, evm_env, inspector);
         op_evm.cfg.tx_chain_id_check = true;
         op_evm.inspector().get_networks().inject_precompiles(op_evm.precompiles_mut());

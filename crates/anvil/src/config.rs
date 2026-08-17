@@ -22,7 +22,7 @@ use alloy_evm::EvmEnv;
 use alloy_genesis::Genesis;
 use alloy_network::{AnyNetwork, AnyRpcBlock, BlockResponse, TransactionResponse};
 use alloy_primitives::{
-    Address, B256, BlockNumber, TxHash, U256, hex, keccak256, map::HashMap, utils::Unit,
+    Address, B256, BlockNumber, Bytes, TxHash, U256, hex, keccak256, map::HashMap, utils::Unit,
 };
 use alloy_provider::Provider;
 use alloy_rpc_types::{
@@ -51,6 +51,7 @@ use foundry_evm::{
     hardforks::latest_active_tempo_hardfork,
     utils::{apply_chain_and_block_specific_env_changes_for_chain, block_env_from_header},
 };
+use foundry_primitives::FRAME_TX_TYPE_ID;
 use parking_lot::RwLock;
 use rand_08::thread_rng;
 use revm::{
@@ -137,6 +138,7 @@ impl AnvilNodeInfoProbe {
 pub(crate) struct ForkTransactionReplay {
     pub(crate) source_block: AnyRpcBlock,
     pub(crate) target_index: usize,
+    pub(crate) raw_frame_transactions: HashMap<usize, Bytes>,
 }
 
 /// The default IPC endpoint
@@ -163,6 +165,16 @@ pub struct NodeConfig {
     pub disable_block_gas_limit: bool,
     /// If set to `true`, enables the tx gas limit as imposed by Osaka (EIP-7825)
     pub enable_tx_gas_limit: bool,
+    /// Enables the experimental EIP-7819 SETDELEGATE instruction.
+    pub enable_eip7819: bool,
+    /// Enables the experimental EIP-7851 SETSELFDELEGATE instruction on the canonical Ethereum
+    /// execution profile using toolkit-local opcode 0xf7 while upstream remains TBD.
+    pub enable_eip7851: bool,
+    /// Enables experimental EIP-8151 account-code restricted ECRecover on the canonical Ethereum
+    /// execution profile.
+    pub enable_eip8151: bool,
+    /// Enables the experimental EIP-8141 Frame transaction profile.
+    pub enable_frame_transactions: bool,
     /// Default gas price for all txs
     pub gas_price: Option<u128>,
     /// Default base fee
@@ -544,6 +556,10 @@ impl Default for NodeConfig {
             gas_limit: None,
             disable_block_gas_limit: false,
             enable_tx_gas_limit: false,
+            enable_eip7819: false,
+            enable_eip7851: false,
+            enable_eip8151: false,
+            enable_frame_transactions: false,
             gas_price: None,
             hardfork: None,
             signer_accounts: genesis_accounts.clone(),
@@ -814,6 +830,60 @@ impl NodeConfig {
     #[must_use]
     pub const fn enable_tx_gas_limit(mut self, enable_tx_gas_limit: bool) -> Self {
         self.enable_tx_gas_limit = enable_tx_gas_limit;
+        self
+    }
+
+    /// Enables the experimental EIP-7819 SETDELEGATE instruction.
+    #[must_use]
+    pub const fn enable_eip7819(mut self, enabled: bool) -> Self {
+        self.enable_eip7819 = enabled;
+        self
+    }
+
+    /// Enables experimental EIP-7851 SETSELFDELEGATE using toolkit-local opcode 0xf7.
+    #[must_use]
+    pub const fn enable_eip7851(mut self, enabled: bool) -> Self {
+        self.enable_eip7851 = enabled;
+        self
+    }
+
+    /// Enables experimental EIP-8151 account-code restricted ECRecover.
+    #[must_use]
+    pub const fn enable_eip8151(mut self, enabled: bool) -> Self {
+        self.enable_eip8151 = enabled;
+        self
+    }
+
+    /// Rejects EIP-7851 outside the canonical Ethereum execution profile.
+    pub(crate) fn validate_eip7851_profile(&self) -> eyre::Result<()> {
+        let ethereum_profile =
+            self.networks.execution_network().is_ethereum() && !self.networks.is_celo();
+        if self.enable_eip7851 && !ethereum_profile {
+            eyre::bail!(
+                "EIP-7851 is only supported by the canonical Ethereum execution profile; active profile is `{}`",
+                self.networks.execution_profile_name()
+            );
+        }
+        Ok(())
+    }
+
+    /// Rejects EIP-8151 outside the canonical Ethereum execution profile.
+    pub(crate) fn validate_eip8151_profile(&self) -> eyre::Result<()> {
+        let ethereum_profile =
+            self.networks.execution_network().is_ethereum() && !self.networks.is_celo();
+        if self.enable_eip8151 && !ethereum_profile {
+            eyre::bail!(
+                "EIP-8151 is only supported by the canonical Ethereum execution profile; active profile is `{}`",
+                self.networks.execution_profile_name()
+            );
+        }
+        Ok(())
+    }
+
+    /// Enables the experimental EIP-8141 Frame transaction profile.
+    #[must_use]
+    pub const fn with_frame_transactions(mut self, enabled: bool) -> Self {
+        self.enable_frame_transactions = enabled;
         self
     }
 
@@ -1307,6 +1377,9 @@ impl NodeConfig {
     {
         // configure the revm environment
 
+        self.validate_eip7851_profile()?;
+        self.validate_eip8151_profile()?;
+
         let mut cfg = CfgEnv::default();
         cfg.spec = self.get_hardfork().into();
 
@@ -1317,6 +1390,7 @@ impl NodeConfig {
         // caller is a contract. So we disable the check by default.
         cfg.disable_eip3607 = true;
         cfg.disable_block_gas_limit = self.disable_block_gas_limit;
+        cfg.enable_eip7819 = self.enable_eip7819;
 
         if !self.enable_tx_gas_limit {
             cfg.tx_gas_limit_cap = Some(u64::MAX);
@@ -1365,6 +1439,13 @@ impl NodeConfig {
                     Arc::new(TokioRwLock::new(Box::new(StateRootDb::new(track_history))));
                 (db, None, None)
             };
+
+        // Fork discovery can resolve an initially unspecified network to a custom execution
+        // profile. Enable Ethereum-only experimental EIPs after that profile is final.
+        self.validate_eip7851_profile()?;
+        self.validate_eip8151_profile()?;
+        evm_env.cfg_env.enable_eip7851 = self.enable_eip7851;
+        evm_env.cfg_env.enable_eip8151 = self.enable_eip8151;
 
         // if provided use all settings of `genesis.json`
         if let Some(ref genesis) = self.genesis {
@@ -2183,11 +2264,39 @@ async fn derive_block_and_replay(
                         )
                     },
                 )?;
-            let replay = validate_fork_transaction_replay(
+            let mut replay = validate_fork_transaction_replay(
                 *transaction_hash,
                 &transaction,
                 transaction_block,
             )?;
+            for (index, source_transaction) in replay
+                .source_block
+                .transactions()
+                .as_transactions()
+                .expect("full source block validated during replay resolution")
+                .iter()
+                .take(replay.target_index.saturating_add(1))
+                .enumerate()
+            {
+                if source_transaction.transaction_type() != Some(FRAME_TX_TYPE_ID) {
+                    continue;
+                }
+                let hash = source_transaction.tx_hash();
+                let raw = provider
+                    .raw_request::<_, Option<Bytes>>("eth_getRawTransactionByHash".into(), (hash,))
+                    .await?
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "raw frame transaction {hash} was not found at source index {index}"
+                        )
+                    })?;
+                eyre::ensure!(
+                    keccak256(&raw) == hash,
+                    "raw frame transaction at source index {index} hashes to {}, expected {hash}",
+                    keccak256(&raw)
+                );
+                replay.raw_frame_transactions.insert(index, raw);
+            }
             Ok((transaction_block_number.saturating_sub(1), Some(replay)))
         }
     }
@@ -2246,7 +2355,11 @@ fn validate_fork_transaction_replay(
         );
     }
 
-    Ok(ForkTransactionReplay { source_block, target_index })
+    Ok(ForkTransactionReplay {
+        source_block,
+        target_index,
+        raw_frame_transactions: HashMap::default(),
+    })
 }
 
 /// Fork delimiter used to specify which block or transaction to fork from.
@@ -2430,6 +2543,48 @@ async fn find_latest_fork_block<P: Provider<AnyNetwork>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eip7851_is_limited_to_the_ethereum_execution_profile() {
+        NodeConfig::test().enable_eip7851(true).validate_eip7851_profile().unwrap();
+        NodeConfig::test()
+            .with_networks(NetworkConfigs::with_ethereum())
+            .enable_eip7851(true)
+            .validate_eip7851_profile()
+            .unwrap();
+
+        let assert_unsupported = |config: NodeConfig, profile: &str| {
+            let err = config.enable_eip7851(true).validate_eip7851_profile().unwrap_err();
+            assert!(err.to_string().contains(profile), "unexpected error: {err}");
+        };
+        assert_unsupported(NodeConfig::test_tempo(), "tempo");
+        assert_unsupported(NodeConfig::test().with_networks(NetworkConfigs::with_celo()), "celo");
+        #[cfg(feature = "optimism")]
+        assert_unsupported(NodeConfig::test().with_optimism(), "optimism");
+        #[cfg(feature = "monad")]
+        assert_unsupported(NodeConfig::test_monad(), "monad");
+    }
+
+    #[test]
+    fn eip8151_is_limited_to_the_ethereum_execution_profile() {
+        NodeConfig::test().enable_eip8151(true).validate_eip8151_profile().unwrap();
+        NodeConfig::test()
+            .with_networks(NetworkConfigs::with_ethereum())
+            .enable_eip8151(true)
+            .validate_eip8151_profile()
+            .unwrap();
+
+        let assert_unsupported = |config: NodeConfig, profile: &str| {
+            let err = config.enable_eip8151(true).validate_eip8151_profile().unwrap_err();
+            assert!(err.to_string().contains(profile), "unexpected error: {err}");
+        };
+        assert_unsupported(NodeConfig::test_tempo(), "tempo");
+        assert_unsupported(NodeConfig::test().with_networks(NetworkConfigs::with_celo()), "celo");
+        #[cfg(feature = "optimism")]
+        assert_unsupported(NodeConfig::test().with_optimism(), "optimism");
+        #[cfg(feature = "monad")]
+        assert_unsupported(NodeConfig::test_monad(), "monad");
+    }
 
     #[test]
     fn test_prune_history() {

@@ -1,8 +1,6 @@
-#[cfg(feature = "optimism")]
-use alloy_consensus::Transaction as _;
 use alloy_consensus::{
-    Sealed, SignableTransaction, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope,
-    TxLegacy, TxType, Typed2718,
+    Sealed, SignableTransaction, Signed, Transaction as _, TransactionEnvelope, TxEip1559,
+    TxEip2930, TxEnvelope, TxLegacy, TxType, Typed2718,
     crypto::RecoveryError,
     transaction::{
         SignerRecoverable, TxEip7702, TxHashRef,
@@ -19,7 +17,7 @@ use revm::context::TxEnv;
 use tempo_primitives::{AASigned, TempoSignature, TempoTransaction};
 use tempo_revm::TempoTxEnv;
 
-use super::frame::TxFrame;
+use super::frame::{FRAME_TX_TYPE_ID, TxFrame};
 
 //
 /// Container type for signed, typed transactions.
@@ -381,6 +379,28 @@ impl TryFrom<AnyRpcTransaction> for FoundryTxEnvelope {
                 TxEnvelope::Eip7702(tx) => Ok(Self::Eip7702(tx)),
             },
             AnyTxEnvelope::Unknown(tx) => {
+                if tx.ty() == FRAME_TX_TYPE_ID {
+                    let expected_hash = tx.hash;
+                    let frame = tx.inner.fields.deserialize_into::<TxFrame>().map_err(|err| {
+                        ConversionError::Custom(format!(
+                            "Failed to deserialize frame transaction: {err}"
+                        ))
+                    })?;
+                    if from != frame.sender {
+                        return Err(ConversionError::Custom(format!(
+                            "Frame transaction sender mismatch: RPC from {from}, payload sender {}",
+                            frame.sender
+                        )));
+                    }
+                    let frame = Sealed::new(frame);
+                    if expected_hash != frame.hash() {
+                        return Err(ConversionError::Custom(format!(
+                            "Frame transaction hash mismatch: RPC hash {expected_hash}, computed hash {}",
+                            frame.hash()
+                        )));
+                    }
+                    return Ok(Self::Frame(frame));
+                }
                 #[cfg(feature = "optimism")]
                 {
                     let mut tx = tx;
@@ -474,7 +494,7 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
 /// carries only the transaction-wide fields, and the executor overrides the
 /// call-shaped ones per frame.
 pub fn frame_tx_env(tx: &TxFrame, caller: Address) -> TxEnv {
-    TxEnv {
+    let mut tx_env = TxEnv {
         tx_type: super::frame::FRAME_TX_TYPE_ID,
         caller,
         gas_limit: tx.max_gas(),
@@ -486,7 +506,9 @@ pub fn frame_tx_env(tx: &TxFrame, caller: Address) -> TxEnv {
         nonce: tx.nonce,
         kind: alloy_primitives::TxKind::Call(tx.sender),
         ..Default::default()
-    }
+    };
+    tx_env.set_eip7851_sender_ecdsa_authenticated(false);
+    tx_env
 }
 
 impl FromTxWithEncoded<FoundryTxEnvelope> for TxEnv {
@@ -592,6 +614,15 @@ mod tests {
         Signed::new_unchecked(tx, Signature::test_signature(), B256::ZERO)
     }
 
+    fn frame_rpc_json(frame: &TxFrame, from: Address, hash: B256) -> serde_json::Value {
+        let mut value = serde_json::to_value(frame).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.insert("type".to_owned(), serde_json::json!("0x6"));
+        fields.insert("from".to_owned(), serde_json::json!(from));
+        fields.insert("hash".to_owned(), serde_json::json!(hash));
+        value
+    }
+
     #[test]
     fn tx_type_predicates() {
         assert!(FoundryTxType::Legacy.is_legacy());
@@ -644,6 +675,31 @@ mod tests {
             assert!(FoundryTxEnvelope::Deposit(Sealed::new(TxDeposit::default())).is_deposit());
             assert!(FoundryTxEnvelope::PostExec(Sealed::new(TxPostExec::default())).is_post_exec());
         }
+    }
+
+    #[test]
+    fn frame_rpc_conversion_checks_sender_hash_and_quantity_nonce() {
+        let frame = TxFrame {
+            chain_id: U256::from(1),
+            nonce: 1,
+            sender: Address::repeat_byte(0x11),
+            ..Default::default()
+        };
+        let sealed = Sealed::new(frame.clone());
+        let json = frame_rpc_json(&frame, frame.sender, sealed.hash());
+        assert_eq!(json["nonce"], "0x1");
+
+        let rpc: AnyRpcTransaction = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(FoundryTxEnvelope::try_from(rpc).unwrap(), FoundryTxEnvelope::Frame(sealed));
+
+        let mismatched_sender =
+            frame_rpc_json(&frame, Address::repeat_byte(0x22), Sealed::new(frame.clone()).hash());
+        let rpc: AnyRpcTransaction = serde_json::from_value(mismatched_sender).unwrap();
+        assert!(FoundryTxEnvelope::try_from(rpc).is_err());
+
+        let mismatched_hash = frame_rpc_json(&frame, frame.sender, B256::repeat_byte(0x33));
+        let rpc: AnyRpcTransaction = serde_json::from_value(mismatched_hash).unwrap();
+        assert!(FoundryTxEnvelope::try_from(rpc).is_err());
     }
 
     #[test]

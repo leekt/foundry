@@ -118,6 +118,9 @@ pub struct EvmOpts {
     /// Whether to enable tx gas limit checks as imposed by Osaka (EIP-7825).
     pub enable_tx_gas_limit: bool,
 
+    /// Whether to enable experimental EIP-8151 account-code restricted ECRecover.
+    pub enable_eip8151: bool,
+
     #[serde(flatten)]
     /// Networks with enabled features.
     pub networks: NetworkConfigs,
@@ -305,6 +308,7 @@ impl Default for EvmOpts {
             isolate: false,
             disable_block_gas_limit: false,
             enable_tx_gas_limit: false,
+            enable_eip8151: false,
             networks: NetworkConfigs::default(),
             create2_deployer: DEFAULT_CREATE2_DEPLOYER,
             fork_endpoint: None,
@@ -1003,6 +1007,7 @@ impl EvmOpts {
             origin = %self.sender,
             disable_block_gas_limit = %self.disable_block_gas_limit,
             enable_tx_gas_limit = %self.enable_tx_gas_limit,
+            enable_eip8151 = %self.enable_eip8151,
             configs = ?self.networks,
             "creating fork environment"
         );
@@ -1244,6 +1249,9 @@ impl EvmOpts {
         // is a contract. So we disable the check by default.
         cfg.disable_eip3607 = true;
         cfg.disable_block_gas_limit = self.disable_block_gas_limit;
+        cfg.enable_eip8151 = self.enable_eip8151
+            && self.networks.execution_network().is_ethereum()
+            && !self.networks.is_celo();
         cfg.disable_nonce_check = true;
         // By default do not enforce transaction gas limits imposed by Osaka (EIP-7825).
         // Users can opt-in to enable these limits by setting `enable_tx_gas_limit` to true.
@@ -1575,6 +1583,19 @@ mod tests {
         assert_eq!(description, "provider example.com");
         assert!(!description.contains("secret"));
         assert!(!description.contains("private-api-key"));
+    }
+
+    #[test]
+    fn eip8151_is_default_off_and_limited_to_the_ethereum_profile() {
+        assert!(!EvmOpts::default().cfg_env::<SpecId>(1).enable_eip8151);
+
+        let enabled = EvmOpts { enable_eip8151: true, ..Default::default() };
+        assert!(enabled.cfg_env::<SpecId>(1).enable_eip8151);
+
+        for networks in [NetworkConfigs::with_tempo(), NetworkConfigs::with_celo()] {
+            let opts = EvmOpts { enable_eip8151: true, networks, ..Default::default() };
+            assert!(!opts.cfg_env::<SpecId>(1).enable_eip8151);
+        }
     }
 
     #[test]

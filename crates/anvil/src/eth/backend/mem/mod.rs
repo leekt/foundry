@@ -1,24 +1,27 @@
 //! In-memory blockchain backend.
-use crate::eth::backend::frame_tx::execute_frame_tx;
 use self::{in_memory_db::StateRootDb, state::trie_storage};
+use crate::eth::backend::frame_tx::execute_frame_tx;
+#[cfg(feature = "monad")]
+use crate::eth::backend::replay::execute_historical_replay_with;
 
 #[cfg(feature = "monad")]
 use crate::eth::backend::db::MonadBlockReplayProfile;
-#[cfg(feature = "monad")]
-use crate::eth::backend::replay::execute_historical_replay_with;
 use crate::{
     ForkChoice, NodeConfig, PrecompileFactory,
     config::{ForkTransactionReplay, PruneStateHistoryConfig},
     eth::{
         backend::{
-            cheats::{CheatEcrecover, CheatsManager},
+            cheats::{
+                CheatEcrecover, CheatsManager, ecrecover_signature, is_cheat_eip8151_fallback_id,
+            },
             db::{AnvilCacheDB, Db, MaybeFullDatabase, SerializableState, StateDb},
             executor::{
-                AnvilBlockExecutor, BlockExecutionKind, EthereumBlockTransitions,
-                ExecutedPoolTransactions, FoundryReceiptBuilder, PoolTransactionHooks,
-                PoolTxGasConfig, apply_ethereum_post_execution_changes,
-                apply_ethereum_pre_execution_changes, build_tx_env_for_pending,
-                execute_pool_transaction, execute_pool_transactions,
+                AnvilBlockExecutor, AnvilExecutionOutcome, BlockExecutionKind,
+                EthereumBlockTransitions, ExecutedPoolTransactions, FoundryReceiptBuilder,
+                FrameReceiptData, PoolTransactionHooks, PoolTxGasConfig,
+                apply_ethereum_post_execution_changes, apply_ethereum_pre_execution_changes,
+                build_tx_env_for_pending, execute_pool_transaction, execute_pool_transactions,
+                is_eip7851_sender_ecdsa_authenticated,
             },
             fork::{ClientFork, ForkEndpointIdentity},
             genesis::GenesisConfig,
@@ -29,8 +32,8 @@ use crate::{
             notifications::{ChainNotification, ChainNotifications, NewBlockNotification},
             replay::{
                 ExecutedHistoricalReplay, HistoricalReplayTransaction,
-                PreparedForkTransactionReplay, execute_historical_replay,
-                prepare_fork_transaction_replay,
+                PreparedForkTransactionReplay, execute_historical_eth_replay,
+                execute_historical_replay, prepare_fork_transaction_replay,
             },
             tempo::AnvilStorageProvider,
             time::{TimeManager, utc_from_secs},
@@ -43,7 +46,7 @@ use crate::{
         preserve_simulation_request_fields,
     },
     mem::{
-        inspector::{AnvilInspector, InspectorTxConfig},
+        inspector::{AnvilInspector, FrameInspector, InspectorTxConfig},
         storage::{BlockchainStorage, InMemoryBlockStates, MinedBlockOutcome},
     },
 };
@@ -67,13 +70,12 @@ use alloy_eips::{
     eip7910::SystemContract,
 };
 use alloy_evm::{
-    Database, EthEvmFactory, Evm, EvmEnv, EvmFactory, FromTxWithEncoded,
-    block::{BlockExecutionResult, BlockExecutor, StateDB},
+    Database, EthEvmFactory, Evm, EvmEnv, EvmFactory, RecoveredTx,
+    block::{BlockExecutionError, BlockExecutionResult, BlockExecutor, StateDB},
     eth::EthEvmContext,
     overrides::{OverrideBlockHashes, apply_state_overrides},
     precompiles::{DynPrecompile, MovePrecompileError, Precompile, PrecompilesMap},
 };
-use alloy_evm::{RecoveredTx, block::BlockExecutionError};
 #[cfg(feature = "monad")]
 use alloy_monad_evm::{MonadContext, MonadEvm, MonadEvmFactory};
 #[cfg(feature = "monad")]
@@ -90,8 +92,8 @@ use alloy_primitives::{
 };
 use alloy_rlp::Decodable;
 use alloy_rpc_types::{
-    AccessList, Block as AlloyBlock, BlockId, BlockNumberOrTag as BlockNumber, BlockOverrides,
-    BlockTransactions, EIP1186AccountProofResponse as AccountProof,
+    AccessList, AccessListItem, Block as AlloyBlock, BlockId, BlockNumberOrTag as BlockNumber,
+    BlockOverrides, BlockTransactions, EIP1186AccountProofResponse as AccountProof,
     EIP1186StorageProof as StorageProof, Filter, Header as AlloyHeader, Index, Log, Transaction,
     TransactionReceipt,
     anvil::Forking,
@@ -145,7 +147,7 @@ use foundry_evm::{
     constants::{DEFAULT_CREATE2_DEPLOYER, DEFAULT_CREATE2_DEPLOYER_RUNTIME_CODE},
     core::{
         evm::{EvmEnvFor, TempoEvmNetwork},
-        precompiles::EC_RECOVER,
+        precompiles::{EC_RECOVER, install_eip8151_precompile, is_eip8151_ecrecover_id},
     },
     decode::RevertDecoder,
     hardfork::{EthereumHardfork, FoundryHardfork},
@@ -164,8 +166,9 @@ use foundry_evm_networks::{NetworkConfigs, arbitrum};
 #[cfg(feature = "optimism")]
 use foundry_primitives::get_deposit_tx_parts;
 use foundry_primitives::{
-    FRAME_TX_TYPE_ID, FoundryHeader, FoundryNetwork, FoundryReceiptEnvelope,
-    FoundryTransactionRequest, FoundryTxEnvelope, FoundryTxReceipt, TempoTransactionRequest,
+    EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE, FRAME_TX_TYPE_ID, FoundryHeader,
+    FoundryNetwork, FoundryReceiptEnvelope, FoundryTransactionRequest, FoundryTxEnvelope,
+    FoundryTxReceipt, TempoTransactionRequest, TxFrame,
 };
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 #[cfg(feature = "monad")]
@@ -188,8 +191,11 @@ use revm::{
         EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler as EvmHandler, validation,
     },
     inspector::{InspectorEvmTr, InspectorHandler},
-    interpreter::{InstructionResult, interpreter::EthInterpreter, interpreter_action::FrameInit},
-    precompile::{PrecompileSpecId, Precompiles},
+    interpreter::{
+        CallInputs, CallOutcome, InstructionResult, interpreter::EthInterpreter,
+        interpreter_action::FrameInit,
+    },
+    precompile::{PrecompileSpecId, Precompiles, secp256k1::ec_recover_run},
     primitives::{KECCAK_EMPTY, hardfork::SpecId},
     state::{Account, AccountInfo, EvmState, EvmStorageSlot, TransactionId},
 };
@@ -208,7 +214,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -247,6 +253,13 @@ type OpCallDepositInfo = DepositTransactionParts;
 #[cfg(not(feature = "optimism"))]
 #[derive(Default, Clone, Debug)]
 struct OpCallDepositInfo;
+
+/// Removes experimental EIPs that are supported only by the canonical Ethereum profile.
+const fn without_ethereum_experimental_eips<S>(mut cfg: CfgEnv<S>) -> CfgEnv<S> {
+    cfg.enable_eip7851 = false;
+    cfg.enable_eip8151 = false;
+    cfg
+}
 
 /// Fully prepared fork replacement awaiting an atomic backend commit.
 pub(crate) struct StagedForkReset {
@@ -772,6 +785,95 @@ struct TypedCallOverrides {
     disable_fee_charge: bool,
 }
 
+#[derive(Debug, Default)]
+struct Eip8151AccessListInspector {
+    mode: Arc<AtomicU8>,
+    cheats: CheatsManager,
+    pending_recovery: Option<Address>,
+    recovered_addresses: HashSet<Address>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+enum Eip8151InferenceMode {
+    #[default]
+    Disabled,
+    Canonical,
+    CheatFallback,
+}
+
+impl Eip8151AccessListInspector {
+    fn new(mode: Arc<AtomicU8>, cheats: CheatsManager) -> Self {
+        Self { mode, cheats, pending_recovery: None, recovered_addresses: HashSet::default() }
+    }
+
+    fn mode(&self) -> Eip8151InferenceMode {
+        match self.mode.load(Ordering::Relaxed) {
+            value if value == Eip8151InferenceMode::Canonical as u8 => {
+                Eip8151InferenceMode::Canonical
+            }
+            value if value == Eip8151InferenceMode::CheatFallback as u8 => {
+                Eip8151InferenceMode::CheatFallback
+            }
+            _ => Eip8151InferenceMode::Disabled,
+        }
+    }
+
+    fn extend_access_list(&self, access_list: &mut AccessList, excluded: &HashSet<Address>) {
+        for &address in &self.recovered_addresses {
+            if !excluded.contains(&address)
+                && !access_list.0.iter().any(|item| item.address == address)
+            {
+                access_list.0.push(AccessListItem { address, storage_keys: Vec::new() });
+            }
+        }
+    }
+}
+
+impl<CTX: ContextTr> Inspector<CTX> for Eip8151AccessListInspector {
+    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        if inputs.bytecode_address == EC_RECOVER {
+            self.pending_recovery = None;
+        }
+        let mode = self.mode();
+        if mode == Eip8151InferenceMode::Disabled
+            || inputs.bytecode_address != EC_RECOVER
+            || inputs.gas_limit < 5_600
+            || !context.cfg().is_eip8151_enabled()
+            || !context.cfg().spec().into().is_enabled_in(SpecId::PRAGUE)
+        {
+            return None;
+        }
+
+        let input = inputs.input.as_bytes(context);
+        if mode == Eip8151InferenceMode::CheatFallback
+            && self.cheats.get_recover_override(&ecrecover_signature(&input)).is_some()
+        {
+            return None;
+        }
+        if let Ok(output) = ec_recover_run(&input, inputs.gas_limit)
+            && output.bytes.len() == 32
+        {
+            self.pending_recovery = Some(Address::from_slice(&output.bytes[12..]));
+        }
+        None
+    }
+
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        if inputs.bytecode_address != EC_RECOVER {
+            return;
+        }
+        let Some(recovered) = self.pending_recovery.take() else { return };
+        if outcome.was_precompile_called
+            && outcome.result.result.is_ok()
+            && outcome.result.output.len() == 32
+            && matches!(outcome.result.gas.total_gas_spent(), 3_100 | 5_600)
+        {
+            self.recovered_addresses.insert(recovered);
+        }
+    }
+}
+
 pub(crate) struct GasEstimateCallOptions {
     gas_limit: u64,
     disable_fee_charge: bool,
@@ -1049,6 +1151,8 @@ pub struct Backend<N: Network> {
     mining: Arc<tokio::sync::Mutex<()>>,
     /// Disable pool balance checks
     disable_pool_balance_checks: bool,
+    /// Whether the experimental EIP-8141 execution profile is active.
+    frame_transactions_enabled: bool,
     /// Keeps startup fork-cache rollback armed until startup initialization completes.
     ///
     /// This must remain the final field so all other backend-held database references are released
@@ -1084,6 +1188,7 @@ impl<N: Network> Clone for Backend<N> {
             precompile_factory: self.precompile_factory.clone(),
             mining: self.mining.clone(),
             disable_pool_balance_checks: self.disable_pool_balance_checks,
+            frame_transactions_enabled: self.frame_transactions_enabled,
             startup_fork_cache_user: self.startup_fork_cache_user.clone(),
         }
     }
@@ -1389,7 +1494,7 @@ impl<N: Network> Backend<N> {
             .map(|transaction| {
                 let pending =
                     Self::pending_mined_transaction_from_storage(storage, transaction.clone())?;
-                Ok(build_tx_env_for_pending::<FoundryTxEnvelope, TxEnv>(&pending, self.cheats()))
+                Ok(build_tx_env_for_pending::<TxEnv>(&pending, self.cheats()))
             })
             .collect()
     }
@@ -1407,7 +1512,7 @@ impl<N: Network> Backend<N> {
                     MaybeImpersonatedTransaction::new(replay.transaction.tx().clone()),
                     replay.transaction.signer(),
                 );
-                build_tx_env_for_pending::<FoundryTxEnvelope, TxEnv>(&pending, self.cheats())
+                build_tx_env_for_pending::<TxEnv>(&pending, self.cheats())
             })
             .collect()
     }
@@ -1781,6 +1886,41 @@ impl<N: Network> Backend<N> {
         Err(BlockchainError::EIP7702TransactionUnsupportedAtHardfork)
     }
 
+    /// Returns an error when the active execution profile cannot execute scalar frame gas.
+    pub fn ensure_frame_transactions_supported(&self) -> Result<(), BlockchainError> {
+        if !self.frame_transactions_enabled {
+            return Err(BlockchainError::InvalidTransactionRequest(
+                "frame transactions are disabled; start Anvil with --enable-frame-transactions"
+                    .to_owned(),
+            ));
+        }
+        if self.is_optimism()
+            || self.is_tempo()
+            || self.is_monad()
+            || self.spec_id() >= SpecId::AMSTERDAM
+        {
+            return Err(BlockchainError::InvalidTransactionRequest(format!(
+                "frame transactions are unsupported by the active {} execution profile",
+                self.execution_profile_name()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Applies the EIP-8141 activation transition to the current live state.
+    pub(crate) async fn apply_frame_transaction_activation(&self) -> Result<(), DatabaseError> {
+        if !self.frame_transactions_enabled
+            || !matches!(self.hardfork(), FoundryHardfork::Ethereum(_))
+            || self.spec_id() >= SpecId::AMSTERDAM
+        {
+            return Ok(());
+        }
+        self.db
+            .write()
+            .await
+            .set_code(EXPIRY_VERIFIER_ADDRESS, Bytes::from_static(EXPIRY_VERIFIER_RUNTIME_CODE))
+    }
+
     /// Returns an error if op-stack deposits are not active
     #[cfg(feature = "optimism")]
     pub const fn ensure_op_deposits_active(&self) -> Result<(), BlockchainError> {
@@ -1852,9 +1992,9 @@ impl<N: Network> Backend<N> {
         }
 
         let hardfork = MonadHardfork::from(self.hardfork());
-        Some(MonadCfgEnv::from(
+        Some(MonadCfgEnv::from(without_ethereum_experimental_eips(
             evm_env.cfg_env.clone().with_spec_and_gas_params(hardfork, monad_gas_params(hardfork)),
-        ))
+        )))
     }
 
     fn tx_gas_limit_cap(&self, evm_env: &EvmEnv) -> u64 {
@@ -2518,12 +2658,17 @@ impl<N: Network> Backend<N> {
 
     /// Injects all configured precompiles into the given precompile map.
     ///
-    /// This applies four layers:
-    /// 1. Network-specific precompiles (e.g. Tempo, OP)
-    /// 2. Chain- and timestamp-specific precompiles
-    /// 3. User-provided precompiles via [`PrecompileFactory`]
-    /// 4. Cheatcode ecrecover overrides (if active)
+    /// This applies five layers:
+    /// 1. EIP-8151's protocol ECRecover implementation (if active)
+    /// 2. Network-specific precompiles (e.g. Tempo, OP)
+    /// 3. Chain- and timestamp-specific precompiles
+    /// 4. User-provided precompiles via [`PrecompileFactory`]
+    /// 5. Cheatcode ecrecover overrides (if active)
     fn inject_precompiles(&self, precompiles: &mut PrecompilesMap, evm_env: &EvmEnv) {
+        if self.networks.execution_network().is_ethereum() && !self.networks.is_celo() {
+            install_eip8151_precompile(precompiles, &evm_env.cfg_env);
+        }
+
         self.networks.inject_precompiles(precompiles);
         self.networks.inject_chain_precompiles(
             precompiles,
@@ -2537,12 +2682,14 @@ impl<N: Network> Backend<N> {
 
         let cheats = Arc::new(self.cheats.clone());
         if cheats.has_recover_overrides() {
-            let cheat_ecrecover = CheatEcrecover::new(Arc::clone(&cheats));
-            precompiles.apply_precompile(&EC_RECOVER, move |_| {
-                Some(DynPrecompile::new_stateful(
-                    cheat_ecrecover.precompile_id().clone(),
-                    move |input| cheat_ecrecover.call(input),
-                ))
+            precompiles.apply_precompile(&EC_RECOVER, move |fallback| {
+                fallback.map(|fallback| {
+                    let cheat_ecrecover = CheatEcrecover::new(Arc::clone(&cheats), fallback);
+                    DynPrecompile::new_stateful(
+                        cheat_ecrecover.precompile_id().clone(),
+                        move |input| cheat_ecrecover.call(input),
+                    )
+                })
             });
         }
     }
@@ -2683,7 +2830,34 @@ impl<N: Network> Backend<N> {
             inspector,
             tx_env,
             &SimulationPrecompileOverrides::default(),
+            None,
         )
+    }
+
+    /// Executes an EIP-8141 envelope while composing approval tracking with the caller's inspector.
+    fn transact_frame_with_inspector_ref<'db, I, DB>(
+        &self,
+        db: &'db DB,
+        evm_env: &EvmEnv,
+        inspector: &mut I,
+        tx: &TxFrame,
+    ) -> Result<ResultAndState<HaltReason>, BlockchainError>
+    where
+        DB: DatabaseRef + ?Sized,
+        I: Inspector<EthEvmContext<WrapDatabaseRef<&'db DB>>> + 'static,
+        WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
+    {
+        let inspector = FrameInspector::new(inspector);
+        let mut evm = EthEvmFactory::default().create_evm_with_inspector(
+            WrapDatabaseRef(db),
+            evm_env.clone(),
+            inspector,
+        );
+        self.inject_precompiles(evm.precompiles_mut(), evm_env);
+        self.inject_arbitrum_precompile(evm.precompiles_mut(), evm_env);
+        execute_frame_tx(&mut evm, tx)
+            .map(|outcome| outcome.result)
+            .map_err(|err| BlockchainError::Internal(err.to_string()))
     }
 
     fn transact_eth_with_inspector_ref_and_precompile_overrides<'db, I, DB>(
@@ -2693,6 +2867,7 @@ impl<N: Network> Backend<N> {
         inspector: &mut I,
         tx_env: TxEnv,
         overrides: &SimulationPrecompileOverrides,
+        eip8151_access_list_inference: Option<&AtomicU8>,
     ) -> Result<ResultAndState<HaltReason>, BlockchainError>
     where
         DB: DatabaseRef + ?Sized,
@@ -2712,7 +2887,54 @@ impl<N: Network> Backend<N> {
             // EIP-2929 warms protocol precompile addresses, not simulation-only destinations.
             evm.ctx_mut().journal_mut().warm_precompiles(&warm_addresses);
         }
+        if let Some(enabled) = eip8151_access_list_inference {
+            let mode = evm.precompiles().get(&EC_RECOVER).map_or(
+                Eip8151InferenceMode::Disabled,
+                |precompile| {
+                    if precompile.supports_caching() {
+                        Eip8151InferenceMode::Disabled
+                    } else if is_eip8151_ecrecover_id(precompile.precompile_id()) {
+                        Eip8151InferenceMode::Canonical
+                    } else if is_cheat_eip8151_fallback_id(precompile.precompile_id()) {
+                        Eip8151InferenceMode::CheatFallback
+                    } else {
+                        Eip8151InferenceMode::Disabled
+                    }
+                },
+            );
+            enabled.store(mode as u8, Ordering::Relaxed);
+        }
         Ok(evm.transact(tx_env)?)
+    }
+
+    fn transact_access_list_call_with_inspector_ref<'db, I, DB>(
+        &self,
+        db: &'db DB,
+        evm_env: &EvmEnv,
+        inspector: &mut I,
+        tx_env: CallTxEnv,
+        monad_context: Option<MonadExecutionContext<'_>>,
+        eip8151_inference: &AtomicU8,
+    ) -> Result<ResultAndState<HaltReason>, BlockchainError>
+    where
+        DB: DatabaseRef + ?Sized,
+        I: BackendInspector<WrapDatabaseRef<&'db DB>> + 'static,
+        WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
+    {
+        match tx_env {
+            CallTxEnv::Eth(tx_env) => self
+                .transact_eth_with_inspector_ref_and_precompile_overrides(
+                    db,
+                    evm_env,
+                    inspector,
+                    tx_env,
+                    &SimulationPrecompileOverrides::default(),
+                    Some(eip8151_inference),
+                ),
+            tx_env => {
+                self.transact_call_with_inspector_ref(db, evm_env, inspector, tx_env, monad_context)
+            }
+        }
     }
 
     fn transact_eth_simulation_with_inspector_ref<'db, I, DB>(
@@ -2769,7 +2991,7 @@ impl<N: Network> Backend<N> {
     ) -> Result<(ResultAndState<HaltReason>, TxEnv), BlockchainError>
     where
         DB: DatabaseRef + ?Sized,
-        I: BackendInspector<WrapDatabaseRef<&'db DB>>,
+        I: BackendInspector<WrapDatabaseRef<&'db DB>> + 'static,
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
         self.transact_envelope_with_inspector_ref_and_context_kind(
@@ -2792,7 +3014,7 @@ impl<N: Network> Backend<N> {
     ) -> Result<(ResultAndState<HaltReason>, TxEnv), BlockchainError>
     where
         DB: DatabaseRef + ?Sized,
-        I: BackendInspector<WrapDatabaseRef<&'db DB>>,
+        I: BackendInspector<WrapDatabaseRef<&'db DB>> + 'static,
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
         self.transact_envelope_with_inspector_ref_and_context_kind(
@@ -2812,24 +3034,27 @@ impl<N: Network> Backend<N> {
     ) -> Result<(ResultAndState<HaltReason>, TxEnv), BlockchainError>
     where
         DB: DatabaseRef + ?Sized,
-        I: BackendInspector<WrapDatabaseRef<&'db DB>>,
+        I: BackendInspector<WrapDatabaseRef<&'db DB>> + 'static,
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
         let tx = pending.transaction.as_ref();
-        let sender = *pending.sender();
         if tx.is_tempo() {
-            let tx_env: TempoTxEnv =
-                FromTxWithEncoded::from_encoded_tx(tx, sender, tx.encoded_2718().into());
+            let tx_env: TempoTxEnv = build_tx_env_for_pending(pending, self.cheats());
             let base = tx_env.inner.clone();
             let result = self.transact_tempo_with_inspector_ref(db, evm_env, inspector, tx_env)?;
             return Ok((result, base));
         }
         #[cfg(feature = "optimism")]
         if self.is_optimism() {
-            let op_tx: OpTransaction<TxEnv> =
-                FromTxWithEncoded::from_encoded_tx(tx, sender, tx.encoded_2718().into());
+            let op_tx: OpTransaction<TxEnv> = build_tx_env_for_pending(pending, self.cheats());
             let base = op_tx.base.clone();
             let result = self.transact_op_with_inspector_ref(db, evm_env, inspector, op_tx)?;
+            return Ok((result, base));
+        }
+        if let Some(frame_tx) = tx.as_frame() {
+            let base = build_tx_env_for_pending(pending, self.cheats());
+            let result =
+                self.transact_frame_with_inspector_ref(db, evm_env, inspector, frame_tx)?;
             return Ok((result, base));
         }
         let tx_env: TxEnv = build_tx_env_for_pending(pending, self.cheats());
@@ -2861,7 +3086,12 @@ impl<N: Network> Backend<N> {
     fn build_tempo_evm_env(&self, evm_env: &EvmEnv) -> EvmEnvFor<TempoEvmNetwork> {
         let hardfork = self.tempo_hardfork();
         EvmEnv::new(
-            evm_env.cfg_env.clone().with_spec_and_gas_params(hardfork, tempo_gas_params(hardfork)),
+            without_ethereum_experimental_eips(
+                evm_env
+                    .cfg_env
+                    .clone()
+                    .with_spec_and_gas_params(hardfork, tempo_gas_params(hardfork)),
+            ),
             TempoBlockEnv {
                 inner: evm_env.block_env.clone(),
                 timestamp_millis_part: 0,
@@ -2916,10 +3146,10 @@ impl<N: Network> Backend<N> {
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
         let monad_env = EvmEnv::new(
-            evm_env
-                .cfg_env
-                .clone()
-                .with_spec_and_gas_params(execution.hardfork, monad_gas_params(execution.hardfork)),
+            without_ethereum_experimental_eips(evm_env.cfg_env.clone().with_spec_and_gas_params(
+                execution.hardfork,
+                monad_gas_params(execution.hardfork),
+            )),
             evm_env.block_env.clone(),
         );
         let factory = MonadEvmFactory::default();
@@ -3001,7 +3231,9 @@ impl<N: Network> Backend<N> {
         #[cfg(feature = "optimism")]
         if self.is_optimism() {
             let op_env = EvmEnv::new(
-                evm_env.cfg_env.clone().with_spec_and_mainnet_gas_params(hardfork.into()),
+                without_ethereum_experimental_eips(
+                    evm_env.cfg_env.clone().with_spec_and_mainnet_gas_params(hardfork.into()),
+                ),
                 evm_env.block_env.clone(),
             );
             let mut evm =
@@ -3029,10 +3261,12 @@ impl<N: Network> Backend<N> {
         if self.is_monad() {
             let hardfork = MonadHardfork::from(hardfork);
             let monad_env = EvmEnv::new(
-                evm_env
-                    .cfg_env
-                    .clone()
-                    .with_spec_and_gas_params(hardfork, monad_gas_params(hardfork)),
+                without_ethereum_experimental_eips(
+                    evm_env
+                        .cfg_env
+                        .clone()
+                        .with_spec_and_gas_params(hardfork, monad_gas_params(hardfork)),
+                ),
                 evm_env.block_env.clone(),
             );
             let mut evm =
@@ -3062,12 +3296,15 @@ impl<N: Network> Backend<N> {
                     executor.execute_transaction_without_commit_with(
                         (tx_env, recovered),
                         |evm, tx_env, transaction_hash| {
-                            MonadEvmFactory::default().transact_replay(evm, tx_env).map_err(|err| {
-                                BlockExecutionError::msg(format!(
-                                    "failed to replay Monad transaction {transaction_hash}: \
+                            MonadEvmFactory::default()
+                                .transact_replay(evm, tx_env)
+                                .map(Into::into)
+                                .map_err(|err| {
+                                    BlockExecutionError::msg(format!(
+                                        "failed to replay Monad transaction {transaction_hash}: \
                                          {err}"
-                                ))
-                            })
+                                    ))
+                                })
                         },
                     )
                 },
@@ -3093,7 +3330,13 @@ impl<N: Network> Backend<N> {
                     (tx_env, recovered),
                     move |evm, _tx_env, _hash| {
                         execute_frame_tx(evm, &frame_tx)
-                            .map(|outcome| outcome.result)
+                            .map(|outcome| AnvilExecutionOutcome {
+                                result: outcome.result,
+                                frame_receipt: Some(FrameReceiptData {
+                                    payer: outcome.payer,
+                                    frame_receipts: outcome.frame_receipts,
+                                }),
+                            })
                             .map_err(|err| BlockExecutionError::msg(err.to_string()))
                     },
                 )
@@ -3231,6 +3474,7 @@ impl<N: Network> Backend<N> {
             blob_hashes,
             ..Default::default()
         };
+        tx_env.set_eip7851_sender_ecdsa_authenticated(false);
         tx_env.set_signed_authorization(authorization_list.unwrap_or_default());
 
         if let Some(nonce) = nonce {
@@ -3327,6 +3571,11 @@ impl<N: Network> Backend<N> {
         request: WithOtherFields<TransactionRequest>,
     ) -> Result<FoundryTransactionRequest, BlockchainError> {
         let transaction_type = request.transaction_type;
+        if transaction_type == Some(FRAME_TX_TYPE_ID) || request.other.contains_key("frames") {
+            return Err(BlockchainError::InvalidTransactionRequest(
+                "frame transactions are only accepted as raw signed envelopes".to_owned(),
+            ));
+        }
         if !self.is_tempo() && transaction_type != Some(TEMPO_TX_TYPE_ID) {
             #[cfg(feature = "optimism")]
             if transaction_type == Some(DEPOSIT_TX_TYPE_ID)
@@ -3509,7 +3758,7 @@ impl<N: Network> Backend<N> {
     ) -> Result<ResultAndState<HaltReason>, BlockchainError>
     where
         DB: DatabaseRef + ?Sized,
-        I: BackendInspector<WrapDatabaseRef<&'db DB>>,
+        I: BackendInspector<WrapDatabaseRef<&'db DB>> + 'static,
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
         self.transact_call_with_inspector_ref_at_hardfork(
@@ -3535,7 +3784,7 @@ impl<N: Network> Backend<N> {
     ) -> Result<ResultAndState<HaltReason>, BlockchainError>
     where
         DB: DatabaseRef + ?Sized,
-        I: BackendInspector<WrapDatabaseRef<&'db DB>>,
+        I: BackendInspector<WrapDatabaseRef<&'db DB>> + 'static,
         WrapDatabaseRef<&'db DB>: Database<Error = DatabaseError>,
     {
         match tx_env {
@@ -3697,20 +3946,26 @@ impl<N: Network> Backend<N> {
         block_env: BlockEnv,
         mut monad_context: Option<MonadReplayContext>,
     ) -> Result<(InstructionResult, Option<Output>, u64, AccessList), BlockchainError> {
-        let mut inspector =
-            AccessListInspector::new(request.access_list.clone().unwrap_or_default());
+        let eip8151_inference = Arc::new(AtomicU8::new(Eip8151InferenceMode::Disabled as u8));
+        let mut inspector = (
+            AccessListInspector::new(request.access_list.clone().unwrap_or_default()),
+            Eip8151AccessListInspector::new(Arc::clone(&eip8151_inference), self.cheats.clone()),
+        );
 
         let PreparedCall { evm_env, tx_env, .. } =
             self.prepare_call_env(state, request, fee_details, block_env)?;
-        let ResultAndState { result, state: _ } = self.transact_call_with_inspector_ref(
-            state,
-            &evm_env,
-            &mut inspector,
-            tx_env,
-            monad_context.as_mut().map(next_monad_context),
-        )?;
+        let ResultAndState { result, state: _ } = self
+            .transact_access_list_call_with_inspector_ref(
+                state,
+                &evm_env,
+                &mut inspector,
+                tx_env,
+                monad_context.as_mut().map(next_monad_context),
+                &eip8151_inference,
+            )?;
         let (exit_reason, gas_used, out, _logs) = unpack_execution_result(result);
-        let access_list = inspector.access_list();
+        let mut access_list = inspector.0.access_list();
+        inspector.1.extend_access_list(&mut access_list, inspector.0.excluded());
         Ok((exit_reason, out, gas_used, access_list))
     }
 
@@ -3850,6 +4105,15 @@ impl<N: Network> Backend<N> {
             Some(info),
             block.header.base_fee_per_gas(),
         ))
+    }
+
+    /// Returns canonical EIP-2718 bytes for a locally mined transaction.
+    pub fn raw_mined_transaction_by_hash(&self, hash: B256) -> Option<Bytes> {
+        let storage = self.blockchain.storage.read();
+        let MinedTransaction { info, block_hash, .. } = storage.transactions.get(&hash)?;
+        let block = storage.blocks.get(block_hash)?;
+        let transaction = block.body.transactions.get(info.transaction_index as usize)?.clone();
+        Some(transaction.into_inner().into_canonical().encoded_2718().into())
     }
 
     /// Returns the traces for the given transaction
@@ -4354,12 +4618,19 @@ impl<N: Network> Backend<N> {
             states = states.disk_path(cache_path);
         }
 
-        let (slots_in_an_epoch, precompile_factory, disable_pool_balance_checks, hardfork) = {
+        let (
+            slots_in_an_epoch,
+            precompile_factory,
+            disable_pool_balance_checks,
+            frame_transactions_enabled,
+            hardfork,
+        ) = {
             let cfg = node_config.read().await;
             (
                 cfg.slots_in_an_epoch,
                 cfg.precompile_factory.clone(),
                 cfg.disable_pool_balance_checks,
+                cfg.enable_frame_transactions,
                 cfg.get_hardfork(),
             )
         };
@@ -4401,6 +4672,7 @@ impl<N: Network> Backend<N> {
             precompile_factory,
             mining: Arc::new(tokio::sync::Mutex::new(())),
             disable_pool_balance_checks,
+            frame_transactions_enabled,
             startup_fork_cache_user,
         };
 
@@ -4577,7 +4849,9 @@ impl<N: Network> Backend<N> {
         tempo_hardfork: Option<TempoHardfork>,
         genesis_hash: B256,
         install_create2_deployer: bool,
+        enable_frame_transactions: bool,
     ) -> Result<(), DatabaseError> {
+        let is_ethereum = matches!(hardfork, FoundryHardfork::Ethereum(_));
         for (account, info) in genesis.account_infos() {
             db.insert_account(account, info);
         }
@@ -4604,6 +4878,9 @@ impl<N: Network> Backend<N> {
         }
 
         genesis.apply_genesis_json_alloc(db)?;
+        if is_ethereum && enable_frame_transactions && SpecId::from(hardfork) < SpecId::AMSTERDAM {
+            db.set_code(EXPIRY_VERIFIER_ADDRESS, Bytes::from_static(EXPIRY_VERIFIER_RUNTIME_CODE))?;
+        }
         for (&address, &balance) in funded_accounts {
             let mut info = db.basic_ref(address)?.unwrap_or_default();
             info.balance = balance;
@@ -4780,6 +5057,15 @@ impl<N: Network> Backend<N> {
                 return Ok(None);
             }
             self.apply_fork_genesis(Arc::clone(&staged_db), cache_lease.clone()).await?;
+            if staged_config.enable_frame_transactions
+                && matches!(staged_config.get_hardfork(), FoundryHardfork::Ethereum(_))
+                && SpecId::from(staged_config.get_hardfork()) < SpecId::AMSTERDAM
+            {
+                staged_db.write().await.set_code(
+                    EXPIRY_VERIFIER_ADDRESS,
+                    Bytes::from_static(EXPIRY_VERIFIER_RUNTIME_CODE),
+                )?;
+            }
 
             #[cfg(feature = "monad")]
             if self.is_monad() {
@@ -4999,6 +5285,13 @@ impl<N: Network> Backend<N> {
         staged_cfg.limit_contract_code_size = staged_config.code_size_limit;
         staged_cfg.disable_eip3607 = true;
         staged_cfg.disable_block_gas_limit = staged_config.disable_block_gas_limit;
+        staged_cfg.enable_eip7819 = staged_config.enable_eip7819;
+        staged_cfg.enable_eip7851 = staged_config.enable_eip7851
+            && staged_config.networks.execution_network().is_ethereum()
+            && !staged_config.networks.is_celo();
+        staged_cfg.enable_eip8151 = staged_config.enable_eip8151
+            && staged_config.networks.execution_network().is_ethereum()
+            && !staged_config.networks.is_celo();
         if !staged_config.enable_tx_gas_limit {
             staged_cfg.tx_gas_limit_cap = Some(u64::MAX);
         }
@@ -5060,6 +5353,7 @@ impl<N: Network> Backend<N> {
             local_tempo_hardfork,
             staged_storage.genesis_hash,
             install_create2_deployer,
+            staged_config.enable_frame_transactions,
         )?;
 
         Ok(StagedMemoryReset {
@@ -5397,6 +5691,9 @@ where
         let PreparedForkTransactionReplay { transactions, timestamp, parent_beacon_block_root } =
             prepared;
         eyre::ensure!(!transactions.is_empty(), "fork transaction replay prefix is empty");
+        if transactions.iter().any(|replay| replay.transaction.tx().is_frame()) {
+            self.ensure_frame_transactions_supported()?;
+        }
         let next_timestamp = timestamp.checked_add(1).ok_or_else(|| {
             eyre::eyre!("fork transaction replay timestamp cannot be incremented")
         })?;
@@ -5667,7 +5964,9 @@ where
         #[cfg(feature = "optimism")]
         if self.is_optimism() {
             let op_env = EvmEnv::new(
-                evm_env.cfg_env.clone().with_spec_and_mainnet_gas_params(hardfork.into()),
+                without_ethereum_experimental_eips(
+                    evm_env.cfg_env.clone().with_spec_and_mainnet_gas_params(hardfork.into()),
+                ),
                 evm_env.block_env.clone(),
             );
             let mut evm =
@@ -5686,10 +5985,12 @@ where
         if self.is_monad() {
             let hardfork = MonadHardfork::from(hardfork);
             let monad_env = EvmEnv::new(
-                evm_env
-                    .cfg_env
-                    .clone()
-                    .with_spec_and_gas_params(hardfork, monad_gas_params(hardfork)),
+                without_ethereum_experimental_eips(
+                    evm_env
+                        .cfg_env
+                        .clone()
+                        .with_spec_and_gas_params(hardfork, monad_gas_params(hardfork)),
+                ),
                 evm_env.block_env.clone(),
             );
             let mut evm =
@@ -5702,10 +6003,11 @@ where
                     executor,
                     transactions,
                     inspector_tx_config,
-                    |evm, tx_env, _transaction_hash| {
+                    |evm, tx_env, _transaction_hash, _transaction| {
                         prepare_monad_transaction(evm, &tx_env);
                         let result = MonadEvmFactory::default()
                             .transact_replay(evm, tx_env)
+                            .map(Into::into)
                             .map_err(BlockExecutionError::msg);
                         if result.is_err() {
                             rollback_monad_transaction(evm);
@@ -5717,7 +6019,11 @@ where
         }
         let mut evm =
             EthEvmFactory::default().create_evm_with_inspector(db, evm_env.clone(), inspector);
-        run!(evm)
+        run!(evm, |executor| execute_historical_eth_replay(
+            executor,
+            transactions,
+            inspector_tx_config,
+        ))
     }
 
     /// Builds a [`BlockInfo`] from the EVM environment, execution results, and transactions.
@@ -5906,7 +6212,7 @@ where
                 let tx_envs = included
                     .iter()
                     .map(|pool_tx| {
-                        build_tx_env_for_pending::<FoundryTxEnvelope, TxEnv>(
+                        build_tx_env_for_pending::<TxEnv>(
                             &pool_tx.pending_transaction,
                             self.cheats(),
                         )
@@ -8489,6 +8795,7 @@ impl Backend<FoundryNetwork> {
                             &mut inspector,
                             tx_env.into_base(),
                             &precompile_overrides,
+                            None,
                         ),
                     };
                     let ResultAndState { result, mut state } = match execution_result {
@@ -9054,6 +9361,24 @@ where
         let account = self.get_account(address).await?;
         let evm_env = self.next_evm_env();
 
+        // EIP-7851 disables only protocol-level ECDSA authority. Frame, deposit, Tempo AA, and
+        // impersonated transactions have different authentication paths and must remain eligible.
+        if evm_env.cfg_env.enable_eip7851
+            && evm_env.cfg_env.spec >= SpecId::PRAGUE
+            && is_eip7851_sender_ecdsa_authenticated(tx)
+        {
+            let code = if let Some(code) = &account.code {
+                code.original_bytes()
+            } else if account.code_hash != KECCAK_EMPTY {
+                self.db.read().await.code_by_hash_ref(account.code_hash)?.original_bytes()
+            } else {
+                Bytes::new()
+            };
+            if code.len() == 23 && code.starts_with(&[0xef, 0x01, 0x01]) {
+                return Err(InvalidTransactionError::SenderNoEOA.into());
+            }
+        }
+
         // Tempo AA: validate time bounds and fee token balance (async checks)
         if let FoundryTxEnvelope::Tempo(aa_tx) = tx.transaction.as_ref() {
             let tempo_tx = aa_tx.tx();
@@ -9169,6 +9494,17 @@ where
             return Err(InvalidTransactionError::MonadBlobTransactionUnsupported);
         }
 
+        let frame_blob_count = tx.as_ref().as_frame().map(|tx| tx.blob_versioned_hashes.len());
+
+        if evm_env.cfg_env.spec >= SpecId::CANCUN
+            && let Some(blob_count) = frame_blob_count
+        {
+            let max_blobs_per_tx = self.blob_params().max_blobs_per_tx as usize;
+            if blob_count > max_blobs_per_tx {
+                return Err(InvalidTransactionError::TooManyBlobs(blob_count, max_blobs_per_tx));
+            }
+        }
+
         // EIP-4844 structural validation
         if evm_env.cfg_env.spec >= SpecId::CANCUN && tx.is_eip4844() {
             // Heavy (blob validation) checks
@@ -9210,65 +9546,66 @@ where
             }
         }
 
-        // Balance and fee related checks
+        // Gas and fee-cap validation remains mandatory even when sender balance
+        // checks are disabled.
+        // Gas limit validation
+        if !tx.as_ref().is_frame() && tx.gas_limit() < MIN_TRANSACTION_GAS as u64 {
+            debug!(target: "backend", "[{:?}] gas too low", tx.hash());
+            return Err(InvalidTransactionError::GasTooLow);
+        }
+
+        // Check tx gas limit against block gas limit, if block gas limit is set.
+        if !evm_env.cfg_env.disable_block_gas_limit && tx.gas_limit() > evm_env.block_env.gas_limit
+        {
+            debug!(target: "backend", "[{:?}] gas too high", tx.hash());
+            return Err(InvalidTransactionError::GasTooHigh(ErrDetail {
+                detail: String::from("tx.gas_limit > env.block.gas_limit"),
+            }));
+        }
+
+        // Check tx gas limit against tx gas limit cap (Osaka hard fork and later).
+        if evm_env.cfg_env.tx_gas_limit_cap.is_none()
+            && tx.gas_limit() > self.tx_gas_limit_cap(evm_env)
+        {
+            debug!(target: "backend", "[{:?}] gas too high", tx.hash());
+            return Err(InvalidTransactionError::GasTooHigh(ErrDetail {
+                detail: String::from("tx.gas_limit > resolved tx gas limit cap"),
+            }));
+        }
+
+        // EIP-1559 fee validation (London hard fork and later).
+        if evm_env.cfg_env.spec >= SpecId::LONDON {
+            if tx.max_fee_per_gas() < evm_env.block_env.basefee.into() && !is_deposit_tx {
+                debug!(target: "backend", "max fee per gas={}, too low, block basefee={}", tx.max_fee_per_gas(), evm_env.block_env.basefee);
+                return Err(InvalidTransactionError::FeeCapTooLow);
+            }
+
+            if !evm_env.cfg_env.disable_priority_fee_check
+                && let (Some(max_priority_fee_per_gas), max_fee_per_gas) =
+                    (tx.as_ref().max_priority_fee_per_gas(), tx.as_ref().max_fee_per_gas())
+                && max_priority_fee_per_gas > max_fee_per_gas
+            {
+                debug!(target: "backend", "max priority fee per gas={}, too high, max fee per gas={}", max_priority_fee_per_gas, max_fee_per_gas);
+                return Err(InvalidTransactionError::TipAboveFeeCap);
+            }
+        }
+
+        // EIP-4844 blob fee validation
+        if evm_env.cfg_env.spec >= SpecId::CANCUN
+            && (tx.is_eip4844() || frame_blob_count.is_some_and(|count| count > 0))
+            && let Some(max_fee_per_blob_gas) = tx.max_fee_per_blob_gas()
+            && let Some(blob_gas_and_price) = &evm_env.block_env.blob_excess_gas_and_price
+            && max_fee_per_blob_gas < blob_gas_and_price.blob_gasprice
+        {
+            debug!(target: "backend", "max fee per blob gas={}, too low, block blob gas price={}", max_fee_per_blob_gas, blob_gas_and_price.blob_gasprice);
+            return Err(InvalidTransactionError::BlobFeeCapTooLow(
+                max_fee_per_blob_gas,
+                blob_gas_and_price.blob_gasprice,
+            ));
+        }
+
+        // Only sender funding checks are controlled by `disable_pool_balance_checks`.
         if !self.disable_pool_balance_checks {
-            // Gas limit validation
-            if tx.gas_limit() < MIN_TRANSACTION_GAS as u64 {
-                debug!(target: "backend", "[{:?}] gas too low", tx.hash());
-                return Err(InvalidTransactionError::GasTooLow);
-            }
-
-            // Check tx gas limit against block gas limit, if block gas limit is set.
-            if !evm_env.cfg_env.disable_block_gas_limit
-                && tx.gas_limit() > evm_env.block_env.gas_limit
-            {
-                debug!(target: "backend", "[{:?}] gas too high", tx.hash());
-                return Err(InvalidTransactionError::GasTooHigh(ErrDetail {
-                    detail: String::from("tx.gas_limit > env.block.gas_limit"),
-                }));
-            }
-
-            // Check tx gas limit against tx gas limit cap (Osaka hard fork and later).
-            if evm_env.cfg_env.tx_gas_limit_cap.is_none()
-                && tx.gas_limit() > self.tx_gas_limit_cap(evm_env)
-            {
-                debug!(target: "backend", "[{:?}] gas too high", tx.hash());
-                return Err(InvalidTransactionError::GasTooHigh(ErrDetail {
-                    detail: String::from("tx.gas_limit > resolved tx gas limit cap"),
-                }));
-            }
-
-            // EIP-1559 fee validation (London hard fork and later).
-            if evm_env.cfg_env.spec >= SpecId::LONDON {
-                if tx.max_fee_per_gas() < evm_env.block_env.basefee.into() && !is_deposit_tx {
-                    debug!(target: "backend", "max fee per gas={}, too low, block basefee={}", tx.max_fee_per_gas(), evm_env.block_env.basefee);
-                    return Err(InvalidTransactionError::FeeCapTooLow);
-                }
-
-                if !evm_env.cfg_env.disable_priority_fee_check
-                    && let (Some(max_priority_fee_per_gas), max_fee_per_gas) =
-                        (tx.as_ref().max_priority_fee_per_gas(), tx.as_ref().max_fee_per_gas())
-                    && max_priority_fee_per_gas > max_fee_per_gas
-                {
-                    debug!(target: "backend", "max priority fee per gas={}, too high, max fee per gas={}", max_priority_fee_per_gas, max_fee_per_gas);
-                    return Err(InvalidTransactionError::TipAboveFeeCap);
-                }
-            }
-
-            // EIP-4844 blob fee validation
-            if evm_env.cfg_env.spec >= SpecId::CANCUN
-                && tx.is_eip4844()
-                && let Some(max_fee_per_blob_gas) = tx.max_fee_per_blob_gas()
-                && let Some(blob_gas_and_price) = &evm_env.block_env.blob_excess_gas_and_price
-                && max_fee_per_blob_gas < blob_gas_and_price.blob_gasprice
-            {
-                debug!(target: "backend", "max fee per blob gas={}, too low, block blob gas price={}", max_fee_per_blob_gas, blob_gas_and_price.blob_gasprice);
-                return Err(InvalidTransactionError::BlobFeeCapTooLow(
-                    max_fee_per_blob_gas,
-                    blob_gas_and_price.blob_gasprice,
-                ));
-            }
-
             let value = tx.value();
             match tx.as_ref() {
                 #[cfg(feature = "optimism")]
@@ -9286,6 +9623,10 @@ where
                 FoundryTxEnvelope::Tempo(_) => {
                     // Tempo AA transactions pay gas with fee tokens, not ETH.
                     // Fee token balance is validated in validate_pool_transaction (async).
+                }
+                FoundryTxEnvelope::Frame(_) => {
+                    // Payment is approved and precharged by a frame, so the
+                    // declared sender does not need to fund the transaction.
                 }
                 _ if self.is_monad() => {
                     let effective_gas_price =

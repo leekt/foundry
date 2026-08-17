@@ -2376,10 +2376,13 @@ impl EthApi<FoundryNetwork> {
     async fn inner_raw_transaction(&self, hash: B256) -> Result<Option<Bytes>> {
         match self.pool.get_transaction(hash) {
             Some(tx) => Ok(Some(tx.transaction.encoded_2718().into())),
-            None => match self.backend.transaction_by_hash(hash).await? {
-                Some(tx) => Ok(Some(tx.as_ref().encoded_2718().into())),
-                None => Ok(None),
-            },
+            None => {
+                if let Some(raw) = self.backend.raw_mined_transaction_by_hash(hash) {
+                    return Ok(Some(raw));
+                }
+                let Some(fork) = self.get_fork() else { return Ok(None) };
+                fork.raw_transaction_by_hash(hash).await.map_err(BlockchainError::AlloyForkProvider)
+            }
         }
     }
 
@@ -3653,7 +3656,16 @@ impl EthApi<FoundryNetwork> {
                 "fork provider returned a non-full block for a full block request".to_string(),
             ));
         };
-        Ok(txs.iter().map(|tx| tx.as_ref().encoded_2718().into()).collect())
+        let mut raw_transactions = Vec::with_capacity(txs.len());
+        for tx in txs {
+            let hash = tx.tx_hash();
+            let raw = fork
+                .raw_transaction_by_hash(hash)
+                .await?
+                .ok_or(BlockchainError::DataUnavailable)?;
+            raw_transactions.push(raw);
+        }
+        Ok(raw_transactions)
     }
 
     /// Returns RLP encoded raw block header.
@@ -4780,6 +4792,7 @@ impl EthApi<FoundryNetwork> {
             // one here rather than letting it reach the pool. Every submission
             // path funnels through this function, so one check covers them all.
             FoundryTxEnvelope::Frame(tx) => {
+                self.backend.ensure_frame_transactions_supported()?;
                 let tx = tx.inner();
                 tx.validate()
                     .and_then(|()| tx.validate_signatures())
@@ -5026,6 +5039,7 @@ impl TryFrom<Result<(InstructionResult, Option<Output>, u128, State)>> for GasEs
                 | InstructionResult::StackOverflow
                 | InstructionResult::OutOfOffset
                 | InstructionResult::CreateCollision
+                | InstructionResult::AddressCollision
                 | InstructionResult::OverflowPayment
                 | InstructionResult::PrecompileError
                 | InstructionResult::NonceOverflow

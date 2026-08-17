@@ -8,18 +8,25 @@
 //! Author: taek <leekt216@gmail.com>
 
 use crate::utils::http_provider;
-use alloy_consensus::Typed2718;
-use alloy_eips::Encodable2718;
+use alloy_consensus::{Typed2718, proofs::calculate_receipt_root};
+use alloy_eips::{Encodable2718, eip7840::BlobParams};
 use alloy_network::{ReceiptResponse, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes, Sealable, U256, bytes, keccak256};
-use alloy_provider::Provider;
-use alloy_rpc_types::TransactionRequest;
+use alloy_provider::{Provider, ext::TraceApi};
+use alloy_rpc_types::{
+    TransactionRequest,
+    trace::parity::{Action, TraceResults, TraceType},
+};
 use alloy_serde::WithOtherFields;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use anvil::{NodeConfig, eth::EthApi, spawn};
 use foundry_common::provider::RetryProvider;
-use foundry_primitives::{FoundryNetwork, Frame, FrameSignature, TxFrame, flags, mode, scheme};
+use foundry_evm::hardfork::EthereumHardfork;
+use foundry_primitives::{
+    EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE, FoundryNetwork, FoundryReceiptEnvelope,
+    Frame, FrameReceipt, FrameSignature, TxFrame, flags, mode, scheme,
+};
 
 /// Deploys `5f355f5500`: `SSTORE(0, calldata[0..32])`, then stop. Payable by
 /// virtue of having no value check at all.
@@ -28,12 +35,46 @@ const STORAGE_WRITER_INITCODE: Bytes = bytes!("645f355f55005f526005601bf3");
 /// Deploys `5f5ffd`: `REVERT(0, 0)`, so every call to it fails.
 const REVERTER_INITCODE: Bytes = bytes!("625f5ffd5f526003601df3");
 
+/// Deploys `5f355f5560035f5faa`: write calldata to slot 0, then approve both scopes.
+const MUTATING_APPROVER_INITCODE: Bytes = bytes!("685f355f5560035f5faa5f5260096017f3");
+
+fn eip7851_designation(target: Address) -> Bytes {
+    let mut code = Vec::with_capacity(23);
+    code.extend_from_slice(&[0xef, 0x01, 0x01]);
+    code.extend_from_slice(target.as_slice());
+    code.into()
+}
+
+fn frame_node_config() -> NodeConfig {
+    NodeConfig::test().with_frame_transactions(true)
+}
+
+/// Deploys `60035f5faa`: approve both scopes without any ordinary state change.
+const APPROVER_INITCODE: Bytes = bytes!("6460035f5faa5f526005601bf3");
+
+/// Deploys code that stores GASPRICE, BLOBHASH(0), and TXPARAM(0) in slots 0..2.
+const TX_ENV_PROBE_INITCODE: Bytes = bytes!("6d3a5f555f496001555fb0600255005f52600e6012f3");
+
 /// The word the SENDER frame writes to slot 0.
 const MAGIC: u64 = 0xdead_beef;
 
 /// Deploys `initcode` from `from` and returns the contract's address.
 async fn deploy(provider: &RetryProvider, from: Address, initcode: Bytes) -> Address {
-    let deploy = TransactionRequest::default().with_from(from).into_create().with_input(initcode);
+    deploy_with_value(provider, from, initcode, U256::ZERO).await
+}
+
+/// Deploys `initcode` with an initial contract balance and returns its address.
+async fn deploy_with_value(
+    provider: &RetryProvider,
+    from: Address,
+    initcode: Bytes,
+    value: U256,
+) -> Address {
+    let deploy = TransactionRequest::default()
+        .with_from(from)
+        .into_create()
+        .with_input(initcode)
+        .with_value(value);
     let receipt = provider
         .send_transaction(WithOtherFields::new(deploy))
         .await
@@ -160,8 +201,84 @@ async fn wrote_magic(provider: &RetryProvider, target: Address) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn fresh_node_installs_the_canonical_expiry_verifier() {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+
+    let code = provider.get_code_at(EXPIRY_VERIFIER_ADDRESS).await.unwrap();
+
+    assert_eq!(code.as_ref(), EXPIRY_VERIFIER_RUNTIME_CODE);
+    let activated_state_root = api.state_root().await.unwrap();
+
+    api.anvil_set_code(EXPIRY_VERIFIER_ADDRESS, Bytes::new()).await.unwrap();
+    assert_ne!(api.state_root().await.unwrap(), activated_state_root);
+    api.anvil_reset(None).await.unwrap();
+    let code = provider.get_code_at(EXPIRY_VERIFIER_ADDRESS).await.unwrap();
+    assert_eq!(code.as_ref(), EXPIRY_VERIFIER_RUNTIME_CODE);
+    assert_eq!(api.state_root().await.unwrap(), activated_state_root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frame_profile_is_inactive_by_default() {
+    let (_api, handle) = spawn(NodeConfig::test()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    assert!(provider.get_code_at(EXPIRY_VERIFIER_ADDRESS).await.unwrap().is_empty());
+
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let mut tx = self_relay_tx(sender, 0, sender, U256::ZERO, 1_000_000_000, 1);
+    sign_entry(&mut tx, 0, &wallet);
+    let err = provider.send_raw_transaction(&tx.encoded_2718()).await.unwrap_err().to_string();
+    assert!(err.contains("--enable-frame-transactions"), "unexpected error: {err}");
+}
+
+/// Runs one custom-code frame whose target and declared sender are the same funded contract.
+async fn run_contract_approval_frame(
+    frame_mode: u8,
+    initcode: Bytes,
+    gas_limit: u64,
+) -> (bool, U256, u64, u64, u64) {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let account = deploy_with_value(
+        &provider,
+        wallet.address(),
+        initcode,
+        U256::from(1_000_000_000_000_000_000u128),
+    )
+    .await;
+    let nonce = provider.get_transaction_count(account).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let tx = TxFrame {
+        chain_id: U256::from(31337u64),
+        nonce,
+        sender: account,
+        frames: vec![Frame {
+            mode: frame_mode,
+            flags: flags::APPROVE_EXECUTION_PAYMENT,
+            target: None,
+            gas_limit,
+            value: U256::ZERO,
+            data: U256::from(MAGIC).to_be_bytes::<32>().into(),
+        }],
+        signatures: vec![],
+        max_priority_fee_per_gas: U256::from(fees.max_priority_fee_per_gas),
+        max_fee_per_gas: U256::from(fees.max_fee_per_gas),
+        max_fee_per_blob_gas: U256::ZERO,
+        blob_versioned_hashes: vec![],
+    };
+    let max_gas = tx.max_gas();
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let mined = provider.get_transaction_receipt(hash).await.unwrap().is_some();
+    let stored = provider.get_storage_at(account, U256::ZERO).await.unwrap();
+    let nonce_after = provider.get_transaction_count(account).await.unwrap();
+    (mined, stored, nonce, nonce_after, max_gas)
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn frame_tx_is_mined_and_its_sender_frame_runs() {
-    let (api, handle) = spawn(NodeConfig::test()).await;
+    let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
     let wallet = handle.dev_wallets().next().unwrap();
     let sender = wallet.address();
@@ -213,6 +330,22 @@ async fn frame_tx_is_mined_and_its_sender_frame_runs() {
         .expect("frame transaction was not mined");
     assert!(receipt.status(), "frame transaction reverted");
     assert_eq!(receipt.from, sender);
+    let payer = receipt
+        .0
+        .other
+        .get_deserialized::<Address>("payer")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has payer");
+    let frame_receipts = receipt
+        .0
+        .other
+        .get_deserialized::<Vec<FrameReceipt<alloy_rpc_types::Log>>>("frameReceipts")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has nested receipts");
+    assert_eq!(payer, sender);
+    assert_eq!(frame_receipts.iter().map(|receipt| receipt.status).collect::<Vec<_>>(), [1, 1]);
 
     // The point of the test: the SENDER frame's side effects, which only exist
     // if the frame actually executed.
@@ -236,13 +369,213 @@ async fn frame_tx_is_mined_and_its_sender_frame_runs() {
     let onchain = provider.get_transaction_by_hash(hash).await.unwrap().unwrap();
     assert_eq!(onchain.inner.inner.ty(), 0x06);
 
-    let block = provider.get_block_by_number(receipt.block_number.unwrap().into()).await.unwrap();
-    assert!(block.unwrap().transactions.hashes().any(|h| h == hash));
+    let consensus_receipt = FoundryReceiptEnvelope::from_frame_parts(
+        receipt.cumulative_gas_used(),
+        payer,
+        frame_receipts.into_iter().map(|receipt| receipt.map_logs(|log| log.inner)).collect(),
+    );
+    let block =
+        provider.get_block_by_number(receipt.block_number.unwrap().into()).await.unwrap().unwrap();
+    assert!(block.transactions.hashes().any(|h| h == hash));
+    assert_eq!(block.header.receipts_root, calculate_receipt_root(&[consensus_receipt]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eip7851_delegation_remains_active_for_frame_transactions() {
+    let config = frame_node_config()
+        .with_hardfork(Some(EthereumHardfork::Prague.into()))
+        .enable_eip7851(true);
+    let (api, handle) = spawn(config).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let approver = deploy(&provider, sender, APPROVER_INITCODE).await;
+    let writer = deploy(&provider, sender, STORAGE_WRITER_INITCODE).await;
+    let authority = Address::repeat_byte(0x42);
+
+    // The sender's delegated VERIFY frame approves payment and execution. The delegated SENDER
+    // target then writes in the authority's storage context.
+    api.anvil_set_code(sender, eip7851_designation(approver)).await.unwrap();
+    api.anvil_set_code(authority, eip7851_designation(writer)).await.unwrap();
+
+    let nonce = provider.get_transaction_count(sender).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = frame_tx(
+        sender,
+        nonce,
+        &[(authority, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    sign_entry(&mut tx, 0, &wallet);
+
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .unwrap()
+        .expect("Frame transaction from EIP-7851 authority was not mined");
+    assert!(receipt.status(), "Frame transaction from EIP-7851 authority reverted");
+    assert!(wrote_magic(&provider, authority).await, "delegated Frame target did not execute");
+    assert_eq!(provider.get_storage_at(writer, U256::ZERO).await.unwrap(), U256::ZERO);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_and_replay_traces_execute_the_frame_calls() {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let writer = deploy(&provider, sender, STORAGE_WRITER_INITCODE).await;
+    let nonce = provider.get_transaction_count(sender).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = self_relay_tx(
+        sender,
+        nonce,
+        writer,
+        U256::ZERO,
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    sign_entry(&mut tx, 0, &wallet);
+    let raw = tx.encoded_2718();
+
+    let raw_trace = provider.trace_raw_transaction(&raw).trace().state_diff().await.unwrap();
+    assert!(
+        raw_trace
+            .trace
+            .iter()
+            .any(|trace| matches!(&trace.action, Action::Call(call) if call.to == writer))
+    );
+    assert!(raw_trace.state_diff.is_some());
+    assert!(!wrote_magic(&provider, writer).await, "raw tracing committed frame state");
+
+    let hash = *provider.send_raw_transaction(&raw).await.unwrap().tx_hash();
+    api.mine_one().await.unwrap();
+    let replay: TraceResults = provider
+        .client()
+        .request("trace_replayTransaction", (hash, vec![TraceType::Trace, TraceType::StateDiff]))
+        .await
+        .unwrap();
+    assert!(
+        replay
+            .trace
+            .iter()
+            .any(|trace| matches!(&trace.action, Action::Call(call) if call.to == writer))
+    );
+    assert!(replay.state_diff.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_hash_fork_replays_frame_envelopes_from_raw_bytes() {
+    let (origin_api, origin_handle) = spawn(frame_node_config()).await;
+    let origin_provider = http_provider(&origin_handle.http_endpoint());
+    let wallet = origin_handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let writer = deploy(&origin_provider, sender, STORAGE_WRITER_INITCODE).await;
+    origin_api.anvil_set_auto_mine(false).await.unwrap();
+    let nonce = origin_provider.get_transaction_count(sender).await.unwrap();
+    let fees = origin_provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = self_relay_tx(
+        sender,
+        nonce,
+        writer,
+        U256::ZERO,
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    sign_entry(&mut tx, 0, &wallet);
+    let hash = *origin_provider.send_raw_transaction(&tx.encoded_2718()).await.unwrap().tx_hash();
+    origin_api.mine_one().await.unwrap();
+    assert!(wrote_magic(&origin_provider, writer).await);
+
+    let (_fork_api, fork_handle) = spawn(
+        frame_node_config()
+            .with_eth_rpc_url(Some(origin_handle.http_endpoint()))
+            .with_fork_transaction_hash(Some(hash))
+            .with_no_mining(true),
+    )
+    .await;
+    let fork_provider = http_provider(&fork_handle.http_endpoint());
+
+    assert!(wrote_magic(&fork_provider, writer).await);
+    let receipt = fork_provider.get_transaction_receipt(hash).await.unwrap().unwrap();
+    assert_eq!(receipt.0.inner.inner.r#type, 0x06);
+    assert_eq!(receipt.0.other.get_deserialized::<Address>("payer").unwrap().unwrap(), sender);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_activation_happens_after_source_transaction_replay() {
+    let (origin_api, origin_handle) = spawn(NodeConfig::test()).await;
+    origin_api.anvil_set_auto_mine(false).await.unwrap();
+    let origin_provider = http_provider(&origin_handle.http_endpoint());
+    let sender = origin_handle.dev_wallets().next().unwrap().address();
+    let pending = origin_provider
+        .send_transaction(WithOtherFields::new(
+            TransactionRequest::default()
+                .from(sender)
+                .to(EXPIRY_VERIFIER_ADDRESS)
+                .with_input(bytes!("01")),
+        ))
+        .await
+        .unwrap();
+    let hash = *pending.tx_hash();
+    origin_api.mine_one().await.unwrap();
+    assert!(origin_provider.get_transaction_receipt(hash).await.unwrap().unwrap().status());
+
+    let (_fork_api, fork_handle) = spawn(
+        frame_node_config()
+            .with_eth_rpc_url(Some(origin_handle.http_endpoint()))
+            .with_fork_transaction_hash(Some(hash))
+            .with_no_mining(true),
+    )
+    .await;
+    let fork_provider = http_provider(&fork_handle.http_endpoint());
+
+    assert!(fork_provider.get_transaction_receipt(hash).await.unwrap().unwrap().status());
+    let code = fork_provider.get_code_at(EXPIRY_VERIFIER_ADDRESS).await.unwrap();
+    assert_eq!(code.as_ref(), EXPIRY_VERIFIER_RUNTIME_CODE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn object_form_frame_requests_are_rejected_instead_of_downgraded() {
+    let (_api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let sender = handle.dev_wallets().next().unwrap().address();
+    let request = serde_json::json!({
+        "type": "0x6",
+        "from": sender,
+        "frames": [],
+        "signatures": [],
+    });
+
+    let result: Result<serde_json::Value, _> =
+        provider.raw_request("eth_call".into(), (request, "latest")).await;
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("raw signed envelopes"), "unexpected error: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_execution_profiles_reject_frame_envelopes_at_submission() {
+    for config in [
+        frame_node_config().with_hardfork(Some(EthereumHardfork::Amsterdam.into())),
+        NodeConfig::test_tempo().with_frame_transactions(true),
+    ] {
+        let (_api, handle) = spawn(config).await;
+        let provider = http_provider(&handle.http_endpoint());
+        let wallet = handle.dev_wallets().next().unwrap();
+        let sender = wallet.address();
+        let mut tx = self_relay_tx(sender, 0, sender, U256::ZERO, 1_000_000_000, 1);
+        sign_entry(&mut tx, 0, &wallet);
+
+        let err = provider.send_raw_transaction(&tx.encoded_2718()).await.unwrap_err().to_string();
+        assert!(err.contains("unsupported by the active"), "unexpected error: {err}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn frame_tx_without_an_approving_verify_frame_is_not_mined() {
-    let (api, handle) = spawn(NodeConfig::test()).await;
+    let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
     let wallet = handle.dev_wallets().next().unwrap();
     let sender = wallet.address();
@@ -298,7 +631,7 @@ async fn frame_tx_without_an_approving_verify_frame_is_not_mined() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn frame_tx_with_a_foreign_signature_entry_is_not_mined() {
-    let (api, handle) = spawn(NodeConfig::test()).await;
+    let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
     let mut wallets = handle.dev_wallets();
     let wallet = wallets.next().unwrap();
@@ -351,6 +684,47 @@ async fn frame_tx_with_a_foreign_signature_entry_is_not_mined() {
     assert_eq!(provider.get_transaction_count(sender).await.unwrap(), nonce);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_frame_state_change_is_static_and_invalidates_the_transaction() {
+    let (mined, stored, nonce, nonce_after, _) =
+        run_contract_approval_frame(mode::VERIFY, MUTATING_APPROVER_INITCODE, 100_000).await;
+
+    assert!(!mined, "a VERIFY frame that executed SSTORE was mined");
+    assert_eq!(stored, U256::ZERO, "VERIFY frame storage survived its static halt");
+    assert_eq!(nonce_after, nonce, "failed VERIFY approval changed the sender nonce");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_frame_state_change_remains_non_static() {
+    let (mined, stored, nonce, nonce_after, _) =
+        run_contract_approval_frame(mode::DEFAULT, MUTATING_APPROVER_INITCODE, 100_000).await;
+
+    assert!(mined, "a DEFAULT frame that executed SSTORE was not mined");
+    assert_eq!(stored, U256::from(MAGIC), "DEFAULT frame did not write storage");
+    assert_eq!(nonce_after, nonce + 1, "successful approval did not increment the nonce");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_frame_can_still_execute_approve() {
+    let (mined, stored, nonce, nonce_after, _) =
+        run_contract_approval_frame(mode::VERIFY, APPROVER_INITCODE, 100_000).await;
+
+    assert!(mined, "APPROVE was blocked by VERIFY static mode");
+    assert_eq!(stored, U256::ZERO);
+    assert_eq!(nonce_after, nonce + 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frame_transaction_below_ordinary_intrinsic_gas_is_mined() {
+    let (mined, stored, nonce, nonce_after, max_gas) =
+        run_contract_approval_frame(mode::DEFAULT, APPROVER_INITCODE, 3_000).await;
+
+    assert!(max_gas < 21_000, "test transaction has a {max_gas} gas limit");
+    assert!(mined, "a valid sub-21k frame transaction was rejected");
+    assert_eq!(stored, U256::ZERO);
+    assert_eq!(nonce_after, nonce + 1);
+}
+
 // -- Atomic batches ---------------------------------------------------------
 
 /// Runs `[VERIFY, first(batched), writer(batched), writer]` on a fresh node: an
@@ -360,8 +734,8 @@ async fn frame_tx_with_a_foreign_signature_entry_is_not_mined() {
 ///
 /// The two calls to this are the positive/negative pair for the whole batch
 /// mechanism: they differ only in whether the batch's first frame fails.
-async fn run_three_frame_batch(first_reverts: bool) -> (u64, bool, bool) {
-    let (api, handle) = spawn(NodeConfig::test()).await;
+async fn run_three_frame_batch(first_reverts: bool) -> (u64, bool, bool, Vec<u8>) {
+    let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
     let wallet = handle.dev_wallets().next().unwrap();
     let sender = wallet.address();
@@ -392,28 +766,43 @@ async fn run_three_frame_batch(first_reverts: bool) -> (u64, bool, bool) {
         .expect("frame transaction was not mined");
     // A failing frame does not fail the transaction: it is reported per frame.
     assert!(receipt.status(), "frame transaction reverted");
+    let statuses = receipt
+        .0
+        .other
+        .get_deserialized::<Vec<FrameReceipt<alloy_rpc_types::Log>>>("frameReceipts")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has nested receipts")
+        .iter()
+        .map(|receipt| receipt.status)
+        .collect();
 
-    (receipt.gas_used(), wrote_magic(&provider, second).await, wrote_magic(&provider, third).await)
+    (
+        receipt.gas_used(),
+        wrote_magic(&provider, second).await,
+        wrote_magic(&provider, third).await,
+        statuses,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn atomic_batch_that_succeeds_keeps_its_state() {
-    let (_, second, third) = run_three_frame_batch(false).await;
+    let (_, second, third, statuses) = run_three_frame_batch(false).await;
     assert!(second, "the batch's second frame did not write");
     assert!(third, "the batch's terminating frame did not write");
+    assert_eq!(statuses, [1, 1, 1, 1]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn atomic_batch_failure_rolls_back_and_skips_the_remaining_frames() {
-    let (skipped_gas, second, third) = run_three_frame_batch(true).await;
+    let (skipped_gas, second, third, statuses) = run_three_frame_batch(true).await;
     assert!(!second, "the frame after the batch failure ran and its write survived");
     assert!(!third, "the batch terminator ran after the batch had already failed");
+    assert_eq!(statuses, [1, 0, 2, 2]);
 
-    // Per-frame statuses are not exposed over RPC, so the evidence that the
-    // remaining frames were *skipped* rather than run-and-rolled-back is the
-    // gas: a skipped frame's allotment is left unspent. Same frame count, same
-    // calldata, so the overhead and the calldata floor are identical.
-    let (full_gas, _, _) = run_three_frame_batch(false).await;
+    // A skipped frame's allotment is left unspent. Same frame count and
+    // calldata means the overhead and calldata floor are identical.
+    let (full_gas, _, _, _) = run_three_frame_batch(false).await;
     assert!(
         skipped_gas < full_gas,
         "skipped frames were charged: {skipped_gas} gas against {full_gas} when all three ran"
@@ -422,7 +811,7 @@ async fn atomic_batch_failure_rolls_back_and_skips_the_remaining_frames() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn atomic_batch_terminator_failure_rolls_the_batch_back() {
-    let (api, handle) = spawn(NodeConfig::test()).await;
+    let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
     let wallet = handle.dev_wallets().next().unwrap();
     let sender = wallet.address();
@@ -482,7 +871,7 @@ async fn atomic_batch_terminator_failure_rolls_the_batch_back() {
 ///
 /// Reports whether the transaction was mined and whether the SENDER frame ran.
 async fn run_default_code_verify(verify_flags: u8, explicit_msg: bool) -> (bool, bool) {
-    let (api, handle) = spawn(NodeConfig::test()).await;
+    let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
     let wallet = handle.dev_wallets().next().unwrap();
     let sender = wallet.address();
@@ -551,7 +940,7 @@ async fn default_code_verify_with_an_explicit_msg_is_not_mined() {
 /// between the two runs, and it changes only what the default code finds at the
 /// index it selects for a payment-only scope.
 async fn run_sponsored_payment(displace_sponsor_signature: bool) -> (bool, bool, Address) {
-    let (api, handle) = spawn(NodeConfig::test()).await;
+    let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
     let mut wallets = handle.dev_wallets();
     let wallet = wallets.next().unwrap();
@@ -559,6 +948,8 @@ async fn run_sponsored_payment(displace_sponsor_signature: bool) -> (bool, bool,
     let sender = wallet.address();
     let sponsor = sponsor_wallet.address();
     let writer = deploy(&provider, sender, STORAGE_WRITER_INITCODE).await;
+    api.anvil_set_balance(sender, U256::ZERO).await.unwrap();
+    assert_eq!(provider.get_balance(sender).await.unwrap(), U256::ZERO);
 
     let nonce = provider.get_transaction_count(sender).await.unwrap();
     let fees = provider.estimate_eip1559_fees().await.unwrap();
@@ -609,7 +1000,7 @@ async fn run_sponsored_payment(displace_sponsor_signature: bool) -> (bool, bool,
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn default_code_payment_only_scope_uses_signature_index_one() {
+async fn zero_balance_sender_is_accepted_when_signature_index_one_sponsor_pays() {
     let (mined, written, _) = run_sponsored_payment(false).await;
     assert!(mined, "the sponsor's default-code payment approval was rejected");
     assert!(written, "the SENDER frame did not run");
@@ -623,4 +1014,136 @@ async fn default_code_payment_only_scope_ignores_a_signature_at_another_index() 
     let (mined, written, _) = run_sponsored_payment(true).await;
     assert!(!mined, "the default code approved payment off the wrong signature index");
     assert!(!written, "the SENDER frame ran despite no payer");
+}
+
+async fn blob_frame_transaction_is_mined(
+    hardfork: EthereumHardfork,
+    blob_count: usize,
+    max_fee_per_blob_gas: u128,
+    disable_pool_balance_checks: bool,
+) -> bool {
+    let config = frame_node_config()
+        .with_hardfork(Some(hardfork.into()))
+        .with_disable_pool_balance_checks(disable_pool_balance_checks);
+    let (api, handle) = spawn(config).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let writer = deploy(&provider, sender, STORAGE_WRITER_INITCODE).await;
+    let nonce = provider.get_transaction_count(sender).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = frame_tx(
+        sender,
+        nonce,
+        &[(writer, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    tx.max_fee_per_blob_gas = U256::from(max_fee_per_blob_gas);
+    tx.blob_versioned_hashes = vec![B256::repeat_byte(0x01); blob_count];
+    sign_entry(&mut tx, 0, &wallet);
+    tx.validate().unwrap();
+    tx.validate_signatures().unwrap();
+
+    let mut raw = Vec::new();
+    tx.encode_2718(&mut raw);
+    let Ok(pending) = provider.send_raw_transaction(&raw).await else {
+        return false;
+    };
+    let hash = *pending.tx_hash();
+    api.mine_one().await.unwrap();
+    provider.get_transaction_receipt(hash).await.unwrap().is_some()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frame_blob_count_uses_the_active_fork_limit() {
+    let cancun_limit = BlobParams::cancun().max_blobs_per_tx as usize;
+    let prague_limit = BlobParams::prague().max_blobs_per_tx as usize;
+    assert!(prague_limit > cancun_limit);
+
+    assert!(
+        !blob_frame_transaction_is_mined(
+            EthereumHardfork::Cancun,
+            cancun_limit + 1,
+            u128::MAX,
+            false,
+        )
+        .await
+    );
+    assert!(
+        blob_frame_transaction_is_mined(
+            EthereumHardfork::Prague,
+            cancun_limit + 1,
+            u128::MAX,
+            false,
+        )
+        .await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frame_blob_fee_cap_is_checked_by_the_pool() {
+    assert!(
+        !blob_frame_transaction_is_mined(EthereumHardfork::Cancun, 1, 0, false).await,
+        "a frame transaction below the block blob fee was accepted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frame_fee_caps_remain_mandatory_when_pool_balance_checks_are_disabled() {
+    let (api, handle) = spawn(frame_node_config().with_disable_pool_balance_checks(true)).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let writer = deploy(&provider, sender, STORAGE_WRITER_INITCODE).await;
+    let nonce = provider.get_transaction_count(sender).await.unwrap();
+    let mut tx = frame_tx(sender, nonce, &[(writer, 0)], 0, 0);
+    sign_entry(&mut tx, 0, &wallet);
+    tx.validate().unwrap();
+    tx.validate_signatures().unwrap();
+    let mut raw = Vec::new();
+    tx.encode_2718(&mut raw);
+
+    assert!(provider.send_raw_transaction(&raw).await.is_err());
+    api.mine_one().await.unwrap();
+    assert!(!wrote_magic(&provider, writer).await);
+
+    assert!(
+        !blob_frame_transaction_is_mined(EthereumHardfork::Cancun, 1, 0, true).await,
+        "disabling balance checks also disabled the frame blob fee cap"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn frame_opcodes_observe_transaction_gas_price_blob_hash_and_type() {
+    let (api, handle) =
+        spawn(frame_node_config().with_hardfork(Some(EthereumHardfork::Prague.into()))).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let probe = deploy(&provider, sender, TX_ENV_PROBE_INITCODE).await;
+    let nonce = provider.get_transaction_count(sender).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let blob_hash = B256::repeat_byte(0x01);
+    let mut tx =
+        frame_tx(sender, nonce, &[(probe, 0)], fees.max_fee_per_gas, fees.max_priority_fee_per_gas);
+    tx.max_fee_per_blob_gas = U256::from(u128::MAX);
+    tx.blob_versioned_hashes = vec![blob_hash];
+    sign_entry(&mut tx, 0, &wallet);
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .unwrap()
+        .expect("frame transaction was not mined");
+
+    assert_eq!(
+        provider.get_storage_at(probe, U256::ZERO).await.unwrap(),
+        U256::from(receipt.effective_gas_price)
+    );
+    assert_eq!(
+        provider.get_storage_at(probe, U256::ONE).await.unwrap(),
+        U256::from_be_bytes(blob_hash.0)
+    );
+    assert_eq!(provider.get_storage_at(probe, U256::from(2)).await.unwrap(), U256::from(0x06));
 }

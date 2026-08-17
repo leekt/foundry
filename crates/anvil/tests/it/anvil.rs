@@ -3,7 +3,7 @@
 use alloy_consensus::EMPTY_ROOT_HASH;
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::{ReceiptResponse, TransactionBuilder};
-use alloy_primitives::{Address, B256, U256, bytes, hex};
+use alloy_primitives::{Address, B256, Bytes, U256, address, bytes, hex};
 use alloy_provider::Provider;
 use alloy_rpc_types::{BlockId, TransactionRequest};
 use alloy_sol_types::SolCall;
@@ -21,6 +21,22 @@ const P256_INPUT: [u8; 160] = hex!(
 );
 // Copies calldata into memory, calls P256, and stores its returned word in slot zero.
 const P256_CALLER_CODE: [u8; 26] = hex!("366000600037602060003660006101005afa5060005160005500");
+
+const SETDELEGATE_FACTORY: Address = address!("1111111111111111111111111111111111111111");
+const SETDELEGATE_LOCATION: Address = address!("7a41c03bf3062738d4ad052749101d8ec0f5639d");
+const SETDELEGATE_TARGET: Address = address!("2222222222222222222222222222222222222222");
+const SETDELEGATE_RUNTIME: Bytes = bytes!("7322222222222222222222222222222222222222225ff600");
+const UPDATED_SETDELEGATE_RUNTIME: Bytes =
+    bytes!("7333333333333333333333333333333333333333335ff600");
+const CLEAR_SETDELEGATE_RUNTIME: Bytes = bytes!("5f5ff600");
+const DELEGATION_CODE: Bytes = bytes!("ef01002222222222222222222222222222222222222222");
+const UPDATED_DELEGATION_CODE: Bytes = bytes!("ef01003333333333333333333333333333333333333333");
+const IMMEDIATE_SETDELEGATE_RUNTIME: Bytes =
+    bytes!("60205f5f5f5f7322222222222222222222222222222222222222225ff661fffff15060205ff3");
+const RETURN_42_RUNTIME: Bytes = bytes!("602a5f5260205ff3");
+const STATICCALLER: Address = address!("4444444444444444444444444444444444444444");
+const STATIC_SETDELEGATE_RUNTIME: Bytes =
+    bytes!("5f5f5f5f73111111111111111111111111111111111111111161fffffa5f5260205ff3");
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_handle_releases_http_listener() {
@@ -153,6 +169,213 @@ async fn bsc_haber_p256_is_available_for_calls_and_mining() {
         .unwrap();
     assert!(receipt.status());
     assert_eq!(provider.get_storage_at(caller, U256::ZERO).await.unwrap(), U256::from(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_requires_explicit_prague_activation() {
+    let (api, handle) =
+        spawn(NodeConfig::test().with_hardfork(Some(EthereumHardfork::Prague.into()))).await;
+    let provider = handle.http_provider();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let err = provider
+        .call(
+            TransactionRequest::default()
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NotActivated"), "unexpected error: {err}");
+
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Cancun.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let err = provider
+        .call(
+            TransactionRequest::default()
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NotActivated"), "unexpected error: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_updates_clears_refunds_and_survives_reset() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Prague.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    let from = handle.dev_accounts().next().unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let first = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(first.status());
+    assert_eq!(
+        provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(),
+        DELEGATION_CODE.as_ref()
+    );
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+
+    api.anvil_set_code(SETDELEGATE_FACTORY, UPDATED_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let updated = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(updated.status());
+    assert!(
+        updated.gas_used() < first.gas_used(),
+        "existing-account update used {} gas; initial install used {}",
+        updated.gas_used(),
+        first.gas_used()
+    );
+    assert_eq!(
+        provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(),
+        UPDATED_DELEGATION_CODE.as_ref()
+    );
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+
+    api.anvil_set_code(SETDELEGATE_FACTORY, CLEAR_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let cleared = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(cleared.status());
+    assert!(provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().is_empty());
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+
+    api.anvil_reset(None).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let provider = handle.http_provider();
+    let after_reset = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(after_reset.status());
+    assert_eq!(
+        provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(),
+        DELEGATION_CODE.as_ref()
+    );
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_rejects_collisions_and_static_context() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Prague.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    let from = handle.dev_accounts().next().unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_LOCATION, bytes!("00")).await.unwrap();
+
+    let collision = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .with_from(from)
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(!collision.status());
+    assert_eq!(provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().as_ref(), &[0]);
+    assert_eq!(provider.get_transaction_count(SETDELEGATE_LOCATION).await.unwrap(), 0);
+
+    api.anvil_reset(None).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_code(STATICCALLER, STATIC_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+    let output = provider
+        .call(TransactionRequest::default().with_to(STATICCALLER).with_gas_limit(100_000).into())
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(output.as_ref()), U256::ZERO);
+    assert!(provider.get_code_at(SETDELEGATE_LOCATION).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn setdelegate_is_immediately_effective() {
+    let (api, handle) = spawn(
+        NodeConfig::test()
+            .with_hardfork(Some(EthereumHardfork::Prague.into()))
+            .enable_eip7819(true),
+    )
+    .await;
+    let provider = handle.http_provider();
+    api.anvil_set_code(SETDELEGATE_TARGET, RETURN_42_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_code(SETDELEGATE_FACTORY, IMMEDIATE_SETDELEGATE_RUNTIME.clone()).await.unwrap();
+
+    let output = provider
+        .call(
+            TransactionRequest::default()
+                .with_to(SETDELEGATE_FACTORY)
+                .with_gas_limit(100_000)
+                .into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(U256::from_be_slice(output.as_ref()), U256::from(42));
 }
 
 #[tokio::test(flavor = "multi_thread")]

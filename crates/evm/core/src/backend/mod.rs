@@ -1588,7 +1588,11 @@ impl<FEN: FoundryEvmNetwork> Backend<FEN> {
                     replay_db = evm.into_db();
                 }
             } else {
-                let mut evm = factory.create_evm(replay_db, evm_env);
+                let mut evm = factory.create_evm_with_context(
+                    replay_db,
+                    evm_env,
+                    ContextAuxFor::<FEN>::default(),
+                );
                 NetworkConfigs::default().inject_chain_precompiles(
                     evm.precompiles_mut(),
                     chain_id,
@@ -2973,11 +2977,13 @@ mod tests {
     use crate::{
         backend::{Backend, ForkPosition},
         constants::MONAD_CHEATCODE_ADDRESS,
-        evm::EthEvmNetwork,
+        evm::{EthEvmNetwork, FoundryEvmFactory},
         fork::ForkId,
         opts::EvmOpts,
+        precompiles::EC_RECOVER,
     };
     use alloy_consensus::transaction::Recovered;
+    use alloy_evm::{EthEvmFactory, Evm, EvmEnv, EvmFactory, precompiles::Precompile};
     use alloy_network::{
         AnyNetwork, AnyRpcTransaction, AnyTxEnvelope, AnyTxType, UnknownTxEnvelope,
         UnknownTypedTransaction,
@@ -2996,8 +3002,8 @@ mod tests {
         cache::{BlockchainDb, BlockchainDbMeta},
     };
     use revm::{
-        context::{BlockEnv, JournalInner, TxEnv},
-        database::{AccountState, CacheDB, DatabaseRef, DbAccount},
+        context::{BlockEnv, CfgEnv, JournalInner, TxEnv},
+        database::{AccountState, CacheDB, DatabaseRef, DbAccount, EmptyDB},
         primitives::hardfork::SpecId,
         state::{Account, AccountInfo, EvmState, EvmStorageSlot, TransactionId},
     };
@@ -3099,6 +3105,24 @@ mod tests {
             let monad = Backend::<MonadEvmNetwork>::spawn(None).unwrap();
             assert!(monad.inner.persistent_accounts.contains(&MONAD_CHEATCODE_ADDRESS));
         }
+    }
+
+    #[test]
+    fn ethereum_no_context_replay_factory_installs_stateful_eip8151() {
+        let factory = EthEvmFactory::default();
+        let mut cfg = CfgEnv::new_with_spec(SpecId::PRAGUE);
+        cfg.enable_eip8151 = true;
+
+        let raw =
+            factory.create_evm(EmptyDB::default(), EvmEnv::new(cfg.clone(), BlockEnv::default()));
+        assert!(raw.precompiles().get(&EC_RECOVER).unwrap().supports_caching());
+
+        let replay = factory.create_evm_with_context(
+            EmptyDB::default(),
+            EvmEnv::new(cfg, BlockEnv::default()),
+            (),
+        );
+        assert!(!replay.precompiles().get(&EC_RECOVER).unwrap().supports_caching());
     }
 
     #[test]

@@ -34,7 +34,7 @@ use anvil_core::eth::transaction::{
     MaybeImpersonatedTransaction, PendingTransaction, TransactionInfo,
 };
 use foundry_evm::core::{env::FoundryTransaction, evm::IntoInstructionResult};
-use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope, FoundryTxType};
+use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope, FoundryTxType, FrameReceipt};
 use revm::{
     Database, DatabaseCommit,
     context::Block as RevmBlock,
@@ -158,7 +158,9 @@ impl FoundryReceiptBuilder {
             #[cfg(feature = "optimism")]
             FoundryTxType::PostExec => FoundryReceiptEnvelope::PostExec(receipt),
             FoundryTxType::Tempo => FoundryReceiptEnvelope::Tempo(receipt),
-            FoundryTxType::Frame => FoundryReceiptEnvelope::Frame(receipt),
+            FoundryTxType::Frame => {
+                panic!("frame receipts require payer and per-frame receipt data")
+            }
         }
     }
 
@@ -218,6 +220,27 @@ impl ReceiptBuilder for FoundryReceiptBuilder {
 pub struct AnvilTxResult<H> {
     pub inner: EthTxResult<H, FoundryTxType>,
     pub sender: Address,
+    pub(crate) frame_receipt: Option<FrameReceiptData>,
+}
+
+/// EIP-8141 receipt fields retained alongside the ordinary EVM result.
+#[derive(Clone, Debug)]
+pub(crate) struct FrameReceiptData {
+    pub(crate) payer: Address,
+    pub(crate) frame_receipts: Vec<FrameReceipt>,
+}
+
+/// Execution result plus transaction-type-specific receipt metadata.
+#[derive(Debug)]
+pub(crate) struct AnvilExecutionOutcome<H> {
+    pub(crate) result: ResultAndState<H>,
+    pub(crate) frame_receipt: Option<FrameReceiptData>,
+}
+
+impl<H> From<ResultAndState<H>> for AnvilExecutionOutcome<H> {
+    fn from(result: ResultAndState<H>) -> Self {
+        Self { result, frame_receipt: None }
+    }
 }
 
 impl<H: Send + 'static> TxResult for AnvilTxResult<H> {
@@ -325,7 +348,7 @@ where
             &mut E,
             E::Tx,
             B256,
-        ) -> Result<ResultAndState<E::HaltReason>, BlockExecutionError>,
+        ) -> Result<AnvilExecutionOutcome<E::HaltReason>, BlockExecutionError>,
     {
         let (tx_env, tx) = tx.into_parts();
 
@@ -340,7 +363,8 @@ where
 
         let sender = *tx.signer();
         let transaction_hash = tx.tx().trie_hash();
-        let result = transact(&mut self.evm, tx_env, transaction_hash)?;
+        let AnvilExecutionOutcome { result, frame_receipt } =
+            transact(&mut self.evm, tx_env, transaction_hash)?;
 
         Ok(AnvilTxResult {
             inner: EthTxResult {
@@ -349,6 +373,7 @@ where
                 tx_type: tx.tx().tx_type(),
             },
             sender,
+            frame_receipt,
         })
     }
 }
@@ -409,7 +434,9 @@ where
         tx: impl ExecutableTx<Self>,
     ) -> Result<Self::Result, BlockExecutionError> {
         self.execute_transaction_without_commit_with(tx, |evm, tx_env, transaction_hash| {
-            evm.transact(tx_env).map_err(|err| BlockExecutionError::evm(err, transaction_hash))
+            evm.transact(tx_env)
+                .map(Into::into)
+                .map_err(|err| BlockExecutionError::evm(err, transaction_hash))
         })
     }
 
@@ -418,6 +445,7 @@ where
             inner: EthTxResult { result: ResultAndState { result, state }, blob_gas_used, tx_type },
             #[cfg_attr(not(feature = "optimism"), allow(unused_variables))]
             sender,
+            frame_receipt,
         } = output;
 
         let gas_used = result.tx_gas_used();
@@ -428,7 +456,14 @@ where
         }
 
         #[cfg(feature = "optimism")]
-        let receipt = if tx_type == FoundryTxType::Deposit {
+        let receipt = if let Some(frame_receipt) = frame_receipt {
+            debug_assert_eq!(tx_type, FoundryTxType::Frame);
+            FoundryReceiptEnvelope::from_frame_parts(
+                self.gas_used,
+                frame_receipt.payer,
+                frame_receipt.frame_receipts,
+            )
+        } else if tx_type == FoundryTxType::Deposit {
             let deposit_nonce = state.get(&sender).map(|acc| acc.info.nonce);
             let receipt = alloy_consensus::Receipt {
                 status: Eip658Value::Eip658(result.is_success()),
@@ -454,13 +489,22 @@ where
             })
         };
         #[cfg(not(feature = "optimism"))]
-        let receipt = self.receipt_builder.build_receipt(ReceiptBuilderCtx {
-            tx_type,
-            evm: &self.evm,
-            result,
-            state: &state,
-            cumulative_gas_used: self.gas_used,
-        });
+        let receipt = if let Some(frame_receipt) = frame_receipt {
+            debug_assert_eq!(tx_type, FoundryTxType::Frame);
+            FoundryReceiptEnvelope::from_frame_parts(
+                self.gas_used,
+                frame_receipt.payer,
+                frame_receipt.frame_receipts,
+            )
+        } else {
+            self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+                tx_type,
+                evm: &self.evm,
+                result,
+                state: &state,
+                cumulative_gas_used: self.gas_used,
+            })
+        };
 
         if let Some(state_changes) = &mut self.state_changes {
             state_changes.push(state.clone());
@@ -580,7 +624,7 @@ where
         >,
     B::Receipt: TxReceipt,
     <B::Result as TxResult>::HaltReason: Clone + IntoInstructionResult,
-    <B::Evm as Evm>::Tx: FromTxWithEncoded<B::Transaction> + FoundryTransaction,
+    <B::Evm as Evm>::Tx: FromTxWithEncoded<FoundryTxEnvelope> + FoundryTransaction,
     BeforeTransaction: FnMut(&mut B::Evm, &<B::Evm as Evm>::Tx),
     ExecuteTransaction: FnMut(
         &mut B,
@@ -622,8 +666,7 @@ where
             }
         };
 
-        let tx_env =
-            build_tx_env_for_pending::<B::Transaction, <B::Evm as Evm>::Tx>(pending, cheats);
+        let tx_env = build_tx_env_for_pending::<<B::Evm as Evm>::Tx>(pending, cheats);
 
         // Gas limit checks
         let cumulative_gas =
@@ -735,15 +778,35 @@ where
     ExecutedPoolTransactions { included, invalid, not_yet_valid, tx_info, txs: transactions }
 }
 
+/// Returns whether a pending transaction's authoritative sender came from its protocol ECDSA
+/// envelope rather than impersonation or another custom authentication path.
+pub(crate) fn is_eip7851_sender_ecdsa_authenticated(
+    tx: &PendingTransaction<FoundryTxEnvelope>,
+) -> bool {
+    !tx.transaction.is_impersonated()
+        && matches!(
+            tx.transaction.as_ref(),
+            FoundryTxEnvelope::Legacy(_)
+                | FoundryTxEnvelope::Eip2930(_)
+                | FoundryTxEnvelope::Eip1559(_)
+                | FoundryTxEnvelope::Eip4844(_)
+                | FoundryTxEnvelope::Eip7702(_)
+        )
+        && tx.transaction.as_ref().recover().is_ok_and(|sender| sender == *tx.sender())
+}
+
 /// Builds the EVM transaction env from a pending pool transaction.
-pub fn build_tx_env_for_pending<Tx, T>(tx: &PendingTransaction<Tx>, cheats: &CheatsManager) -> T
+pub fn build_tx_env_for_pending<T>(
+    tx: &PendingTransaction<FoundryTxEnvelope>,
+    cheats: &CheatsManager,
+) -> T
 where
-    Tx: Transaction + Encodable2718,
-    T: FromTxWithEncoded<Tx> + FoundryTransaction,
+    T: FromTxWithEncoded<FoundryTxEnvelope> + FoundryTransaction,
 {
     let encoded = tx.transaction.encoded_2718().into();
     let mut tx_env: T =
         FromTxWithEncoded::from_encoded_tx(tx.transaction.as_ref(), *tx.sender(), encoded);
+    tx_env.set_eip7851_sender_ecdsa_authenticated(is_eip7851_sender_ecdsa_authenticated(tx));
 
     if let Some(signed_auths) = tx.transaction.authorization_list()
         && cheats.has_recover_overrides()
@@ -778,11 +841,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_eips::{
         eip6110::MAINNET_DEPOSIT_CONTRACT_ADDRESS, eip7002::WITHDRAWAL_REQUEST_TYPE,
         eip7251::CONSOLIDATION_REQUEST_TYPE,
     };
+    use alloy_network::TxSignerSync;
+    use alloy_signer_local::PrivateKeySigner;
     use alloy_sol_types::{SolEvent, sol};
+    use revm::context::{Transaction as RevmTransaction, TxEnv};
 
     sol! {
         event DepositEvent(
@@ -792,6 +859,31 @@ mod tests {
             bytes signature,
             bytes index
         );
+    }
+
+    #[test]
+    fn pending_tx_env_preserves_protocol_ecdsa_authentication() {
+        let signer = PrivateKeySigner::random();
+        let mut tx = TxEip1559 { chain_id: 31337, gas_limit: 21_000, ..Default::default() };
+        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+        let envelope = FoundryTxEnvelope::Eip1559(tx.into_signed(signature));
+
+        let signed = PendingTransaction::new(envelope.clone()).unwrap();
+        let signed_env: TxEnv = build_tx_env_for_pending(&signed, &CheatsManager::default());
+        assert!(RevmTransaction::is_eip7851_sender_ecdsa_authenticated(&signed_env));
+
+        let impersonated =
+            PendingTransaction::with_impersonated(envelope.clone(), signer.address());
+        let impersonated_env: TxEnv =
+            build_tx_env_for_pending(&impersonated, &CheatsManager::default());
+        assert!(!RevmTransaction::is_eip7851_sender_ecdsa_authenticated(&impersonated_env));
+
+        let custom = PendingTransaction::with_sender(
+            MaybeImpersonatedTransaction::new(envelope),
+            Address::ZERO,
+        );
+        let custom_env: TxEnv = build_tx_env_for_pending(&custom, &CheatsManager::default());
+        assert!(!RevmTransaction::is_eip7851_sender_ecdsa_authenticated(&custom_env));
     }
 
     #[test]

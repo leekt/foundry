@@ -6,7 +6,6 @@ use crate::{
     inspector::{RecordDebugStepInfo, refresh_context_after_state_change},
 };
 use alloy_consensus::transaction::SignerRecoverable;
-use revm::context_interface::host::{FrameInfo, FrameSigInfo, FrameTxContext};
 use alloy_evm::FromRecoveredTx;
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_network::eip2718::EIP4844_TX_TYPE_ID;
@@ -44,6 +43,13 @@ use revm::{
     Database,
     bytecode::Bytecode,
     context::{Block, Cfg, ContextTr, Host, JournalTr, Transaction, result::ExecutionResult},
+    context_interface::host::{
+        FrameInfo, FrameSigInfo, FrameTxAccountDiff as RevmFrameTxAccountDiff,
+        FrameTxBalanceDiff as RevmFrameTxBalanceDiff, FrameTxContext,
+        FrameTxDeployedContract as RevmFrameTxDeployedContract, FrameTxEvent as RevmFrameTxEvent,
+        FrameTxRecentRootReference as RevmFrameTxRecentRootReference,
+        FrameTxStorageDiff as RevmFrameTxStorageDiff, FrameTxTrace as RevmFrameTxTrace,
+    },
     inspector::JournalExt,
     primitives::{KECCAK_EMPTY, hardfork::SpecId},
     state::{Account, AccountStatus},
@@ -572,14 +578,25 @@ impl Cheatcode for chainIdCall {
     }
 }
 
+/// EIP-8141 entry point used as the caller for every non-SENDER frame.
+const FRAME_TX_ENTRY_POINT_ADDRESS: Address =
+    Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa]);
+/// EIP-8141 SENDER frame mode.
+const FRAME_TX_SENDER_MODE: u8 = 2;
+
 impl Cheatcode for setFrameTxCall {
-    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, _ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self { frameTx } = self;
         let frames = frameTx
             .frames
             .iter()
             .map(|f| FrameInfo {
                 resolved_target: f.target,
+                expected_caller: if f.mode == FRAME_TX_SENDER_MODE {
+                    frameTx.sender
+                } else {
+                    FRAME_TX_ENTRY_POINT_ADDRESS
+                },
                 gas_limit: f.gasLimit,
                 mode: f.mode,
                 flags: f.flags,
@@ -600,27 +617,97 @@ impl Cheatcode for setFrameTxCall {
                 signature: sig.signature.clone(),
             })
             .collect();
+        let recent_root_references = frameTx
+            .recentRootReferences
+            .iter()
+            .map(|reference| RevmFrameTxRecentRootReference {
+                source_id: reference.sourceId,
+                slot: reference.slot,
+                root: reference.root,
+            })
+            .collect();
+        let trace = RevmFrameTxTrace {
+            balance_diffs: frameTx
+                .trace
+                .balanceDiffs
+                .iter()
+                .map(|diff| RevmFrameTxBalanceDiff {
+                    address: diff.account,
+                    before: diff.balanceBefore,
+                    after: diff.balanceAfter,
+                })
+                .collect(),
+            storage_diffs: frameTx
+                .trace
+                .storageDiffs
+                .iter()
+                .map(|diff| RevmFrameTxStorageDiff {
+                    address: diff.account,
+                    key: diff.key,
+                    before: diff.valueBefore,
+                    after: diff.valueAfter,
+                })
+                .collect(),
+            deployed_contracts: frameTx
+                .trace
+                .deployedContracts
+                .iter()
+                .map(|deployment| RevmFrameTxDeployedContract {
+                    address: deployment.account,
+                    code_hash: deployment.codeHash,
+                })
+                .collect(),
+            account_diffs: frameTx
+                .trace
+                .accountDiffs
+                .iter()
+                .map(|diff| RevmFrameTxAccountDiff {
+                    address: diff.account,
+                    nonce_changed: diff.nonceChanged,
+                    code_hash_before: diff.codeHashBefore,
+                    code_hash_after: diff.codeHashAfter,
+                })
+                .collect(),
+            events: frameTx
+                .trace
+                .events
+                .iter()
+                .map(|event| RevmFrameTxEvent {
+                    address: event.emitter,
+                    topics: event.topics.clone(),
+                    data: event.data.clone(),
+                })
+                .collect(),
+            gas_pre_charge: frameTx.trace.gasPreCharge,
+            gas_payer: frameTx.trace.gasPayer,
+        };
         revm::interpreter::instructions::frame_tx::set_frame_tx_context(Some(FrameTxContext {
             sender: frameTx.sender,
             nonce: frameTx.nonce,
+            legacy_nonce: frameTx.legacyNonce,
+            nonce_keys: frameTx.nonceKeys.clone(),
+            nonce_keys_hash: frameTx.nonceKeysHash,
             sig_hash: frameTx.sigHash,
             max_cost: frameTx.maxCost,
-            max_priority_fee_per_gas: U256::ZERO,
-            max_fee_per_gas: U256::ZERO,
-            max_fee_per_blob_gas: U256::ZERO,
-            blob_count: 0,
+            max_priority_fee_per_gas: frameTx.maxPriorityFeePerGas,
+            max_fee_per_gas: frameTx.maxFeePerGas,
+            max_fee_per_blob_gas: frameTx.maxFeePerBlobGas,
+            blob_count: frameTx.blobCount,
             frame_index: frameTx.frameIndex,
             frames,
             signatures,
+            recent_root_references,
+            trace,
             approvable_scopes: frameTx.approvableScopes,
             approved_scope: 0,
+            event_index: Default::default(),
         }));
         Ok(Default::default())
     }
 }
 
 impl Cheatcode for clearFrameTxCall {
-    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
+    fn apply_stateful<FEN: FoundryEvmNetwork>(&self, _ccx: &mut CheatsCtxt<'_, '_, FEN>) -> Result {
         let Self {} = self;
         revm::interpreter::instructions::frame_tx::set_frame_tx_context(None);
         Ok(Default::default())

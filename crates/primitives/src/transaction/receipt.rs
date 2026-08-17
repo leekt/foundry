@@ -1,11 +1,12 @@
 use alloy_consensus::{
-    Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, TxReceipt, Typed2718,
+    Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, RlpDecodableReceipt,
+    RlpEncodableReceipt, TxReceipt, Typed2718,
 };
 use alloy_network::eip2718::{
     Decodable2718, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID, EIP7702_TX_TYPE_ID,
     Eip2718Error, Encodable2718, LEGACY_TX_TYPE_ID,
 };
-use alloy_primitives::{Bloom, Log, TxHash, logs_bloom};
+use alloy_primitives::{Address, Bloom, Log, TxHash, logs_bloom};
 use alloy_rlp::{BufMut, Decodable, Encodable, Header, bytes};
 use alloy_rpc_types::{BlockNumHash, trace::otterscan::OtsReceipt};
 #[cfg(feature = "optimism")]
@@ -16,6 +17,145 @@ use serde::{Deserialize, Serialize};
 use tempo_primitives::TEMPO_TX_TYPE_ID;
 
 use crate::{FoundryTxType, transaction::frame::FRAME_TX_TYPE_ID};
+
+/// Receipt for one executed EIP-8141 frame.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameReceipt<T = Log> {
+    /// Top-level frame return status (`0` failed, `1` succeeded, `2` skipped).
+    #[serde(with = "alloy_serde::quantity")]
+    pub status: u8,
+    /// Gross gas used by this frame, before transaction-level refunds.
+    #[serde(with = "alloy_serde::quantity")]
+    pub gas_used: u64,
+    /// Canonical logs retained by this frame.
+    pub logs: Vec<T>,
+}
+
+impl<T> FrameReceipt<T> {
+    /// Converts this frame receipt's log type.
+    pub fn map_logs<U>(self, f: impl FnMut(T) -> U) -> FrameReceipt<U> {
+        FrameReceipt {
+            status: self.status,
+            gas_used: self.gas_used,
+            logs: self.logs.into_iter().map(f).collect(),
+        }
+    }
+}
+
+impl<T: Encodable> Encodable for FrameReceipt<T> {
+    fn encode(&self, out: &mut dyn BufMut) {
+        let payload_length = self.status.length() + self.gas_used.length() + self.logs.length();
+        Header { list: true, payload_length }.encode(out);
+        self.status.encode(out);
+        self.gas_used.encode(out);
+        self.logs.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_length = self.status.length() + self.gas_used.length() + self.logs.length();
+        Header { list: true, payload_length }.length_with_payload()
+    }
+}
+
+impl<T: Decodable> Decodable for FrameReceipt<T> {
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let header = Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining = buf.len();
+        let receipt = Self {
+            status: Decodable::decode(buf)?,
+            gas_used: Decodable::decode(buf)?,
+            logs: Decodable::decode(buf)?,
+        };
+        if receipt.status > 2 || buf.len() + header.payload_length != remaining {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        Ok(receipt)
+    }
+}
+
+/// Consensus receipt payload for an EIP-8141 frame transaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameTransactionReceipt<T = Log> {
+    /// Standard RPC-compatible transaction receipt view.
+    #[serde(flatten)]
+    pub inner: Receipt<T>,
+    /// Account that paid the transaction fee.
+    pub payer: Address,
+    /// Ordered receipts for every frame.
+    pub frame_receipts: Vec<FrameReceipt<T>>,
+}
+
+impl<T: Clone> FrameTransactionReceipt<T> {
+    /// Builds a frame receipt and its flattened transaction-level log view.
+    pub fn new(
+        cumulative_gas_used: u64,
+        payer: Address,
+        frame_receipts: Vec<FrameReceipt<T>>,
+    ) -> Self {
+        let logs = frame_receipts.iter().flat_map(|frame| frame.logs.iter().cloned()).collect();
+        Self {
+            inner: Receipt { status: Eip658Value::Eip658(true), cumulative_gas_used, logs },
+            payer,
+            frame_receipts,
+        }
+    }
+}
+
+impl<T> FrameTransactionReceipt<T> {
+    /// Converts both nested and flattened logs to another type.
+    pub fn map_logs<U: Clone>(self, mut f: impl FnMut(T) -> U) -> FrameTransactionReceipt<U> {
+        let cumulative_gas_used = self.inner.cumulative_gas_used;
+        let frame_receipts =
+            self.frame_receipts.into_iter().map(|frame| frame.map_logs(&mut f)).collect();
+        FrameTransactionReceipt::new(cumulative_gas_used, self.payer, frame_receipts)
+    }
+}
+
+impl<T: Encodable> RlpEncodableReceipt for FrameTransactionReceipt<T> {
+    fn rlp_encoded_length_with_bloom(&self, _bloom: &Bloom) -> usize {
+        let payload_length = self.inner.cumulative_gas_used.length()
+            + self.payer.length()
+            + self.frame_receipts.length();
+        Header { list: true, payload_length }.length_with_payload()
+    }
+
+    fn rlp_encode_with_bloom(&self, _bloom: &Bloom, out: &mut dyn BufMut) {
+        let payload_length = self.inner.cumulative_gas_used.length()
+            + self.payer.length()
+            + self.frame_receipts.length();
+        Header { list: true, payload_length }.encode(out);
+        self.inner.cumulative_gas_used.encode(out);
+        self.payer.encode(out);
+        self.frame_receipts.encode(out);
+    }
+}
+
+impl<T> RlpDecodableReceipt for FrameTransactionReceipt<T>
+where
+    T: AsRef<Log> + Clone + Decodable,
+{
+    fn rlp_decode_with_bloom(buf: &mut &[u8]) -> alloy_rlp::Result<ReceiptWithBloom<Self>> {
+        let header = Header::decode(buf)?;
+        if !header.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        let remaining = buf.len();
+        let cumulative_gas_used = Decodable::decode(buf)?;
+        let payer = Decodable::decode(buf)?;
+        let frame_receipts: Vec<FrameReceipt<T>> = Decodable::decode(buf)?;
+        if buf.len() + header.payload_length != remaining {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        let receipt = Self::new(cumulative_gas_used, payer, frame_receipts);
+        let logs_bloom = logs_bloom(receipt.inner.logs.iter().map(AsRef::as_ref));
+        Ok(ReceiptWithBloom { receipt, logs_bloom })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -40,7 +180,7 @@ pub enum FoundryReceiptEnvelope<T = Log> {
     Tempo(ReceiptWithBloom<Receipt<T>>),
     /// EIP-8141 frame transaction receipt.
     #[serde(rename = "0x6", alias = "0x06")]
-    Frame(ReceiptWithBloom<Receipt<T>>),
+    Frame(ReceiptWithBloom<FrameTransactionReceipt<T>>),
 }
 
 impl FoundryReceiptEnvelope<alloy_rpc_types::Log> {
@@ -94,7 +234,7 @@ impl FoundryReceiptEnvelope<alloy_rpc_types::Log> {
                 Self::Tempo(ReceiptWithBloom { receipt: inner_receipt, logs_bloom })
             }
             FoundryTxType::Frame => {
-                Self::Frame(ReceiptWithBloom { receipt: inner_receipt, logs_bloom })
+                panic!("frame receipts require payer and per-frame receipt data")
             }
         }
     }
@@ -109,6 +249,43 @@ impl FoundryReceiptEnvelope<Log> {
         transaction_index: u64,
         next_log_index: usize,
     ) -> FoundryReceiptEnvelope<alloy_rpc_types::Log> {
+        if let Self::Frame(receipt) = &self {
+            let mut log_index = next_log_index;
+            let frame_receipts = receipt
+                .receipt
+                .frame_receipts
+                .iter()
+                .map(|frame| FrameReceipt {
+                    status: frame.status,
+                    gas_used: frame.gas_used,
+                    logs: frame
+                        .logs
+                        .iter()
+                        .cloned()
+                        .map(|log| {
+                            let log = alloy_rpc_types::Log {
+                                inner: log,
+                                block_hash: Some(block_numhash.hash),
+                                block_number: Some(block_numhash.number),
+                                block_timestamp: Some(block_timestamp),
+                                transaction_hash: Some(transaction_hash),
+                                transaction_index: Some(transaction_index),
+                                log_index: Some(log_index as u64),
+                                removed: false,
+                            };
+                            log_index += 1;
+                            log
+                        })
+                        .collect(),
+                })
+                .collect();
+            return FoundryReceiptEnvelope::from_frame_parts(
+                receipt.receipt.inner.cumulative_gas_used,
+                receipt.receipt.payer,
+                frame_receipts,
+            );
+        }
+
         let logs = self
             .logs()
             .iter()
@@ -141,6 +318,20 @@ impl FoundryReceiptEnvelope<Log> {
 }
 
 impl<T> FoundryReceiptEnvelope<T> {
+    /// Builds an EIP-8141 receipt from its consensus fields.
+    pub fn from_frame_parts(
+        cumulative_gas_used: u64,
+        payer: Address,
+        frame_receipts: Vec<FrameReceipt<T>>,
+    ) -> Self
+    where
+        T: AsRef<Log> + Clone,
+    {
+        let receipt = FrameTransactionReceipt::new(cumulative_gas_used, payer, frame_receipts);
+        let logs_bloom = logs_bloom(receipt.inner.logs.iter().map(AsRef::as_ref));
+        Self::Frame(ReceiptWithBloom { receipt, logs_bloom })
+    }
+
     /// Returns `true` if this is an OP stack deposit receipt.
     #[cfg(feature = "optimism")]
     pub const fn is_deposit(&self) -> bool {
@@ -193,7 +384,7 @@ impl<T> FoundryReceiptEnvelope<T> {
     /// Converts the receipt's log type by applying a function to each log.
     ///
     /// Returns the receipt with the new log type.
-    pub fn map_logs<U>(self, f: impl FnMut(T) -> U) -> FoundryReceiptEnvelope<U> {
+    pub fn map_logs<U: Clone>(self, f: impl FnMut(T) -> U) -> FoundryReceiptEnvelope<U> {
         match self {
             Self::Legacy(r) => FoundryReceiptEnvelope::Legacy(r.map_logs(f)),
             Self::Eip2930(r) => FoundryReceiptEnvelope::Eip2930(r.map_logs(f)),
@@ -207,7 +398,9 @@ impl<T> FoundryReceiptEnvelope<T> {
                 r.map_receipt(|r: OpDepositReceipt<T>| r.map_logs(f)),
             ),
             Self::Tempo(r) => FoundryReceiptEnvelope::Tempo(r.map_logs(f)),
-            Self::Frame(r) => FoundryReceiptEnvelope::Frame(r.map_logs(f)),
+            Self::Frame(r) => {
+                FoundryReceiptEnvelope::Frame(r.map_receipt(|receipt| receipt.map_logs(f)))
+            }
         }
     }
 
@@ -246,8 +439,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             | Self::Eip1559(t)
             | Self::Eip4844(t)
             | Self::Eip7702(t)
-            | Self::Tempo(t)
-            | Self::Frame(t) => t.receipt,
+            | Self::Tempo(t) => t.receipt,
+            Self::Frame(t) => t.receipt.inner,
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => t.receipt,
             #[cfg(feature = "optimism")]
@@ -263,8 +456,8 @@ impl<T> FoundryReceiptEnvelope<T> {
             | Self::Eip1559(t)
             | Self::Eip4844(t)
             | Self::Eip7702(t)
-            | Self::Tempo(t)
-            | Self::Frame(t) => &t.receipt,
+            | Self::Tempo(t) => &t.receipt,
+            Self::Frame(t) => &t.receipt.inner,
             #[cfg(feature = "optimism")]
             Self::PostExec(t) => &t.receipt,
             #[cfg(feature = "optimism")]
@@ -311,6 +504,11 @@ impl Encodable for FoundryReceiptEnvelope {
     fn encode(&self, out: &mut dyn bytes::BufMut) {
         match self {
             Self::Legacy(r) => r.encode(out),
+            Self::Frame(_) => {
+                let payload_length = self.encode_2718_len();
+                Header { list: false, payload_length }.encode(out);
+                self.encode_2718(out);
+            }
             receipt => {
                 let payload_len = match receipt {
                     Self::Eip2930(r) => r.length() + 1,
@@ -322,7 +520,6 @@ impl Encodable for FoundryReceiptEnvelope {
                     #[cfg(feature = "optimism")]
                     Self::Deposit(r) => r.length() + 1,
                     Self::Tempo(r) => r.length() + 1,
-                    Self::Frame(r) => r.length() + 1,
                     _ => unreachable!("receipt already matched"),
                 };
 
@@ -362,11 +559,6 @@ impl Encodable for FoundryReceiptEnvelope {
                     Self::Tempo(r) => {
                         Header { list: true, payload_length: payload_len }.encode(out);
                         TEMPO_TX_TYPE_ID.encode(out);
-                        r.encode(out);
-                    }
-                    Self::Frame(r) => {
-                        Header { list: true, payload_length: payload_len }.encode(out);
-                        FRAME_TX_TYPE_ID.encode(out);
                         r.encode(out);
                     }
                     _ => unreachable!("receipt already matched"),
@@ -413,7 +605,8 @@ impl Decodable for FoundryReceiptEnvelope {
                         .map(FoundryReceiptEnvelope::Eip7702)
                 } else if receipt_type == FRAME_TX_TYPE_ID {
                     buf.advance(1);
-                    <ReceiptWithBloom as Decodable>::decode(buf).map(FoundryReceiptEnvelope::Frame)
+                    <ReceiptWithBloom<FrameTransactionReceipt> as Decodable>::decode(buf)
+                        .map(FoundryReceiptEnvelope::Frame)
                 } else if receipt_type == TEMPO_TX_TYPE_ID {
                     buf.advance(1);
                     <ReceiptWithBloom as Decodable>::decode(buf).map(FoundryReceiptEnvelope::Tempo)
@@ -489,8 +682,8 @@ impl Encodable2718 for FoundryReceiptEnvelope {
             | Self::Eip1559(r)
             | Self::Eip4844(r)
             | Self::Eip7702(r)
-            | Self::Tempo(r)
-            | Self::Frame(r) => r.encode(out),
+            | Self::Tempo(r) => r.encode(out),
+            Self::Frame(r) => r.encode(out),
             #[cfg(feature = "optimism")]
             Self::PostExec(r) => r.encode(out),
             #[cfg(feature = "optimism")]
@@ -511,7 +704,9 @@ impl Decodable2718 for FoundryReceiptEnvelope {
             }
         }
         if ty == FRAME_TX_TYPE_ID {
-            return Ok(Self::Frame(ReceiptWithBloom::decode(buf)?));
+            return Ok(Self::Frame(
+                <ReceiptWithBloom<FrameTransactionReceipt> as Decodable>::decode(buf)?,
+            ));
         }
         if ty == TEMPO_TX_TYPE_ID {
             return Ok(Self::Tempo(ReceiptWithBloom::decode(buf)?));
@@ -548,7 +743,7 @@ impl From<FoundryReceiptEnvelope<alloy_rpc_types::Log>> for OtsReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, Bytes, LogData, hex};
+    use alloy_primitives::{B256, Bytes, LogData, hex};
     use std::str::FromStr;
 
     fn receipt_for(tx_type: FoundryTxType) -> FoundryReceiptEnvelope {
@@ -572,12 +767,47 @@ mod tests {
         assert!(receipt_for(FoundryTxType::Eip7702).is_eip7702());
         assert!(receipt_for(FoundryTxType::Tempo).is_tempo());
         assert!(!receipt_for(FoundryTxType::Tempo).is_legacy());
+        assert!(
+            FoundryReceiptEnvelope::from_frame_parts(0, Address::ZERO, Vec::<FrameReceipt>::new(),)
+                .is_frame()
+        );
 
         #[cfg(feature = "optimism")]
         {
             assert!(receipt_for(FoundryTxType::Deposit).is_deposit());
             assert!(receipt_for(FoundryTxType::PostExec).is_post_exec());
         }
+    }
+
+    #[test]
+    fn frame_receipt_uses_eip8141_consensus_payload() {
+        let payer = Address::repeat_byte(0x11);
+        let receipt = FoundryReceiptEnvelope::from_frame_parts(
+            21_000,
+            payer,
+            vec![
+                FrameReceipt { status: 1, gas_used: 16, logs: Vec::new() },
+                FrameReceipt { status: 0, gas_used: 0, logs: Vec::new() },
+                FrameReceipt { status: 2, gas_used: 0, logs: Vec::new() },
+            ],
+        );
+        let expected =
+            hex!("06e5825208941111111111111111111111111111111111111111ccc30110c0c38080c0c30280c0");
+
+        let encoded = receipt.encoded_2718();
+        assert_eq!(encoded, expected);
+        let decoded = FoundryReceiptEnvelope::decode_2718(&mut encoded.as_slice()).unwrap();
+        assert_eq!(decoded, receipt);
+        let FoundryReceiptEnvelope::Frame(frame) = decoded else { unreachable!() };
+        assert_eq!(frame.receipt.payer, payer);
+        assert_eq!(frame.receipt.frame_receipts.len(), 3);
+        assert!(frame.receipt.inner.status.coerce_status());
+
+        let mut network_encoded = Vec::new();
+        receipt.encode(&mut network_encoded);
+        let network_decoded =
+            FoundryReceiptEnvelope::decode(&mut network_encoded.as_slice()).unwrap();
+        assert_eq!(network_decoded, receipt);
     }
 
     #[test]

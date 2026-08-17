@@ -10523,7 +10523,7 @@ dependencies = [
 [[package]]
 name = "revm"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "revm-bytecode",
  "revm-context",
@@ -10541,7 +10541,7 @@ dependencies = [
 [[package]]
 name = "revm-bytecode"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "bitvec",
  "paste",
@@ -10553,7 +10553,7 @@ dependencies = [
 [[package]]
 name = "revm-context"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "bitvec",
  "cfg-if",
@@ -10569,7 +10569,7 @@ dependencies = [
 [[package]]
 name = "revm-context-interface"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "alloy-eip2930",
  "alloy-eip7702",
@@ -10584,7 +10584,7 @@ dependencies = [
 [[package]]
 name = "revm-database"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "alloy-eips",
  "derive_more",
@@ -10599,7 +10599,7 @@ dependencies = [
 [[package]]
 name = "revm-database-interface"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "auto_impl",
  "either",
@@ -10612,7 +10612,7 @@ dependencies = [
 [[package]]
 name = "revm-handler"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "auto_impl",
  "derive-where",
@@ -10630,7 +10630,7 @@ dependencies = [
 [[package]]
 name = "revm-inspector"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "auto_impl",
  "either",
@@ -10667,7 +10667,7 @@ dependencies = [
 [[package]]
 name = "revm-interpreter"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",
@@ -10679,7 +10679,7 @@ dependencies = [
 [[package]]
 name = "revm-precompile"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -10703,7 +10703,7 @@ dependencies = [
 [[package]]
 name = "revm-primitives"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "alloy-primitives",
  "once_cell",
@@ -10713,7 +10713,7 @@ dependencies = [
 [[package]]
 name = "revm-state"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#ce7886ea9f7e549fd803c6f30ea2d159cff495a3"
+source = "git+https://github.com/leekt/revm?rev=2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba#2f96f6cb10d9649bbc81fbe3c3af4ea907eb8fba"
 dependencies = [
  "alloy-eip7928",
  "bitflags 2.13.1",

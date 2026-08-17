@@ -1,20 +1,34 @@
 //! Support for "cheat codes" / bypass functions
 
-use alloy_evm::precompiles::{Precompile, PrecompileInput};
+use alloy_evm::precompiles::{DynPrecompile, Precompile, PrecompileInput};
 use alloy_primitives::{
     Address, B256, Bytes,
     map::{AddressHashSet, foldhash::HashMap},
 };
+use foundry_evm::core::precompiles::is_eip8151_ecrecover_id;
 use parking_lot::RwLock;
 use revm::precompile::{
-    PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult, call_eth_precompile,
-    secp256k1::ec_recover_run, utilities::right_pad,
+    PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult, utilities::right_pad,
 };
 use std::{borrow::Cow, sync::Arc};
 
 /// ID for the [`CheatEcrecover::precompile_id`] precompile.
 static PRECOMPILE_ID_CHEAT_ECRECOVER: PrecompileId =
     PrecompileId::Custom(Cow::Borrowed("cheat_ecrecover"));
+static PRECOMPILE_ID_CHEAT_EIP8151_FALLBACK: PrecompileId =
+    PrecompileId::Custom(Cow::Borrowed("cheat_ecrecover_eip8151_fallback"));
+
+pub(crate) fn is_cheat_eip8151_fallback_id(id: &PrecompileId) -> bool {
+    id == &PRECOMPILE_ID_CHEAT_EIP8151_FALLBACK
+}
+
+pub(crate) fn ecrecover_signature(input: &[u8]) -> Bytes {
+    let padded = right_pad::<128>(input);
+    let mut signature = [0u8; 65];
+    signature[..64].copy_from_slice(&padded[64..128]);
+    signature[64] = padded[63];
+    Bytes::copy_from_slice(&signature)
+}
 
 /// Manages user modifications that may affect the node's behavior
 ///
@@ -153,28 +167,28 @@ pub(crate) struct PendingPrevrandao {
 }
 
 impl CheatEcrecover {
-    pub const fn new(cheats: Arc<CheatsManager>) -> Self {
-        Self { cheats }
+    pub fn new(cheats: Arc<CheatsManager>, fallback: DynPrecompile) -> Self {
+        let precompile_id = if is_eip8151_ecrecover_id(fallback.precompile_id()) {
+            PRECOMPILE_ID_CHEAT_EIP8151_FALLBACK.clone()
+        } else {
+            PRECOMPILE_ID_CHEAT_ECRECOVER.clone()
+        };
+        Self { cheats, fallback, precompile_id }
     }
 }
 
 impl Precompile for CheatEcrecover {
     fn call(&self, input: PrecompileInput<'_>) -> PrecompileResult {
         if !self.cheats.has_recover_overrides() {
-            return Ok(call_eth_precompile(ec_recover_run, input.data, input.gas, input.reservoir));
+            return self.fallback.call(input);
         }
 
         const ECRECOVER_BASE: u64 = 3_000;
         if input.gas < ECRECOVER_BASE {
             return Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, input.reservoir));
         }
-        let padded = right_pad::<128>(input.data);
-        let v = padded[63];
-        let mut sig_bytes = [0u8; 65];
-        sig_bytes[..64].copy_from_slice(&padded[64..128]);
-        sig_bytes[64] = v;
-        let sig_bytes_wrapped = Bytes::copy_from_slice(&sig_bytes);
-        if let Some(addr) = self.cheats.get_recover_override(&sig_bytes_wrapped) {
+        let signature = ecrecover_signature(input.data);
+        if let Some(addr) = self.cheats.get_recover_override(&signature) {
             let mut out = [0u8; 32];
             out[12..].copy_from_slice(addr.as_slice());
             return Ok(PrecompileOutput::new(
@@ -183,11 +197,11 @@ impl Precompile for CheatEcrecover {
                 input.reservoir,
             ));
         }
-        Ok(call_eth_precompile(ec_recover_run, input.data, input.gas, input.reservoir))
+        self.fallback.call(input)
     }
 
     fn precompile_id(&self) -> &PrecompileId {
-        &PRECOMPILE_ID_CHEAT_ECRECOVER
+        &self.precompile_id
     }
 
     fn supports_caching(&self) -> bool {
@@ -196,9 +210,11 @@ impl Precompile for CheatEcrecover {
 }
 
 /// A custom ecrecover precompile that supports cheat-based signature overrides.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CheatEcrecover {
     cheats: Arc<CheatsManager>,
+    fallback: DynPrecompile,
+    precompile_id: PrecompileId,
 }
 
 #[cfg(test)]

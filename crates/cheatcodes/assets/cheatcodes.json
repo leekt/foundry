@@ -328,7 +328,12 @@
         {
           "name": "gasLimit",
           "ty": "uint64",
-          "description": "Gas limit allotted to the frame."
+          "description": "Execution gas limit allotted to the frame (`limits.execution`)."
+        },
+        {
+          "name": "stateGasLimit",
+          "ty": "uint64",
+          "description": "State gas limit allotted to the frame (`limits.state`, EIP-8037)."
         },
         {
           "name": "value",
@@ -344,6 +349,16 @@
           "name": "status",
           "ty": "uint8",
           "description": "Execution status: 0 failed, 1 success, 2 skipped. Only meaningful for a\n frame before the one currently executing."
+        },
+        {
+          "name": "executionGasUsed",
+          "ty": "uint64",
+          "description": "Execution gas recorded in the frame's receipt (`gas_used.execution`).\n Only meaningful for a frame before the one currently executing."
+        },
+        {
+          "name": "stateGasUsed",
+          "ty": "uint64",
+          "description": "State gas attributed to the frame's receipt (`gas_used.state`).\n Only meaningful for a frame before the one currently executing."
         }
       ]
     },
@@ -562,17 +577,22 @@
         {
           "name": "legacyNonce",
           "ty": "uint64",
-          "description": "Sender's legacy account nonce in the transaction pre-state, reported by\n `TXPARAM(0x0C)`."
+          "description": "Sender's legacy account nonce in the transaction pre-state, reported by\n fixture `TXPARAM(0x80)`."
         },
         {
           "name": "nonceKeys",
           "ty": "uint256[]",
-          "description": "Canonically ordered EIP-8250 nonce keys. Their count is reported by\n `TXPARAM(0x0D)` and the first key by `TXPARAM(0x10)`."
+          "description": "Canonically ordered EIP-8250 nonce keys. Their count is reported by\n fixture `TXPARAM(0x81)` and the first key by fixture `TXPARAM(0x84)`."
         },
         {
           "name": "nonceKeysHash",
           "ty": "bytes32",
-          "description": "Canonical hash of `nonceKeys`, reported by `TXPARAM(0x0E)`."
+          "description": "Canonical hash of `nonceKeys`, reported by fixture `TXPARAM(0x82)`."
+        },
+        {
+          "name": "stateGasLeft",
+          "ty": "uint64",
+          "description": "State gas remaining in the currently executing frame, reported by\n `TXPARAM(0x0C)`."
         },
         {
           "name": "sigHash",
@@ -622,7 +642,7 @@
         {
           "name": "recentRootReferences",
           "ty": "FrameTxRecentRootReference[]",
-          "description": "Verified recent-root references in transaction order. Their count is\n reported by `TXPARAM(0x0F)`."
+          "description": "Verified recent-root references in transaction order. Their count is\n reported by fixture `TXPARAM(0x83)`."
         },
         {
           "name": "trace",
@@ -11349,13 +11369,13 @@
         "declaration": "function setFrameTx(FrameTx calldata frameTx) external;",
         "visibility": "external",
         "mutability": "",
-        "signature": "setFrameTx((address,uint64,uint64,uint256[],bytes32,bytes32,uint256,uint256,uint256,uint256,uint64,uint64,(uint8,uint8,address,uint64,uint256,bytes,uint8)[],(uint8,address,bytes32,bytes)[],(bytes32,uint64,bytes32)[],((address,uint256,uint256)[],(address,uint256,uint256,uint256)[],(address,bytes32)[],(address,bool,bytes32,bytes32)[],(address,bytes32[],bytes)[],uint256,address),uint64))",
-        "selector": "0xdd313d9d",
+        "signature": "setFrameTx((address,uint64,uint64,uint256[],bytes32,uint64,bytes32,uint256,uint256,uint256,uint256,uint64,uint64,(uint8,uint8,address,uint64,uint64,uint256,bytes,uint8,uint64,uint64)[],(uint8,address,bytes32,bytes)[],(bytes32,uint64,bytes32)[],((address,uint256,uint256)[],(address,uint256,uint256,uint256)[],(address,bytes32)[],(address,bool,bytes32,bytes32)[],(address,bytes32[],bytes)[],uint256,address),uint64))",
+        "selector": "0x79658304",
         "selectorBytes": [
-          221,
-          49,
-          61,
-          157
+          121,
+          101,
+          131,
+          4
         ]
       },
       "group": "evm",

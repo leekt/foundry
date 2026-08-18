@@ -185,8 +185,10 @@ interface Vm {
         uint8 flags;
         /// The frame's target, already resolved (a null target resolves to the sender).
         address target;
-        /// Gas limit allotted to the frame.
+        /// Execution gas limit allotted to the frame (`limits.execution`).
         uint64 gasLimit;
+        /// State gas limit allotted to the frame (`limits.state`, EIP-8037).
+        uint64 stateGasLimit;
         /// Value transferred by the frame.
         uint256 value;
         /// Calldata supplied to the frame.
@@ -194,6 +196,12 @@ interface Vm {
         /// Execution status: 0 failed, 1 success, 2 skipped. Only meaningful for a
         /// frame before the one currently executing.
         uint8 status;
+        /// Execution gas recorded in the frame's receipt (`gas_used.execution`).
+        /// Only meaningful for a frame before the one currently executing.
+        uint64 executionGasUsed;
+        /// State gas attributed to the frame's receipt (`gas_used.state`).
+        /// Only meaningful for a frame before the one currently executing.
+        uint64 stateGasUsed;
     }
 
     /// A signature entry of an EIP-8141 frame transaction, as reported by `SIGPARAM`.
@@ -299,13 +307,16 @@ interface Vm {
         /// Shared keyed-nonce sequence (`nonce_seq`), reported by `TXPARAM(0x01)`.
         uint64 nonce;
         /// Sender's legacy account nonce in the transaction pre-state, reported by
-        /// `TXPARAM(0x0C)`.
+        /// fixture `TXPARAM(0x80)`.
         uint64 legacyNonce;
         /// Canonically ordered EIP-8250 nonce keys. Their count is reported by
-        /// `TXPARAM(0x0D)` and the first key by `TXPARAM(0x10)`.
+        /// fixture `TXPARAM(0x81)` and the first key by fixture `TXPARAM(0x84)`.
         uint256[] nonceKeys;
-        /// Canonical hash of `nonceKeys`, reported by `TXPARAM(0x0E)`.
+        /// Canonical hash of `nonceKeys`, reported by fixture `TXPARAM(0x82)`.
         bytes32 nonceKeysHash;
+        /// State gas remaining in the currently executing frame, reported by
+        /// `TXPARAM(0x0C)`.
+        uint64 stateGasLeft;
         /// The canonical signature hash, reported by `TXPARAM(0x08)`.
         bytes32 sigHash;
         /// Maximum cost the payer may be charged, reported by `TXPARAM(0x06)`.
@@ -325,7 +336,7 @@ interface Vm {
         /// Every signature entry, in order.
         FrameTxSignature[] signatures;
         /// Verified recent-root references in transaction order. Their count is
-        /// reported by `TXPARAM(0x0F)`.
+        /// reported by fixture `TXPARAM(0x83)`.
         FrameTxRecentRootReference[] recentRootReferences;
         /// Transaction-local state diff and event trace as of the current frame.
         FrameTxTrace trace;

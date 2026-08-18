@@ -599,10 +599,13 @@ impl Cheatcode for setFrameTxCall {
                     FRAME_TX_ENTRY_POINT_ADDRESS
                 },
                 gas_limit: f.gasLimit,
+                state_gas_limit: f.stateGasLimit,
                 mode: f.mode,
                 flags: f.flags,
                 value: f.value,
                 status: f.status,
+                execution_gas_used: f.executionGasUsed,
+                state_gas_used: f.stateGasUsed,
                 data: f.data.clone(),
             })
             .collect();
@@ -694,6 +697,7 @@ impl Cheatcode for setFrameTxCall {
             max_fee_per_gas: frameTx.maxFeePerGas,
             max_fee_per_blob_gas: frameTx.maxFeePerBlobGas,
             blob_count: frameTx.blobCount,
+            state_gas_left: frameTx.stateGasLeft,
             frame_index: frameTx.frameIndex,
             frames,
             signatures,

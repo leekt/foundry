@@ -240,7 +240,7 @@ mod tests {
     fn frame_receipt_conversion_requires_and_preserves_nested_receipts() {
         let bloom = "00".repeat(256);
         let json = format!(
-            r#"{{"type":"0x6","status":"0x1","cumulativeGasUsed":"0x5208","logs":[],"logsBloom":"0x{bloom}","transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000001","transactionIndex":"0x0","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000002","blockNumber":"0x1","gasUsed":"0x5208","effectiveGasPrice":"0x1","from":"0x2222222222222222222222222222222222222222","to":"0x3333333333333333333333333333333333333333","contractAddress":null,"payer":"0x1111111111111111111111111111111111111111","frameReceipts":[{{"status":"0x1","gasUsed":"0x10","logs":[]}},{{"status":"0x2","gasUsed":"0x0","logs":[]}}]}}"#
+            r#"{{"type":"0x6","status":"0x1","cumulativeGasUsed":"0x5208","logs":[],"logsBloom":"0x{bloom}","transactionHash":"0x0000000000000000000000000000000000000000000000000000000000000001","transactionIndex":"0x0","blockHash":"0x0000000000000000000000000000000000000000000000000000000000000002","blockNumber":"0x1","gasUsed":"0x5208","effectiveGasPrice":"0x1","from":"0x2222222222222222222222222222222222222222","to":"0x3333333333333333333333333333333333333333","contractAddress":null,"payer":"0x1111111111111111111111111111111111111111","frameReceipts":[{{"status":"0x1","executionGasUsed":"0x10","stateGasUsed":"0x7","logs":[]}},{{"status":"0x2","executionGasUsed":"0x0","stateGasUsed":"0x0","logs":[]}}]}}"#
         );
         let receipt: AnyTransactionReceipt = serde_json::from_str(&json).unwrap();
 
@@ -261,8 +261,10 @@ mod tests {
         let receipt: AnyTransactionReceipt = serde_json::from_str(&missing_payer).unwrap();
         assert!(FoundryTxReceipt::try_from(receipt).is_err());
 
-        let invalid_status =
-            json.replace(r#""status":"0x2","gasUsed":"0x0""#, r#""status":"0x3","gasUsed":"0x0""#);
+        let invalid_status = json.replace(
+            r#""status":"0x2","executionGasUsed":"0x0""#,
+            r#""status":"0x3","executionGasUsed":"0x0""#,
+        );
         let receipt: AnyTransactionReceipt = serde_json::from_str(&invalid_status).unwrap();
         assert!(FoundryTxReceipt::try_from(receipt).is_err());
     }

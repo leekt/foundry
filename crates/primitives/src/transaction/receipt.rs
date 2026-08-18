@@ -7,7 +7,7 @@ use alloy_network::eip2718::{
     Eip2718Error, Encodable2718, LEGACY_TX_TYPE_ID,
 };
 use alloy_primitives::{Address, Bloom, Log, TxHash, logs_bloom};
-use alloy_rlp::{BufMut, Decodable, Encodable, Header, bytes};
+use alloy_rlp::{BufMut, Decodable, Encodable, Header, bytes, length_of_length};
 use alloy_rpc_types::{BlockNumHash, trace::otterscan::OtsReceipt};
 #[cfg(feature = "optimism")]
 use op_alloy_consensus::{
@@ -25,9 +25,14 @@ pub struct FrameReceipt<T = Log> {
     /// Top-level frame return status (`0` failed, `1` succeeded, `2` skipped).
     #[serde(with = "alloy_serde::quantity")]
     pub status: u8,
-    /// Gross gas used by this frame, before transaction-level refunds.
+    /// Gross execution gas used by this frame (`gas_used.execution`), before
+    /// transaction-level refunds.
     #[serde(with = "alloy_serde::quantity")]
-    pub gas_used: u64,
+    pub execution_gas_used: u64,
+    /// Final state gas attributed to this frame (`gas_used.state`), after all
+    /// state-gas refills and rollbacks in the transaction have been applied.
+    #[serde(with = "alloy_serde::quantity", default)]
+    pub state_gas_used: u64,
     /// Canonical logs retained by this frame.
     pub logs: Vec<T>,
 }
@@ -37,23 +42,38 @@ impl<T> FrameReceipt<T> {
     pub fn map_logs<U>(self, f: impl FnMut(T) -> U) -> FrameReceipt<U> {
         FrameReceipt {
             status: self.status,
-            gas_used: self.gas_used,
+            execution_gas_used: self.execution_gas_used,
+            state_gas_used: self.state_gas_used,
             logs: self.logs.into_iter().map(f).collect(),
         }
+    }
+
+    /// Payload length of the nested `gas_used = [execution, state]` list.
+    fn gas_used_payload_length(&self) -> usize {
+        self.execution_gas_used.length() + self.state_gas_used.length()
+    }
+
+    fn rlp_payload_length(&self) -> usize
+    where
+        T: Encodable,
+    {
+        let gas_used = self.gas_used_payload_length();
+        self.status.length() + gas_used + length_of_length(gas_used) + self.logs.length()
     }
 }
 
 impl<T: Encodable> Encodable for FrameReceipt<T> {
     fn encode(&self, out: &mut dyn BufMut) {
-        let payload_length = self.status.length() + self.gas_used.length() + self.logs.length();
-        Header { list: true, payload_length }.encode(out);
+        Header { list: true, payload_length: self.rlp_payload_length() }.encode(out);
         self.status.encode(out);
-        self.gas_used.encode(out);
+        Header { list: true, payload_length: self.gas_used_payload_length() }.encode(out);
+        self.execution_gas_used.encode(out);
+        self.state_gas_used.encode(out);
         self.logs.encode(out);
     }
 
     fn length(&self) -> usize {
-        let payload_length = self.status.length() + self.gas_used.length() + self.logs.length();
+        let payload_length = self.rlp_payload_length();
         Header { list: true, payload_length }.length_with_payload()
     }
 }
@@ -65,11 +85,15 @@ impl<T: Decodable> Decodable for FrameReceipt<T> {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining = buf.len();
-        let receipt = Self {
-            status: Decodable::decode(buf)?,
-            gas_used: Decodable::decode(buf)?,
-            logs: Decodable::decode(buf)?,
-        };
+        let status = Decodable::decode(buf)?;
+        let mut gas_used = Header::decode_bytes(buf, true)?;
+        let execution_gas_used = Decodable::decode(&mut gas_used)?;
+        let state_gas_used = Decodable::decode(&mut gas_used)?;
+        if !gas_used.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
+        let receipt =
+            Self { status, execution_gas_used, state_gas_used, logs: Decodable::decode(buf)? };
         if receipt.status > 2 || buf.len() + header.payload_length != remaining {
             return Err(alloy_rlp::Error::UnexpectedLength);
         }
@@ -257,7 +281,8 @@ impl FoundryReceiptEnvelope<Log> {
                 .iter()
                 .map(|frame| FrameReceipt {
                     status: frame.status,
-                    gas_used: frame.gas_used,
+                    execution_gas_used: frame.execution_gas_used,
+                    state_gas_used: frame.state_gas_used,
                     logs: frame
                         .logs
                         .iter()
@@ -786,13 +811,30 @@ mod tests {
             21_000,
             payer,
             vec![
-                FrameReceipt { status: 1, gas_used: 16, logs: Vec::new() },
-                FrameReceipt { status: 0, gas_used: 0, logs: Vec::new() },
-                FrameReceipt { status: 2, gas_used: 0, logs: Vec::new() },
+                FrameReceipt {
+                    status: 1,
+                    execution_gas_used: 16,
+                    state_gas_used: 7,
+                    logs: Vec::new(),
+                },
+                FrameReceipt {
+                    status: 0,
+                    execution_gas_used: 0,
+                    state_gas_used: 0,
+                    logs: Vec::new(),
+                },
+                FrameReceipt {
+                    status: 2,
+                    execution_gas_used: 0,
+                    state_gas_used: 0,
+                    logs: Vec::new(),
+                },
             ],
         );
-        let expected =
-            hex!("06e5825208941111111111111111111111111111111111111111ccc30110c0c38080c0c30280c0");
+        // `gas_used` is the nested `[execution, state]` list per frame receipt.
+        let expected = hex!(
+            "06eb825208941111111111111111111111111111111111111111d2c501c21007c0c580c28080c0c502c28080c0"
+        );
 
         let encoded = receipt.encoded_2718();
         assert_eq!(encoded, expected);

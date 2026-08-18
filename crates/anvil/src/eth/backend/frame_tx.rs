@@ -17,7 +17,9 @@ use crate::eth::backend::mem::inspector::{
 use alloy_consensus::Transaction as _;
 use alloy_evm::{Evm, eth::EthEvm};
 use alloy_primitives::{Address, B256, Log, TxKind, U256, keccak256};
-use foundry_primitives::{ENTRY_POINT_ADDRESS, Frame, FrameReceipt, TxFrame, flags, mode};
+use foundry_primitives::{
+    ENTRY_POINT_ADDRESS, Frame, FrameReceipt, TxFrame, flags, frame_gas, mode,
+};
 #[cfg(test)]
 use foundry_primitives::{EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE};
 use revm::{
@@ -80,9 +82,17 @@ pub enum FrameExecutionError {
     /// The concrete EVM journal cannot begin an outer frame transaction.
     #[error("frame transaction lifecycle is unavailable")]
     LifecycleUnavailable,
-    /// The pinned scalar frame-gas draft does not define Amsterdam state-gas semantics.
-    #[error("scalar frame gas does not support Amsterdam state-gas rules")]
+    /// The frame-gas model here does not compose with Amsterdam node-level
+    /// state-gas semantics.
+    #[error("frame gas does not support Amsterdam state-gas rules")]
     StateGasUnsupported,
+    /// An `APPROVE` that had to create the sender could not cover the
+    /// account-creation state-gas charge from the approving frame's budget.
+    #[error("frame {index} exhausted its state gas during APPROVE")]
+    StateGasExhausted {
+        /// Index of the offending frame.
+        index: usize,
+    },
     /// Final settlement exceeded the amount collected from the payer.
     #[error("charged fee exceeds precharged maximum")]
     ChargedExceedsMaxCost,
@@ -396,14 +406,35 @@ fn legacy_nonce_keys_hash() -> B256 {
     keccak256(preimage)
 }
 
+/// `SYSTEM_ADDRESS` (EIP-4788), the emitter of EIP-7708 transfer logs.
+const SYSTEM_ADDRESS: Address =
+    Address::new(alloy_primitives::hex!("fffffffffffffffffffffffffffffffffffffffe"));
+
+/// `keccak256("Transfer(address,address,uint256)")` (EIP-7708 topic 0).
+const TRANSFER_TOPIC: B256 = B256::new(alloy_primitives::hex!(
+    "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+));
+
+/// The EIP-7708 transfer log a value-bearing frame emits before any EVM logs.
+fn eth_transfer_log(from: Address, to: Address, value: U256) -> Log {
+    Log::new_unchecked(
+        SYSTEM_ADDRESS,
+        vec![TRANSFER_TOPIC, from.into_word(), to.into_word()],
+        value.to_be_bytes::<32>().to_vec().into(),
+    )
+}
+
 /// Builds the frame-transaction context the introspection opcodes read.
 ///
-/// `frame_index` and `approvable_scopes` are the only per-frame parts; the rest
-/// describes the whole transaction.
+/// `frame_index`, `state_gas_left` and `approvable_scopes` are the only
+/// per-frame parts; the rest describes the whole transaction. Receipt gas of
+/// already-completed frames is read from `receipts`.
 fn build_context(
     tx: &TxFrame,
     frame_index: usize,
     statuses: &[u8],
+    receipts: &[FrameReceipt],
+    state_gas_left: u64,
     max_cost: U256,
 ) -> FrameTxContext {
     let frames = tx
@@ -418,10 +449,13 @@ fn build_context(
                 ENTRY_POINT_ADDRESS
             },
             gas_limit: frame.gas_limit,
+            state_gas_limit: frame.state_gas_limit,
             mode: frame.mode,
             flags: frame.flags,
             value: frame.value,
             status: statuses.get(i).copied().unwrap_or(STATUS_FAILED),
+            execution_gas_used: receipts.get(i).map_or(0, |receipt| receipt.execution_gas_used),
+            state_gas_used: receipts.get(i).map_or(0, |receipt| receipt.state_gas_used),
             data: frame.data.clone(),
         })
         .collect();
@@ -454,6 +488,7 @@ fn build_context(
         max_fee_per_gas: tx.max_fee_per_gas,
         max_fee_per_blob_gas: tx.max_fee_per_blob_gas,
         blob_count: tx.blob_versioned_hashes.len() as u64,
+        state_gas_left,
         frame_index: frame_index as u64,
         frames,
         signatures,
@@ -560,6 +595,7 @@ where
     let mut statuses = vec![STATUS_FAILED; tx.frames.len()];
     let mut frame_receipts = Vec::with_capacity(tx.frames.len());
     let mut frame_gas_total = 0u64;
+    let mut frame_state_total = 0u64;
     let mut refund_counter = 0i64;
 
     // Frames run one atomic batch at a time. A batch is the maximal contiguous
@@ -602,103 +638,166 @@ where
                 .map_err(|message| FrameExecutionError::Evm { index, message })?
                 .nonce;
 
-            // Scope the opcode context to this frame. Dropping the guard restores
-            // an outer context even when execution errors or unwinds.
-            evm.inspector_mut().watch_frame_approval(
-                resolved_target,
-                tx.sender,
-                (frame.flags & flags::APPROVE_EXECUTION_PAYMENT) as u64,
-                max_cost,
-                approval,
-            );
-            let outcome = {
-                let _frame_context =
-                    install_frame_tx_context(build_context(tx, index, &statuses, max_cost));
-                evm.transact_raw(frame_env(tx, frame, caller, caller_nonce))
-            };
+            // EIP-8037 frame gas pools. The toolkit meters the state dimension
+            // for the charges EIP-8141 itself defines -- account creation by a
+            // value-bearing frame and sender creation by APPROVE. Opcode-level
+            // EIP-8037 charges (SSTORE, code deposit) are not modeled here.
+            let mut state_gas_left = frame.state_gas_limit;
+            let payer_before = approval.payer;
+            let sender_missing = account_missing(evm, tx.sender, index)?;
+            let mut halted_on_state_gas = false;
+            if !frame.value.is_zero() && account_missing(evm, resolved_target, index)? {
+                if state_gas_left < frame_gas::NEW_ACCOUNT_STATE_GAS {
+                    // A charge exceeding its pool is an exceptional halt of the
+                    // frame, consuming its execution pool.
+                    halted_on_state_gas = true;
+                } else {
+                    state_gas_left -= frame_gas::NEW_ACCOUNT_STATE_GAS;
+                }
+            }
 
-            let observed = evm
-                .inspector_mut()
-                .take_frame_approval()
-                .expect("frame approval watcher was installed");
-            approval = observed.state;
+            let mut succeeded;
+            let gross_gas_used;
+            let mut frame_logs;
+            if halted_on_state_gas {
+                succeeded = false;
+                gross_gas_used = frame.gas_limit;
+                frame_logs = Vec::new();
+            } else {
+                // Scope the opcode context to this frame. Dropping the guard
+                // restores an outer context even when execution errors or
+                // unwinds.
+                evm.inspector_mut().watch_frame_approval(
+                    resolved_target,
+                    tx.sender,
+                    (frame.flags & flags::APPROVE_EXECUTION_PAYMENT) as u64,
+                    max_cost,
+                    approval,
+                );
+                let outcome = {
+                    let _frame_context = install_frame_tx_context(build_context(
+                        tx,
+                        index,
+                        &statuses,
+                        &frame_receipts,
+                        state_gas_left,
+                        max_cost,
+                    ));
+                    evm.transact_raw(frame_env(tx, frame, caller, caller_nonce))
+                };
 
-            // `transact_raw` has already finalized this frame call through the
-            // active REVM lifecycle. Its returned state is observational only;
-            // the outer journal remains the source of truth.
-            let ResultAndState { result, state: _ } = outcome
-                .map_err(|err| FrameExecutionError::Evm { index, message: format!("{err:?}") })?;
+                let observed = evm
+                    .inspector_mut()
+                    .take_frame_approval()
+                    .expect("frame approval watcher was installed");
+                approval = observed.state;
 
-            let mut succeeded = result.is_success();
-            let gross_gas_used = result.gas().total_gas_spent();
+                // `transact_raw` has already finalized this frame call through
+                // the active REVM lifecycle. Its returned state is observational
+                // only; the outer journal remains the source of truth.
+                let ResultAndState { result, state: _ } = outcome.map_err(|err| {
+                    FrameExecutionError::Evm { index, message: format!("{err:?}") }
+                })?;
+
+                succeeded = result.is_success();
+                gross_gas_used = result.gas().total_gas_spent();
+                frame_logs = result.logs().to_vec();
+
+                // An account with no code of its own still validates frame
+                // transactions, through the protocol-defined default code. In
+                // DEFAULT and SENDER mode that is a plain empty-code call, which
+                // is what just ran; only VERIFY mode carries extra semantics.
+                let uses_default_verify = succeeded
+                    && frame.mode == mode::VERIFY
+                    && observed.attempts.is_empty()
+                    && target_has_no_code(evm, resolved_target, index)?;
+                let default_scope = uses_default_verify
+                    .then(|| default_verify_scope(tx, frame, resolved_target))
+                    .flatten();
+
+                // Empty-code VERIFY executes the protocol's synthetic APPROVE.
+                // Its validation failure is a VERIFY revert, not merely an
+                // absent payer.
+                let mut validated_approval = None;
+                if uses_default_verify {
+                    if let Some(scope) = default_scope {
+                        match validate_default_approval(
+                            evm,
+                            tx,
+                            frame,
+                            resolved_target,
+                            scope,
+                            max_cost,
+                            &approval,
+                            index,
+                        )? {
+                            Some(validated) => validated_approval = Some(validated),
+                            None => succeeded = false,
+                        }
+                    } else {
+                        succeeded = false;
+                    }
+                }
+
+                if let Some(validated) = validated_approval
+                    && !apply_default_approval(
+                        evm,
+                        validated,
+                        tx.sender,
+                        max_cost,
+                        &mut approval,
+                        index,
+                    )?
+                {
+                    succeeded = false;
+                }
+
+                if succeeded {
+                    refund_counter = refund_counter
+                        .checked_add(observed.refund_counter)
+                        .ok_or(FrameExecutionError::GasOverflow)?;
+                }
+            }
             frame_gas_total = frame_gas_total
                 .checked_add(gross_gas_used)
                 .ok_or(FrameExecutionError::GasOverflow)?;
 
-            // An account with no code of its own still validates frame
-            // transactions, through the protocol-defined default code. In DEFAULT
-            // and SENDER mode that is a plain empty-code call, which is what just
-            // ran; only VERIFY mode carries extra semantics.
-            let uses_default_verify = succeeded
-                && frame.mode == mode::VERIFY
-                && observed.attempts.is_empty()
-                && target_has_no_code(evm, resolved_target, index)?;
-            let default_scope = uses_default_verify
-                .then(|| default_verify_scope(tx, frame, resolved_target))
-                .flatten();
-
-            // Empty-code VERIFY executes the protocol's synthetic APPROVE. Its
-            // validation failure is a VERIFY revert, not merely an absent payer.
-            let mut validated_approval = None;
-            if uses_default_verify {
-                if let Some(scope) = default_scope {
-                    match validate_default_approval(
-                        evm,
-                        tx,
-                        frame,
-                        resolved_target,
-                        scope,
-                        max_cost,
-                        &approval,
-                        index,
-                    )? {
-                        Some(validated) => validated_approval = Some(validated),
-                        None => succeeded = false,
-                    }
-                } else {
-                    succeeded = false;
+            // Incrementing the nonce of a non-existent sender created the
+            // account: charge `STATE_BYTES_PER_NEW_ACCOUNT * CPSB` from the
+            // approving frame's state budget. A pool that cannot cover the
+            // charge invalidates the transaction, as approval effects cannot
+            // stand without the charge.
+            if succeeded && sender_missing && payer_before.is_none() && approval.payer.is_some() {
+                if state_gas_left < frame_gas::NEW_ACCOUNT_STATE_GAS {
+                    return Err(FrameExecutionError::StateGasExhausted { index });
                 }
-            }
-
-            if let Some(validated) = validated_approval
-                && !apply_default_approval(
-                    evm,
-                    validated,
-                    tx.sender,
-                    max_cost,
-                    &mut approval,
-                    index,
-                )?
-            {
-                succeeded = false;
+                state_gas_left -= frame_gas::NEW_ACCOUNT_STATE_GAS;
             }
 
             if succeeded {
                 statuses[index] = STATUS_SUCCESS;
-                refund_counter = refund_counter
-                    .checked_add(observed.refund_counter)
-                    .ok_or(FrameExecutionError::GasOverflow)?;
+                // A non-zero value transfer to an address other than the sender
+                // emits the EIP-7708 transfer log, before the frame's EVM logs.
+                if !frame.value.is_zero() && resolved_target != tx.sender {
+                    frame_logs.insert(0, eth_transfer_log(tx.sender, resolved_target, frame.value));
+                }
             } else {
-                // A failed frame keeps its gas but loses its state changes. A
-                // reverting VERIFY frame invalidates the whole transaction.
+                // A failed frame keeps its execution gas but loses its state
+                // changes, including its attributed state gas. A reverting
+                // VERIFY frame invalidates the whole transaction.
                 if frame.mode == mode::VERIFY {
                     return Err(FrameExecutionError::VerifyFailed { index });
                 }
             }
+            let state_gas_used = if succeeded { frame.state_gas_limit - state_gas_left } else { 0 };
+            frame_state_total = frame_state_total
+                .checked_add(state_gas_used)
+                .ok_or(FrameExecutionError::GasOverflow)?;
             frame_receipts.push(FrameReceipt {
                 status: statuses[index],
-                gas_used: gross_gas_used,
-                logs: result.logs().to_vec(),
+                execution_gas_used: gross_gas_used,
+                state_gas_used,
+                logs: frame_logs,
             });
 
             if !succeeded {
@@ -714,15 +813,20 @@ where
             evm.frame_transaction_checkpoint_revert(checkpoint);
             approval = approval_before_batch;
             refund_counter = refund_before_batch;
+            // Unrolling the batch removes state-gas charges attributed to its
+            // frames from their receipts, along with their logs.
             for receipt in &mut frame_receipts[start..] {
                 receipt.logs.clear();
+                frame_state_total -= receipt.state_gas_used;
+                receipt.state_gas_used = 0;
             }
             for status in &mut statuses[failed + 1..=batch_end] {
                 *status = STATUS_SKIPPED;
-                // A skipped frame's gas allotment is left unspent.
+                // A skipped frame's gas allotments are left unspent.
                 frame_receipts.push(FrameReceipt {
                     status: STATUS_SKIPPED,
-                    gas_used: 0,
+                    execution_gas_used: 0,
+                    state_gas_used: 0,
                     logs: Vec::new(),
                 });
             }
@@ -734,23 +838,38 @@ where
 
     let payer = approval.payer.ok_or(FrameExecutionError::NoPayer)?;
 
-    // The transaction is charged the greater of what the frames actually used
-    // (plus the fixed overhead) and the calldata floor.
+    // Settlement (EIP-8141 gas accounting): the intrinsic overhead plus what
+    // the frames actually used in both dimensions, refund-capped, with the
+    // calldata floor compared against the execution component alone. State gas
+    // never absorbs into the data floor.
     let overhead = standard_gas.saturating_sub(tx.sum_frame_gas().unwrap_or(0));
-    let gas_used_before_refund =
-        frame_gas_total.checked_add(overhead).ok_or(FrameExecutionError::GasOverflow)?;
+    let gas_used_before_refund = frame_gas_total
+        .checked_add(frame_state_total)
+        .and_then(|used| used.checked_add(overhead))
+        .ok_or(FrameExecutionError::GasOverflow)?;
     let applied_refund =
         u64::try_from(refund_counter).unwrap_or_default().min(gas_used_before_refund / 5);
-    let gas_used =
-        gas_used_before_refund.saturating_sub(applied_refund).max(floor_gas).min(max_gas);
+    let gas_used_after_refund = gas_used_before_refund.saturating_sub(applied_refund);
+    let tx_execution_gas = gas_used_after_refund.saturating_sub(frame_state_total).max(floor_gas);
+    let gas_used = tx_execution_gas.saturating_add(frame_state_total).min(max_gas);
 
     settle_fee(evm, tx, payer, gas_used, max_cost, blob_base_fee)?;
-    let (state, logs) = evm.finish_frame_transaction();
+    let (state, journal_logs) = evm.finish_frame_transaction();
     evm.inspector_mut().finish_frame_transaction_trace(gas_used);
+    // Synthesized EIP-7708 transfer logs live only in the frame receipts; the
+    // journal carries everything the EVM emitted.
     debug_assert_eq!(
-        logs,
-        frame_receipts.iter().flat_map(|receipt| receipt.logs.iter().cloned()).collect::<Vec<_>>()
+        journal_logs,
+        frame_receipts
+            .iter()
+            .flat_map(|receipt| receipt.logs.iter().filter(|log| log.address != SYSTEM_ADDRESS))
+            .cloned()
+            .collect::<Vec<_>>()
     );
+    // The transaction-level log view is the frame receipts' concatenation,
+    // transfer logs included.
+    let logs =
+        frame_receipts.iter().flat_map(|receipt| receipt.logs.iter().cloned()).collect::<Vec<_>>();
 
     // The transaction as a whole succeeds once a payer is established; an
     // individual frame's failure is reported in its own frame result, exactly
@@ -785,6 +904,26 @@ where
         .map_err(|message| FrameExecutionError::Evm { index, message })?;
     Ok(info.code_hash == alloy_primitives::KECCAK256_EMPTY
         || info.code_hash == alloy_primitives::B256::ZERO)
+}
+
+/// Reports whether an account does not exist under the EIP-8037 existence
+/// rule: no balance, no nonce and no code. Creating such an account charges
+/// `STATE_BYTES_PER_NEW_ACCOUNT * CPSB` state gas.
+fn account_missing<E>(
+    evm: &mut E,
+    address: Address,
+    index: usize,
+) -> Result<bool, FrameExecutionError>
+where
+    E: Evm<Tx = TxEnv> + SuspendFeeRules,
+{
+    let info = evm
+        .frame_transaction_account_info(address)
+        .map_err(|message| FrameExecutionError::Evm { index, message })?;
+    Ok(info.balance.is_zero()
+        && info.nonce == 0
+        && (info.code_hash == alloy_primitives::KECCAK256_EMPTY
+            || info.code_hash == alloy_primitives::B256::ZERO))
 }
 
 /// The EIP-8141 default code for a `VERIFY` frame whose target carries no code.
@@ -1304,7 +1443,7 @@ mod tests {
             ..Default::default()
         };
 
-        let context = build_context(&tx, 0, &[], U256::from(123));
+        let context = build_context(&tx, 0, &[], &[], 0, U256::from(123));
 
         assert_eq!(context.nonce, 42);
         assert_eq!(context.max_cost, U256::from(123));
@@ -1622,11 +1761,11 @@ mod tests {
                 STATUS_FAILED,
             ]
         );
-        assert_eq!(outcome.frame_receipts[1].gas_used, 2_600);
-        assert_eq!(outcome.frame_receipts[2].gas_used, 100);
-        assert_eq!(outcome.frame_receipts[3].gas_used, 2_604);
-        assert_eq!(outcome.frame_receipts[4].gas_used, 2_604);
-        assert_eq!(outcome.frame_receipts[5].gas_used, 2_599);
+        assert_eq!(outcome.frame_receipts[1].execution_gas_used, 2_600);
+        assert_eq!(outcome.frame_receipts[2].execution_gas_used, 100);
+        assert_eq!(outcome.frame_receipts[3].execution_gas_used, 2_604);
+        assert_eq!(outcome.frame_receipts[4].execution_gas_used, 2_604);
+        assert_eq!(outcome.frame_receipts[5].execution_gas_used, 2_599);
     }
 
     #[test]
@@ -1668,8 +1807,102 @@ mod tests {
             frame_statuses(&outcome),
             [STATUS_SUCCESS, STATUS_SUCCESS, STATUS_FAILED, STATUS_SUCCESS]
         );
-        assert_eq!(outcome.frame_receipts[1].gas_used, 2_600);
-        assert_eq!(outcome.frame_receipts[3].gas_used, 2_600);
+        assert_eq!(outcome.frame_receipts[1].execution_gas_used, 2_600);
+        assert_eq!(outcome.frame_receipts[3].execution_gas_used, 2_600);
+    }
+
+    /// A value transfer to a missing account charges the frame's state budget
+    /// and every value frame to a non-sender target emits the EIP-7708 log.
+    #[test]
+    fn value_frame_state_gas_and_transfer_log() {
+        let sender = Address::repeat_byte(0x31);
+        let fresh = Address::repeat_byte(0x32);
+        let existing = Address::repeat_byte(0x33);
+        let mut evm = test_evm([
+            (sender, U256::MAX, 0, approver_code(flags::APPROVE_EXECUTION_PAYMENT, false)),
+            (existing, U256::ONE, 0, Bytecode::default()),
+        ]);
+        let tx = approval_tx(
+            sender,
+            0,
+            evm.chain_id(),
+            vec![
+                approval_frame(sender, mode::DEFAULT, flags::APPROVE_EXECUTION_PAYMENT, 0),
+                Frame {
+                    mode: mode::SENDER,
+                    target: Some(fresh),
+                    gas_limit: 30_000,
+                    state_gas_limit: frame_gas::NEW_ACCOUNT_STATE_GAS,
+                    value: U256::from(5u64),
+                    ..Default::default()
+                },
+                Frame {
+                    mode: mode::SENDER,
+                    target: Some(existing),
+                    gas_limit: 30_000,
+                    value: U256::from(5u64),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let outcome = execute_frame_tx(&mut evm, &tx).unwrap();
+
+        assert_eq!(frame_statuses(&outcome), [STATUS_SUCCESS, STATUS_SUCCESS, STATUS_SUCCESS]);
+        // Creating `fresh` cost the account-creation state gas; the transfer to
+        // the existing account cost none.
+        assert_eq!(outcome.frame_receipts[1].state_gas_used, frame_gas::NEW_ACCOUNT_STATE_GAS);
+        assert_eq!(outcome.frame_receipts[2].state_gas_used, 0);
+        // Both value frames emit the EIP-7708 transfer log first.
+        for (receipt, to) in
+            [(&outcome.frame_receipts[1], fresh), (&outcome.frame_receipts[2], existing)]
+        {
+            let log = receipt.logs.first().expect("transfer log");
+            assert_eq!(log.address, SYSTEM_ADDRESS);
+            assert_eq!(log.topics()[0], TRANSFER_TOPIC);
+            assert_eq!(log.topics()[1], sender.into_word());
+            assert_eq!(log.topics()[2], to.into_word());
+        }
+        // The transaction-level logs include the synthesized transfer logs.
+        assert_eq!(outcome.result.result.logs().len(), 2);
+    }
+
+    /// The account-creation charge exceeding the frame's state budget is an
+    /// exceptional halt: the execution pool is consumed and no state is used.
+    #[test]
+    fn value_frame_without_state_budget_halts() {
+        let sender = Address::repeat_byte(0x34);
+        let fresh = Address::repeat_byte(0x35);
+        let mut evm = test_evm([(
+            sender,
+            U256::MAX,
+            0,
+            approver_code(flags::APPROVE_EXECUTION_PAYMENT, false),
+        )]);
+        let tx = approval_tx(
+            sender,
+            0,
+            evm.chain_id(),
+            vec![
+                approval_frame(sender, mode::DEFAULT, flags::APPROVE_EXECUTION_PAYMENT, 0),
+                Frame {
+                    mode: mode::SENDER,
+                    target: Some(fresh),
+                    gas_limit: 30_000,
+                    state_gas_limit: frame_gas::NEW_ACCOUNT_STATE_GAS - 1,
+                    value: U256::from(5u64),
+                    ..Default::default()
+                },
+            ],
+        );
+
+        let outcome = execute_frame_tx(&mut evm, &tx).unwrap();
+
+        assert_eq!(frame_statuses(&outcome), [STATUS_SUCCESS, STATUS_FAILED]);
+        let halted = &outcome.frame_receipts[1];
+        assert_eq!(halted.execution_gas_used, 30_000);
+        assert_eq!(halted.state_gas_used, 0);
+        assert!(halted.logs.is_empty());
     }
 
     #[test]
@@ -1922,7 +2155,7 @@ mod tests {
                 evm.chain_id(),
                 vec![empty_approval_frame(sender, flags::APPROVE_EXECUTION_PAYMENT)],
             );
-            execute_and_commit(&mut evm, &tx).unwrap().frame_receipts[0].gas_used
+            execute_and_commit(&mut evm, &tx).unwrap().frame_receipts[0].execution_gas_used
         }
 
         // C_mem(256 words) - C_mem(1 word) = (3*256 + 256^2/512) - 3.

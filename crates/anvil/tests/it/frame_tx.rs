@@ -137,6 +137,7 @@ fn frame_tx(
         flags: flags::APPROVE_EXECUTION_PAYMENT,
         target: None, // null target == tx.sender
         gas_limit: 40_000,
+        state_gas_limit: 0,
         value: U256::ZERO,
         data: Bytes::new(),
     };
@@ -146,6 +147,7 @@ fn frame_tx(
             flags: *flags,
             target: Some(*target),
             gas_limit: 120_000,
+            state_gas_limit: 0,
             value: U256::ZERO,
             data: U256::from(MAGIC).to_be_bytes::<32>().into(),
         }))
@@ -259,6 +261,7 @@ async fn run_contract_approval_frame(
             flags: flags::APPROVE_EXECUTION_PAYMENT,
             target: None,
             gas_limit,
+            state_gas_limit: 0,
             value: U256::ZERO,
             data: U256::from(MAGIC).to_be_bytes::<32>().into(),
         }],
@@ -968,6 +971,7 @@ async fn run_sponsored_payment(displace_sponsor_signature: bool) -> (bool, bool,
             flags: flags::APPROVE_PAYMENT,
             target: Some(sponsor),
             gas_limit: 40_000,
+            state_gas_limit: 0,
             value: U256::ZERO,
             data: Bytes::new(),
         },

@@ -359,6 +359,11 @@ impl FromEvmVersion for SpecId {
             EvmVersion::Prague => Self::PRAGUE,
             EvmVersion::Osaka => Self::OSAKA,
             EvmVersion::Amsterdam => Self::AMSTERDAM,
+            // The experimental `@future` compiler surface targets the toolkit's
+            // pre-Amsterdam frame profile: Amsterdam's node-level state-gas
+            // rules would reject frame transactions, and the `@future` opcodes
+            // are spec-independent in the patched interpreter.
+            EvmVersion::Future => Self::PRAGUE,
         }
     }
 }
@@ -400,7 +405,7 @@ impl FromEvmVersion for OpSpecId {
             EvmVersion::Shanghai => Self::CANYON,
             EvmVersion::Cancun => Self::ECOTONE,
             EvmVersion::Prague => Self::ISTHMUS,
-            EvmVersion::Osaka | EvmVersion::Amsterdam => Self::KARST,
+            EvmVersion::Osaka | EvmVersion::Amsterdam | EvmVersion::Future => Self::KARST,
         }
     }
 }

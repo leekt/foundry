@@ -359,11 +359,13 @@ impl FromEvmVersion for SpecId {
             EvmVersion::Prague => Self::PRAGUE,
             EvmVersion::Osaka => Self::OSAKA,
             EvmVersion::Amsterdam => Self::AMSTERDAM,
-            // The experimental `@future` compiler surface targets the toolkit's
-            // pre-Amsterdam frame profile: Amsterdam's node-level state-gas
-            // rules would reject frame transactions, and the `@future` opcodes
-            // are spec-independent in the patched interpreter.
-            EvmVersion::Future => Self::PRAGUE,
+            // The toolkit deliberately executes `@future` bytecode with the
+            // pre-Amsterdam Osaka rules: Amsterdam's node-level state-gas rules
+            // would reject frame transactions, while Osaka activates P256VERIFY
+            // for WebAuthn validators. This is a runtime mapping, not a promise
+            // that every later opcode exposed by the experimental compiler is
+            // executable in this profile.
+            EvmVersion::Future => Self::OSAKA,
         }
     }
 }
@@ -546,6 +548,12 @@ mod tests {
         assert_eq!(spec_id_from_ethereum_hardfork(EthereumHardfork::Prague), SpecId::PRAGUE);
         assert_eq!(spec_id_from_ethereum_hardfork(EthereumHardfork::Osaka), SpecId::OSAKA);
         assert_eq!(spec_id_from_ethereum_hardfork(EthereumHardfork::Amsterdam), SpecId::AMSTERDAM);
+    }
+
+    #[test]
+    fn test_future_evm_version_uses_pre_amsterdam_osaka_profile() {
+        assert_eq!(evm_spec_id::<SpecId>(EvmVersion::Future), SpecId::OSAKA);
+        assert_eq!(evm_spec_id_from_str::<SpecId>("@future"), Some(SpecId::OSAKA));
     }
 
     #[test]

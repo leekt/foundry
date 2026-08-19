@@ -27,6 +27,9 @@ use foundry_primitives::{
     EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE, FoundryNetwork, FoundryReceiptEnvelope,
     Frame, FrameReceipt, FrameSignature, TxFrame, flags, mode, scheme,
 };
+use p256::ecdsa::{
+    Signature as P256Signature, SigningKey as P256SigningKey, signature::hazmat::PrehashSigner,
+};
 
 /// Deploys `5f355f5500`: `SSTORE(0, calldata[0..32])`, then stop. Payable by
 /// virtue of having no value check at all.
@@ -37,6 +40,18 @@ const REVERTER_INITCODE: Bytes = bytes!("625f5ffd5f526003601df3");
 
 /// Deploys `5f355f5560035f5faa`: write calldata to slot 0, then approve both scopes.
 const MUTATING_APPROVER_INITCODE: Bytes = bytes!("685f355f5560035f5faa5f5260096017f3");
+
+/// The metadata-free runtime emitted for `contracts/src/accounts/P256Account.sol`.
+///
+/// The test installs the production runtime directly so it can focus on raw
+/// frame-envelope admission and the account's VERIFY path without coupling the
+/// Rust suite to an external Solidity build step. Slot zero is populated with
+/// the key-derived signer below, exactly as the constructor would populate it.
+/// Regenerate after rebuilding the contracts with:
+/// `jq -r .deployedBytecode.object contracts/out/P256Account.sol/P256Account.json`.
+const P256_ACCOUNT_RUNTIME: Bytes = bytes!(
+    "608060405260043610610041575f3560e01c806325b904941461004c5780636fa364651461006d5780638d2b1f571461008c578063f3376a09146100c6575f5ffd5b3661004857005b5f5ffd5b348015610057575f5ffd5b5061006b61006636600461029e565b6100e5565b005b348015610078575f5ffd5b5061006b61008736600461030f565b6101c1565b348015610097575f5ffd5b505f546100aa906001600160a01b031681565b6040516001600160a01b03909116815260200160405180910390f35b3480156100d1575f5ffd5b506100aa6100e036600461030f565b610234565b5f80546001600160a01b031690805b8381101561016e575f85858381811061010f5761010f61032f565b905060200201359050600261012582600190b490565b146101305750610166565b600281b41561013f5750610166565b6001600160a01b0384165f82b46001600160a01b03160361016457600192505061016e565b505b6001016100f4565b508061018d5760405163afd2b59d60e01b815260040160405180910390fd5b6006600ab0b3806101b15760405163353dfba360e21b815260040160405180910390fd5b6101ba81805f5faa5b5050505050565b3330146101e1576040516314e1dbf760e11b815260040160405180910390fd5b6101eb8282610246565b5f80546001600160a01b0319166001600160a01b039290921691821781556040517f316aad49c9322783338ad5a4800300704fe9b4005f32d40bb8c1348713e975919190a25050565b5f61023f8383610246565b9392505050565b5f82158015610253575081155b156102715760405163145a1fdd60e31b815260040160405180910390fd5b50604080516020808201949094528082019290925280518083038201815260609092019052805191012090565b5f5f602083850312156102af575f5ffd5b823567ffffffffffffffff8111156102c5575f5ffd5b8301601f810185136102d5575f5ffd5b803567ffffffffffffffff8111156102eb575f5ffd5b8560208260051b84010111156102ff575f5ffd5b6020919091019590945092505050565b5f5f60408385031215610320575f5ffd5b50508035926020909101359150565b634e487b7160e01b5f52603260045260245ffd"
+);
 
 fn eip7851_designation(target: Address) -> Bytes {
     let mut code = Vec::with_capacity(23);
@@ -106,6 +121,45 @@ fn sign_hash_into(tx: &mut TxFrame, index: usize, signer: &PrivateKeySigner, has
 fn sign_entry(tx: &mut TxFrame, index: usize, signer: &PrivateKeySigner) {
     let hash = tx.signature_hash();
     sign_hash_into(tx, index, signer, hash);
+}
+
+/// Deterministic P256 test key (private scalar 1).
+fn p256_test_key() -> P256SigningKey {
+    let mut scalar = [0u8; 32];
+    scalar[31] = 1;
+    P256SigningKey::from_bytes((&scalar).into()).unwrap()
+}
+
+/// EIP-8141's P256 signer identity: `keccak256(qx || qy)[12..]`.
+fn p256_signer(key: &P256SigningKey) -> Address {
+    let public_key = key.verifying_key().to_encoded_point(false);
+    let uncompressed = public_key.as_bytes();
+    debug_assert_eq!(uncompressed.len(), 65);
+    Address::from_slice(&keccak256(&uncompressed[1..])[12..])
+}
+
+/// Signs a canonical transaction hash into the native P256 wire encoding
+/// `r || s || qx || qy` and normalizes `s` for the pinned low-s profile.
+fn sign_p256_entry(tx: &mut TxFrame, index: usize, key: &P256SigningKey) {
+    let signature: P256Signature = key.sign_prehash(tx.signature_hash().as_slice()).unwrap();
+    let signature = signature.normalize_s().unwrap_or(signature);
+    let public_key = key.verifying_key().to_encoded_point(false);
+
+    let mut encoded = Vec::with_capacity(128);
+    encoded.extend_from_slice(signature.to_bytes().as_slice());
+    encoded.extend_from_slice(&public_key.as_bytes()[1..]);
+    debug_assert_eq!(encoded.len(), 128);
+    tx.signatures[index].signature = encoded.into();
+}
+
+/// ABI encoding of `validate(uint256[])` selecting signature entry zero.
+fn validate_signature_zero_calldata() -> Bytes {
+    let mut data = Vec::with_capacity(100);
+    data.extend_from_slice(&[0x25, 0xb9, 0x04, 0x94]);
+    data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+    data.extend_from_slice(&U256::ONE.to_be_bytes::<32>());
+    data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+    data.into()
 }
 
 /// An empty-`msg` secp256k1 entry for `signer`, left unsigned. An empty `signer`
@@ -381,6 +435,90 @@ async fn frame_tx_is_mined_and_its_sender_frame_runs() {
         provider.get_block_by_number(receipt.block_number.unwrap().into()).await.unwrap().unwrap();
     assert!(block.transactions.hashes().any(|h| h == hash));
     assert_eq!(block.header.receipts_root, calculate_receipt_root(&[consensus_receipt]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_p256_frame_tx_runs_the_p256_account_authorization_path() {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let writer = deploy(&provider, wallet.address(), STORAGE_WRITER_INITCODE).await;
+
+    // Install the production P256Account runtime with the same slot-zero value
+    // its constructor derives from the uncompressed public key.
+    let account = Address::repeat_byte(0xa5);
+    let key = p256_test_key();
+    let signer = p256_signer(&key);
+    api.anvil_set_code(account, P256_ACCOUNT_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_storage_at(
+        account,
+        U256::ZERO,
+        B256::from(U256::from_be_slice(signer.as_slice())),
+    )
+    .await
+    .unwrap();
+    api.anvil_set_balance(account, U256::MAX / U256::from(2)).await.unwrap();
+
+    let nonce = provider.get_transaction_count(account).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = frame_tx(
+        account,
+        nonce,
+        &[(writer, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    tx.frames[0].gas_limit = 100_000;
+    tx.frames[0].state_gas_limit = 100_000;
+    tx.frames[0].data = validate_signature_zero_calldata();
+    tx.signatures[0] = FrameSignature {
+        scheme: scheme::P256,
+        signer: Bytes::copy_from_slice(signer.as_slice()),
+        msg: Bytes::new(),
+        signature: Bytes::new(),
+    };
+    sign_p256_entry(&mut tx, 0, &key);
+
+    assert_eq!(tx.signatures[0].signature.len(), 128, "P256 wire signature length");
+    tx.validate().unwrap();
+    tx.validate_signatures().unwrap();
+    let raw = tx.encoded_2718();
+    assert_eq!(raw[0], 0x06, "raw transaction type");
+
+    // Corrupt r while retaining a canonical scalar and the matching public key.
+    // This reaches cryptographic verification and must be refused at raw-envelope
+    // admission, before any frame executes or nonce is consumed.
+    let mut invalid = tx.clone();
+    let mut invalid_wire_signature = invalid.signatures[0].signature.to_vec();
+    invalid_wire_signature[0] ^= 1;
+    invalid.signatures[0].signature = invalid_wire_signature.into();
+    assert!(invalid.validate_signatures().is_err());
+    provider.send_raw_transaction(&invalid.encoded_2718()).await.unwrap_err();
+    assert_eq!(provider.get_transaction_count(account).await.unwrap(), nonce);
+    assert!(!wrote_magic(&provider, writer).await);
+
+    let payer_balance_before = provider.get_balance(account).await.unwrap();
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .unwrap()
+        .expect("native-P256 frame transaction was not mined");
+    assert!(receipt.status(), "native-P256 frame transaction reverted");
+    let payer = receipt
+        .0
+        .other
+        .get_deserialized::<Address>("payer")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has payer");
+    assert_eq!(payer, account, "P256Account did not approve its own payment");
+    assert!(
+        provider.get_balance(account).await.unwrap() < payer_balance_before,
+        "P256Account was named as payer but was not charged"
+    );
+    assert!(wrote_magic(&provider, writer).await, "authorized SENDER frame did not execute");
+    assert_eq!(provider.get_transaction_count(account).await.unwrap(), nonce + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

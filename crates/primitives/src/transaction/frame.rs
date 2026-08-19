@@ -1163,6 +1163,60 @@ mod tests {
         assert!(mutated.validate_signatures().is_err());
     }
 
+    /// Daimo's first EIP-7951 vector, split as
+    /// `msg || r || s || qx || qy`. EIP-8141 carries the last four words in
+    /// the signature field and resolves the signer from `keccak256(qx || qy)`.
+    const P256_VECTOR: &str = "4cee90eb86eaa050036147a12d49004b6b9c72bd725d39d4785011fe190f0b4da73bd4903f0ce3b639bbbf6e8e80d16931ff4bcf5993d58468e8fb19086e8cac36dbcd03009df8c59286b162af3bd7fcc0450c9aa81be5d10d312af6c66b1d604aebd3099c618202fcfe16ae7770b0c49ab5eadf74b754204a3bb6060e44eff37618b065f9832de4ca6ca971a7a1adc826d0f7c00181a5fb2ddf79ae00b4e10e";
+
+    fn p256_vector() -> (FrameSignature, B256) {
+        let input = alloy_primitives::hex::decode(P256_VECTOR).unwrap();
+        let msg = B256::from_slice(&input[..32]);
+        let resolved = Address::from_slice(&keccak256(&input[96..160])[12..]);
+        let signature = FrameSignature {
+            scheme: scheme::P256,
+            signer: Bytes::copy_from_slice(resolved.as_slice()),
+            msg: Bytes::new(),
+            signature: Bytes::copy_from_slice(&input[32..]),
+        };
+        (signature, msg)
+    }
+
+    #[test]
+    fn accepts_a_canonical_p256_wire_signature() {
+        let (signature, canonical_hash) = p256_vector();
+        assert!(sample().validate_signature(&signature, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_p256_wrong_hash_signer_and_wire_length() {
+        let (signature, canonical_hash) = p256_vector();
+        let tx = sample();
+
+        assert!(!tx.validate_signature(&signature, B256::repeat_byte(0x42)));
+
+        let mut wrong_signer = signature.clone();
+        wrong_signer.signer = Bytes::from(vec![0x42; 20]);
+        assert!(!tx.validate_signature(&wrong_signer, canonical_hash));
+
+        let mut short = signature;
+        short.signature = Bytes::copy_from_slice(&short.signature[..127]);
+        assert!(!tx.validate_signature(&short, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_a_high_s_p256_signature_from_the_pinned_profile() {
+        let (mut signature, canonical_hash) = p256_vector();
+        let s = U256::from_be_slice(&signature.signature[32..64]);
+        let high_s = SECP256R1_N - s;
+        let mut high_s_signature = signature.signature.to_vec();
+        high_s_signature[32..64].copy_from_slice(&high_s.to_be_bytes::<32>());
+        signature.signature = high_s_signature.into();
+
+        // EIP-7951 verifies both forms, but the toolkit's pinned EIP-8141
+        // profile requires the unique low-s encoding before frame execution.
+        assert!(!sample().validate_signature(&signature, canonical_hash));
+    }
+
     #[test]
     fn validate_rejects_malformed_envelopes() {
         let base = signed_vector();

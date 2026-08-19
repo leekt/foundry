@@ -1292,6 +1292,7 @@ dependencies = [
  "op-alloy-consensus",
  "op-alloy-rpc-types",
  "op-revm",
+ "p256 0.13.2",
  "parking_lot",
  "rand 0.8.7",
  "rand 0.9.5",

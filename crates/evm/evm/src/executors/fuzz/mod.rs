@@ -1,5 +1,6 @@
 use crate::executors::{
     DURATION_BETWEEN_METRICS_REPORT, EarlyExit, Executor, FuzzTestTimer, RawCallResult,
+    campaign::{CampaignCallKind, CampaignControl, CampaignEvent, FuzzCampaign, FuzzCampaignMode},
     corpus::{
         CorpusSyncCoordinator, GlobalCorpusMetrics, ReplayTarget, StatelessReplayTarget,
         WorkerCorpus,
@@ -17,7 +18,7 @@ use foundry_common::sh_println;
 use foundry_config::FuzzConfig;
 use foundry_evm_core::{
     Breakpoints,
-    constants::{CHEATCODE_ADDRESS, MAGIC_ASSUME},
+    constants::MAGIC_ASSUME,
     decode::{RevertDecoder, SkipReason},
     evm::FoundryEvmNetwork,
 };
@@ -326,9 +327,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 ..Default::default()
             });
         }
-        if call.reverter == Some(CHEATCODE_ADDRESS)
-            && let Some(reason) = SkipReason::decode(&call.result)
-        {
+        if let Some(reason) = call.skip_reason() {
             return Ok(FuzzTestResult { skipped: true, reason: reason.0, ..Default::default() });
         }
 
@@ -336,9 +335,12 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             call.cheatcodes.as_ref().map_or_else(Default::default, |cheats| {
                 (cheats.breakpoints.clone(), cheats.deprecated.clone())
             });
-        let success =
-            should_ignore_revert::<FEN>(self.config.fail_on_revert, address, call.reverter)
-                || self.executor_f.is_raw_call_mut_success(address, &mut call, false);
+        let success = should_ignore_revert(
+            self.config.fail_on_revert,
+            address,
+            call.reverter,
+            self.executor_f.inspector().networks.extra_cheatcode_addresses(),
+        ) || self.executor_f.is_raw_call_mut_success(address, &mut call, false);
 
         let mut result = FuzzTestResult {
             success,
@@ -347,6 +349,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             debug_bytecodes: call.debug_bytecodes.clone(),
             breakpoints: Some(breakpoints),
             deprecated_cheatcodes,
+            fork_block_number: call.fork_block_number,
             ..Default::default()
         };
 
@@ -357,13 +360,10 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             result.logs = call.logs;
             result.gas_report_traces.extend(call.traces.into_iter().map(|trace| trace.arena));
         } else {
-            let reason = if call.reverter == Some(CHEATCODE_ADDRESS) {
-                SkipReason::decode(&call.result)
-                    .map(|reason| reason.to_string())
-                    .or_else(|| rd.maybe_decode(&call.result, call.exit_reason))
-            } else {
-                rd.maybe_decode(&call.result, call.exit_reason)
-            };
+            let reason = call
+                .skip_reason()
+                .map(|reason| reason.to_string())
+                .or_else(|| rd.maybe_decode(&call.result, call.exit_reason));
             result.reason = reason;
             let args = tx
                 .call_details
@@ -389,7 +389,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
     /// or a `CounterExampleOutcome`
     fn single_fuzz(
         &self,
-        executor: &Executor<FEN>,
+        executor: &mut Executor<FEN>,
         address: Address,
         mut tx: BasicTxDetails,
         coverage_metrics: &mut WorkerCorpus,
@@ -402,25 +402,56 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         tx.roll = None;
         self.resolve_stateless_tx_with_executor(executor, &mut tx)
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
-        let mut call = executor
-            .call_raw(
-                tx.sender,
-                tx.call_details.target,
-                tx.call_details.calldata.clone(),
-                tx.call_details.value.unwrap_or_default(),
+        let campaign = FuzzCampaign::new(FuzzCampaignMode::Stateless);
+        let mut state = (executor, tx);
+        let mut cmp_values = Vec::new();
+        let mut new_coverage = false;
+        let mut checked = None;
+        campaign
+            .run_sequence(
+                &mut state,
+                1,
+                |state| (state.0, &mut state.1),
+                |_| 0,
+                |_| false,
+                |_, event| {
+                    match event {
+                        CampaignEvent::Feedback(call) => {
+                            cmp_values = call.evm_cmp_values.take().unwrap_or_default();
+                            new_coverage = coverage_metrics.merge_edge_coverage(call);
+                        }
+                        CampaignEvent::Check { result, kind, .. } => {
+                            checked = Some((
+                                result.take().expect("campaign check result is available"),
+                                kind,
+                            ));
+                            return Ok(CampaignControl::Stop);
+                        }
+                        CampaignEvent::Advance | CampaignEvent::Next { .. } => {
+                            unreachable!("depth-one campaigns cannot advance")
+                        }
+                        CampaignEvent::PostCheck => {}
+                    }
+                    Ok(CampaignControl::Continue)
+                },
             )
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
-        let cmp_values = call.evm_cmp_values.take().unwrap_or_default();
-        let new_coverage = coverage_metrics.merge_edge_coverage(&mut call);
+        let (mut call, kind) = checked.expect("depth-one campaign emits a check event");
+        let tx = state.1.clone();
         // `new_coverage` is only meaningful when edge coverage is collected; otherwise
         // `merge_edge_coverage` always returns `false`, so record it as unknown for frontiers.
         let frontier_new_coverage =
             self.config.corpus.collect_edge_coverage().then_some(new_coverage);
         frontier_recorder.capture_stateless_call(fuzz_run, &tx, &cmp_values, frontier_new_coverage);
-        coverage_metrics.process_inputs(&[tx.clone()], &[cmp_values], new_coverage, None);
+        coverage_metrics.process_inputs(
+            std::slice::from_ref(&tx),
+            &[cmp_values],
+            new_coverage,
+            None,
+        );
 
         // Handle `vm.assume`.
-        if call.result.as_ref() == MAGIC_ASSUME {
+        if kind == CampaignCallKind::AssumptionRejected {
             return Err(TestCaseError::reject(FuzzError::AssumeReject));
         }
 
@@ -431,9 +462,12 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
 
         // Consider call success if test should not fail on reverts and reverter is not the test
         // address or one of the network's cheatcode contracts.
-        let success =
-            should_ignore_revert::<FEN>(self.config.fail_on_revert, address, call.reverter)
-                || executor.is_raw_call_mut_success(address, &mut call, false);
+        let success = should_ignore_revert(
+            self.config.fail_on_revert,
+            address,
+            call.reverter,
+            state.0.inspector().networks.extra_cheatcode_addresses(),
+        ) || state.0.is_raw_call_mut_success(address, &mut call, false);
 
         if success {
             Ok(FuzzOutcome::Case(CaseOutcome {
@@ -520,6 +554,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                 result.traces.clone_from(&call.traces);
                 result.debug_bytecodes.clone_from(&call.debug_bytecodes);
                 result.breakpoints = call.cheatcodes.as_ref().map(|c| c.breakpoints.clone());
+                result.fork_block_number = call.fork_block_number;
             }
 
             match &failed_worker.failure {
@@ -800,7 +835,7 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
 
             worker.last_run_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
             match self.single_fuzz(
-                &executor,
+                &mut executor,
                 address,
                 input,
                 &mut corpus,
@@ -873,15 +908,12 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
                         }
                         worker.failure_run = fuzz_run;
 
-                        // Only classify magic skip payloads when the revert originates from the
-                        // cheatcode address.
-                        let reason = if outcome.1.reverter == Some(CHEATCODE_ADDRESS) {
-                            SkipReason::decode(&outcome.1.result)
-                                .map(|reason| reason.to_string())
-                                .or_else(|| rd.maybe_decode(&outcome.1.result, status))
-                        } else {
-                            rd.maybe_decode(&outcome.1.result, status)
-                        };
+                        // Only classify magic skip payloads minted by the skip cheatcode.
+                        let reason = outcome
+                            .1
+                            .skip_reason()
+                            .map(|reason| reason.to_string())
+                            .or_else(|| rd.maybe_decode(&outcome.1.result, status));
                         if self.config.show_logs {
                             worker.logs.extend(outcome.1.logs.clone());
                         } else {

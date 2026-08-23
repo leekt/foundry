@@ -1,39 +1,32 @@
 use std::{fmt::Debug, ops::Deref};
 
-#[cfg(feature = "monad")]
-use crate::constants::MONAD_CHEATCODE_ADDRESS;
 use crate::{
-    FoundryBlock, FoundryContextExt, FoundryContextState, FoundryEvmAuxState, FoundryInspectorExt,
+    FoundryBlock, FoundryChain, FoundryContextExt, FoundryInspectorExt, FoundryJournal,
     FoundryTransaction, FromAnyRpcTransaction,
     backend::{DatabaseExt, JournaledState},
-    constants::CHEATCODE_ADDRESS,
 };
 use alloy_consensus::{SignableTransaction, Signed, transaction::SignerRecoverable};
 use alloy_evm::{
     EthEvmFactory, Evm, EvmEnv, EvmFactory, FromRecoveredTx, precompiles::PrecompilesMap,
 };
-#[cfg(feature = "monad")]
-use alloy_monad_evm::MonadEvmFactory;
 use alloy_network::{Ethereum, Network};
 use alloy_primitives::{Address, Signature, U256};
 use alloy_rlp::Decodable;
 use foundry_common::{FoundryReceiptResponse, FoundryTransactionBuilder, fmt::UIfmt};
 use foundry_config::ExecutionSpec;
-use foundry_evm_networks::NetworkVariant;
 use foundry_fork_db::{DatabaseError, ForkBlockEnv};
 use revm::{
     Database,
     context::{
-        JournalTr,
+        ContextTr, JournalTr,
         result::{EVMError, HaltReason, ResultAndState},
     },
     handler::FrameResult,
-    inspector::{Inspector, NoOpInspector},
+    inspector::NoOpInspector,
     interpreter::{
         CallInput, CallInputs, CallScheme, CallValue, CreateInputs, FrameInput, InstructionResult,
     },
-    primitives::{eip3860::MAX_INITCODE_SIZE, hardfork::SpecId},
-    state::EvmState,
+    primitives::hardfork::SpecId,
 };
 use serde::{Deserialize, Serialize};
 use tempo_alloy::TempoNetwork;
@@ -57,10 +50,7 @@ pub use monad::*;
 pub use op::*;
 pub use tempo::*;
 
-mod replay;
-pub use replay::*;
-
-/// Foundry's supertrait associating [Network] with [FoundryEvmFactory]
+/// Foundry's compatibility trait associating a [`Network`] with a [`FoundryEvmFactory`].
 pub trait FoundryEvmNetwork: Copy + Debug + Default + 'static {
     type Network: Network<
             TxEnvelope: Decodable
@@ -76,29 +66,6 @@ pub trait FoundryEvmNetwork: Copy + Debug + Default + 'static {
             ReceiptResponse: FoundryReceiptResponse,
         >;
     type EvmFactory: FoundryEvmFactory<Tx: FromRecoveredTx<<Self::Network as Network>::TxEnvelope>>;
-
-    /// Additional network-specific cheatcode contract addresses.
-    const EXTRA_CHEATCODE_ADDRESSES: &'static [Address] = &[];
-
-    /// Maximum initcode size enforced when nested cheatcode execution simulates a raw deployment.
-    const CONTRACT_INITCODE_SIZE_LIMIT: usize = MAX_INITCODE_SIZE;
-
-    /// Returns whether this concrete EVM network can execute `network`.
-    ///
-    /// Non-Monad implementations reject Monad execution because it requires a distinct EVM
-    /// factory. Other existing network compatibility behavior remains unchanged.
-    fn supports_network(network: NetworkVariant) -> bool {
-        !network.is_monad()
-    }
-
-    fn is_extra_cheatcode_address(address: Address) -> bool {
-        Self::EXTRA_CHEATCODE_ADDRESSES.contains(&address)
-    }
-
-    /// Returns whether `address` is a standard or network-specific cheatcode contract.
-    fn is_cheatcode_address(address: Address) -> bool {
-        address == CHEATCODE_ADDRESS || Self::is_extra_cheatcode_address(address)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -121,14 +88,7 @@ pub struct MonadEvmNetwork;
 #[cfg(feature = "monad")]
 impl FoundryEvmNetwork for MonadEvmNetwork {
     type Network = Ethereum;
-    type EvmFactory = MonadEvmFactory;
-
-    const EXTRA_CHEATCODE_ADDRESSES: &'static [Address] = &[MONAD_CHEATCODE_ADDRESS];
-    const CONTRACT_INITCODE_SIZE_LIMIT: usize = monad_revm::MONAD_MAX_INITCODE_SIZE;
-
-    fn supports_network(network: NetworkVariant) -> bool {
-        network.is_monad()
-    }
+    type EvmFactory = alloy_monad_evm::MonadEvmFactory;
 }
 
 /// Convenience type aliases for accessing associated types through [`FoundryEvmNetwork`].
@@ -141,14 +101,24 @@ pub type SpecFor<FEN> = <EvmFactoryFor<FEN> as EvmFactory>::Spec;
 pub type BlockEnvFor<FEN> = <EvmFactoryFor<FEN> as EvmFactory>::BlockEnv;
 pub type PrecompilesFor<FEN> = <EvmFactoryFor<FEN> as EvmFactory>::Precompiles;
 pub type EvmEnvFor<FEN> = EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>;
-pub type ContextAuxFor<FEN> = <EvmFactoryFor<FEN> as FoundryEvmFactory>::ContextAux;
-pub type ContextStateFor<FEN> = FoundryContextState<ContextAuxFor<FEN>>;
-
 pub type NetworkFor<FEN> = <FEN as FoundryEvmNetwork>::Network;
 pub type TxEnvelopeFor<FEN> = <NetworkFor<FEN> as Network>::TxEnvelope;
 pub type TransactionRequestFor<FEN> = <NetworkFor<FEN> as Network>::TransactionRequest;
 pub type TransactionResponseFor<FEN> = <NetworkFor<FEN> as Network>::TransactionResponse;
 pub type BlockResponseFor<FEN> = <NetworkFor<FEN> as Network>::BlockResponse;
+
+pub type ChainFor<FEN> = <EvmFactoryFor<FEN> as FoundryEvmFactory>::Chain;
+
+/// Boxed nested EVM produced by a Foundry EVM factory.
+pub type NestedEvmFor<'db, F> = Box<
+    dyn NestedEvm<
+            Spec = <F as EvmFactory>::Spec,
+            Block = <F as EvmFactory>::BlockEnv,
+            Tx = <F as EvmFactory>::Tx,
+            Chain = <F as FoundryEvmFactory>::Chain,
+            Journal = <<F as FoundryEvmFactory>::FoundryContext<'db> as ContextTr>::Journal,
+        > + 'db,
+>;
 
 pub trait FoundryEvmFactory:
     EvmFactory<
@@ -162,24 +132,16 @@ pub trait FoundryEvmFactory:
     + Default
     + 'static
 {
-    /// Whether transaction execution needs metadata from surrounding blocks.
-    const NEEDS_BLOCK_CONTEXT: bool = false;
-
-    /// Whether canonical protocol system transactions must be included during fork replay.
-    const REPLAYS_PROTOCOL_SYSTEM_TRANSACTIONS: bool = false;
-
-    /// Whether this EVM family executes the EIP-4788 beacon-roots system call.
-    const USES_EIP4788_BEACON_ROOTS: bool = true;
-
-    /// Network-specific state stored outside the standard REVM journal.
-    type ContextAux: FoundryEvmAuxState;
+    /// Chain type for EVM's context created by this factory.
+    type Chain: FoundryChain<Self::Tx>;
 
     /// Foundry Context abstraction
     type FoundryContext<'db>: FoundryContextExt<
             Block = Self::BlockEnv,
             Tx = Self::Tx,
             Spec = Self::Spec,
-            Aux = Self::ContextAux,
+            Chain = Self::Chain,
+            Journal: FoundryJournal,
             Db: DatabaseExt<Self>,
         >
     where
@@ -201,83 +163,34 @@ pub trait FoundryEvmFactory:
         &self,
         db: &'db mut dyn DatabaseExt<Self>,
         evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
-        context_aux: Self::ContextAux,
+        chain_context: Self::Chain,
         inspector: I,
     ) -> Self::FoundryEvm<'db, I>;
 
-    /// Returns the auxiliary state for a standalone synthetic transaction.
-    fn context_for_transaction(&self, _tx: &Self::Tx) -> Self::ContextAux {
-        Self::ContextAux::default()
-    }
-
-    /// Returns the auxiliary state for a transaction at an exact position in a block.
-    fn context_for_block(
-        &self,
-        _grandparent: &[Self::Tx],
-        _parent: &[Self::Tx],
-        _current: &[Self::Tx],
-        _current_tx_index: usize,
-    ) -> Self::ContextAux {
-        Self::ContextAux::default()
-    }
-
-    /// Rebases live auxiliary state after the underlying database or fork position changes.
+    /// Tries to execute a canonical system transaction on a regular Alloy EVM during replay.
     ///
-    /// `replacement` contains context reconstructed at the new position. Implementations may
-    /// preserve transaction-scoped state from `current` while recomputing caches against `state`.
-    fn rebase_context_aux(
+    /// Returning `Ok(None)` means the transaction was not recognized. Implementations must not
+    /// mutate the EVM, its database, or inspector before returning `Ok(None)`, because callers may
+    /// fall back to ordinary execution using the same EVM instance.
+    #[cfg(feature = "monad")]
+    fn try_transact_system_replay<DB, I>(
         &self,
-        _current: &Self::ContextAux,
-        _replacement: &mut Self::ContextAux,
-        _state: &EvmState,
-    ) {
-    }
-
-    /// Converts a canonical envelope into a family-specific protocol system call.
-    ///
-    /// Returns an error when the transaction uses a network's reserved protocol sender but does
-    /// not satisfy that network's canonical envelope rules.
-    fn protocol_system_call(&self, _tx: &Self::Tx) -> eyre::Result<Option<ProtocolSystemCall>> {
+        _evm: &mut Self::Evm<DB, I>,
+        _tx: &Self::Tx,
+    ) -> eyre::Result<Option<ResultAndState<Self::HaltReason>>>
+    where
+        DB: alloy_evm::Database,
+        I: revm::inspector::Inspector<Self::Context<DB>>,
+    {
         Ok(None)
     }
 
-    /// Executes a canonical replay transaction on a regular EVM created by this factory.
-    ///
-    /// Factories with protocol system envelopes override this hook to apply their protocol
-    /// prestate through the concrete EVM context before entering the dedicated system-call path.
-    fn transact_replay<DB, I>(
-        &self,
-        evm: &mut Self::Evm<DB, I>,
-        tx: Self::Tx,
-    ) -> eyre::Result<ResultAndState<Self::HaltReason>>
-    where
-        DB: alloy_evm::Database,
-        I: Inspector<Self::Context<DB>>,
-    {
-        if self.protocol_system_call(&tx)?.is_some() {
-            eyre::bail!("protocol system replay is not implemented for this EVM factory");
-        }
-        evm.transact(tx).map_err(Into::into)
-    }
-
-    /// Executes a canonical replay transaction on a Foundry EVM with an inspector.
-    fn transact_foundry_replay<'db, I: FoundryInspectorExt<Self::FoundryContext<'db>>>(
-        &self,
-        evm: &mut Self::FoundryEvm<'db, I>,
-        tx: Self::Tx,
-    ) -> eyre::Result<ResultAndState<Self::HaltReason>> {
-        if self.protocol_system_call(&tx)?.is_some() {
-            eyre::bail!("protocol system replay is not implemented for this EVM factory");
-        }
-        evm.transact(tx).map_err(Into::into)
-    }
-
-    /// Creates an uninspected EVM with explicit network-specific auxiliary state.
+    /// Creates an uninspected EVM with explicit transaction-position context.
     fn create_evm_with_context<DB: alloy_evm::Database>(
         &self,
         db: DB,
         evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
-        context_aux: Self::ContextAux,
+        chain_context: Self::Chain,
     ) -> Self::Evm<DB, NoOpInspector>;
 
     /// Creates a Foundry-wrapped EVM with a dynamic inspector, returning a boxed [`NestedEvm`].
@@ -290,16 +203,9 @@ pub trait FoundryEvmFactory:
         &self,
         db: &'db mut dyn DatabaseExt<Self>,
         evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
-        context_aux: Self::ContextAux,
+        chain_context: Self::Chain,
         inspector: &'db mut dyn FoundryInspectorExt<Self::FoundryContext<'db>>,
-    ) -> Box<
-        dyn NestedEvm<
-                Spec = Self::Spec,
-                Block = Self::BlockEnv,
-                Tx = Self::Tx,
-                Aux = Self::ContextAux,
-            > + 'db,
-    >;
+    ) -> NestedEvmFor<'db, Self>;
 }
 
 /// Object-safe trait exposing the operations that cheatcode nested EVM closures need.
@@ -312,75 +218,68 @@ pub trait NestedEvm {
     /// The block environment type.
     type Block;
     /// The transaction environment type.
-    type Tx;
-    /// Network-specific state stored outside the standard REVM journal.
-    type Aux: FoundryEvmAuxState;
-
+    type Tx: FoundryTransaction;
+    /// Chain context identifying the active transaction position.
+    type Chain: FoundryChain<Self::Tx>;
+    /// The Journal type, which may own Monad's reserve-balance-tracker state.
+    type Journal: FoundryJournal;
     /// Returns a mutable reference to the journal inner state (`JournaledState`).
     fn journal_inner_mut(&mut self) -> &mut JournaledState;
 
-    /// Clones the complete context state.
-    fn context_state(&self) -> FoundryContextState<Self::Aux>;
+    /// Returns a mutable reference to the transaction environment.
+    fn tx_mut(&mut self) -> &mut Self::Tx;
 
-    /// Clones the network-specific auxiliary state.
-    fn aux_state(&self) -> Self::Aux;
+    /// Returns a mutable reference to the chain-position context.
+    fn chain_mut(&mut self) -> &mut Self::Chain;
 
-    /// Restores the complete context state.
-    fn set_context_state(&mut self, state: FoundryContextState<Self::Aux>);
-
-    /// Preserves auxiliary state across the next synthetic transaction boundary.
-    fn preserve_aux_state_on_transaction(&mut self) {}
+    /// Returns a mutable reference to the Journal.
+    fn journal_mut(&mut self) -> &mut Self::Journal;
 
     /// Runs a single execution frame (create or call) through the EVM handler loop.
     fn run_execution(&mut self, frame: FrameInput) -> Result<FrameResult, EVMError<DatabaseError>>;
 
     /// Executes a full transaction with the given tx env.
-    fn transact_raw(
-        &mut self,
-        tx: Self::Tx,
-    ) -> Result<ResultAndState<HaltReason>, EVMError<DatabaseError>>;
-
-    /// Executes a canonical replay transaction.
-    ///
-    /// Networks with protocol system envelopes must override this method so replay can apply the
-    /// protocol prestate and bypass ordinary transaction validation.
-    fn transact_replay(&mut self, tx: Self::Tx) -> eyre::Result<ResultAndState<HaltReason>> {
-        self.transact_raw(tx).map_err(Into::into)
-    }
+    fn transact_raw(&mut self, tx: Self::Tx) -> eyre::Result<ResultAndState<HaltReason>>;
 
     fn to_evm_env(&self) -> EvmEnv<Self::Spec, Self::Block>;
 }
 
 /// Closure type used by `CheatcodesExecutor` methods that run nested EVM operations.
-pub type NestedEvmClosure<'a, Spec, Block, Tx, Aux> =
-    &'a mut dyn FnMut(
-        &mut dyn NestedEvm<Spec = Spec, Block = Block, Tx = Tx, Aux = Aux>,
-    ) -> Result<(), EVMError<DatabaseError>>;
+pub type NestedEvmClosure<'a, F> = &'a mut dyn for<'j> FnMut(
+    &mut dyn NestedEvm<
+        Spec = <F as EvmFactory>::Spec,
+        Block = <F as EvmFactory>::BlockEnv,
+        Tx = <F as EvmFactory>::Tx,
+        Chain = <F as FoundryEvmFactory>::Chain,
+        Journal = <<F as FoundryEvmFactory>::FoundryContext<'j> as ContextTr>::Journal,
+    >,
+)
+    -> Result<(), EVMError<DatabaseError>>;
+
+/// Nested EVM closure for a Foundry EVM network.
+pub type NestedEvmClosureFor<'a, FEN> = NestedEvmClosure<'a, EvmFactoryFor<FEN>>;
 
 /// Clones the current context (env + journal), passes the database, cloned env,
-/// and cloned context state to the callback. The callback builds whatever EVM it
-/// needs, runs its operations, and returns `(result, modified_env, modified_context)`.
+/// and cloned journal inner to the callback. The callback builds whatever EVM it
+/// needs, runs its operations, and returns `(result, modified_env, modified_journal)`.
 /// Modified state is written back after the callback returns.
 pub fn with_cloned_context<CTX: FoundryContextExt>(
     ecx: &mut CTX,
     f: impl FnOnce(
         &mut CTX::Db,
         EvmEnv<CTX::Spec, CTX::Block>,
-        FoundryContextState<CTX::Aux>,
-    ) -> Result<
-        (EvmEnv<CTX::Spec, CTX::Block>, FoundryContextState<CTX::Aux>),
-        EVMError<DatabaseError>,
-    >,
+        JournaledState,
+    )
+        -> Result<(EvmEnv<CTX::Spec, CTX::Block>, JournaledState), EVMError<DatabaseError>>,
 ) -> Result<(), EVMError<DatabaseError>> {
     let evm_env = ecx.evm_clone();
-    let context_state = ecx.context_state();
+    let (db, journal_inner) = ecx.db_journal_inner_mut();
+    let journal_inner = journal_inner.clone();
 
-    let db = ecx.db_mut();
-
-    let (sub_evm_env, sub_state) = f(db, evm_env, context_state)?;
+    let (sub_evm_env, sub_inner) = f(db, evm_env, journal_inner)?;
 
     // Write back modified state. The db borrow was released when f returned.
-    ecx.set_context_state(sub_state);
+    ecx.set_journal_inner(sub_inner);
     ecx.set_evm(sub_evm_env);
 
     Ok(())
@@ -428,45 +327,5 @@ impl IntoInstructionResult for TempoHaltReason {
             Self::Ethereum(eth) => eth.into(),
             _ => InstructionResult::PrecompileError,
         }
-    }
-}
-
-#[cfg(all(test, feature = "monad"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn monad_overrides_nested_initcode_size_limit() {
-        assert_eq!(
-            <EthEvmNetwork as FoundryEvmNetwork>::CONTRACT_INITCODE_SIZE_LIMIT,
-            MAX_INITCODE_SIZE
-        );
-        assert_eq!(
-            <TempoEvmNetwork as FoundryEvmNetwork>::CONTRACT_INITCODE_SIZE_LIMIT,
-            MAX_INITCODE_SIZE
-        );
-        assert_eq!(
-            <MonadEvmNetwork as FoundryEvmNetwork>::CONTRACT_INITCODE_SIZE_LIMIT,
-            monad_revm::MONAD_MAX_INITCODE_SIZE
-        );
-    }
-
-    #[test]
-    fn evm_factories_only_isolate_monad_forks() {
-        for network in [NetworkVariant::Ethereum, NetworkVariant::Tempo] {
-            assert!(EthEvmNetwork::supports_network(network));
-            assert!(TempoEvmNetwork::supports_network(network));
-            assert!(!MonadEvmNetwork::supports_network(network));
-        }
-        #[cfg(feature = "optimism")]
-        {
-            assert!(EthEvmNetwork::supports_network(NetworkVariant::Optimism));
-            assert!(TempoEvmNetwork::supports_network(NetworkVariant::Optimism));
-            assert!(!MonadEvmNetwork::supports_network(NetworkVariant::Optimism));
-        }
-
-        assert!(!EthEvmNetwork::supports_network(NetworkVariant::Monad));
-        assert!(!TempoEvmNetwork::supports_network(NetworkVariant::Monad));
-        assert!(MonadEvmNetwork::supports_network(NetworkVariant::Monad));
     }
 }

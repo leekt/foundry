@@ -1,7 +1,5 @@
 use crate::utils::generate_large_init_contract;
 use foundry_compilers::artifacts::EvmVersion;
-#[cfg(feature = "monad")]
-use foundry_evm_networks::NetworkConfigs;
 use foundry_test_utils::{forgetest, forgetest_init, snapbox::IntoData, str, util::OutputExt};
 use globset::Glob;
 use std::{
@@ -13,7 +11,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git").current_dir(root).args(args).output().unwrap();
@@ -33,6 +31,82 @@ fn add_local_submodule(root: &Path, path: &str) -> String {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     git(&root.join(path), &["rev-parse", "HEAD"])
 }
+
+#[cfg(unix)]
+forgetest!(local_compiler_requires_approval, |prj, cmd| {
+    let solc = prj.root().join("payload");
+    let invoked = prj.root().join("payload.invoked");
+    fs::write(
+        &solc,
+        r#"#!/bin/sh
+touch "$0.invoked"
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+    exit 0
+fi
+exit 1
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&solc).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&solc, permissions).unwrap();
+    prj.add_source("Contract", "contract Contract {}");
+    prj.update_config(|config| {
+        config.solc = Some(foundry_config::SolcReq::Local(solc.clone()));
+    });
+
+    let output = cmd.arg("build").assert_failure();
+    let stderr = output.get_output().stderr_lossy();
+    assert!(stderr.contains("refusing to run unapproved local compiler"), "{stderr}");
+    assert!(stderr.contains("--allow-local-compiler"), "{stderr}");
+    assert!(!invoked.exists(), "local compiler ran without approval");
+
+    cmd.forge_fuse().args(["build", "--allow-local-compiler"]).assert_failure();
+    assert!(invoked.exists(), "approved local compiler did not run");
+});
+
+forgetest!(project_dotenv_requires_approval, |prj, cmd| {
+    fs::write(prj.root().join(".env"), "FOUNDRY_SRC=dotenv-src").unwrap();
+
+    let output = cmd.args(["config", "--json"]).assert_failure();
+    let stderr = output.get_output().stderr_lossy();
+    assert!(stderr.contains("refusing to load unapproved project dotenv"), "{stderr}");
+    assert!(stderr.contains("--allow-project-env"), "{stderr}");
+
+    let output = cmd.forge_fuse().args([
+        "create",
+        "src/Contract.sol:Contract",
+        "--constructor-args",
+        "--allow-project-env",
+    ]);
+    let stderr = output.assert_failure().get_output().stderr_lossy();
+    assert!(stderr.contains("refusing to load unapproved project dotenv"), "{stderr}");
+
+    let output =
+        cmd.forge_fuse().args(["config", "--json", "--allow-project-env"]).assert_success();
+    let config: serde_json::Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(config["src"], "dotenv-src");
+});
+
+#[cfg(unix)]
+forgetest!(local_compiler_path_escapes_control_characters, |prj, cmd| {
+    let solc = prj.root().join("payload\n\u{1b}[2Jspoofed");
+    fs::write(&solc, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut permissions = fs::metadata(&solc).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&solc, permissions).unwrap();
+    prj.add_source("Contract", "contract Contract {}");
+    prj.update_config(|config| {
+        config.solc = Some(foundry_config::SolcReq::Local(solc.clone()));
+    });
+
+    let output = cmd.arg("build").assert_failure();
+    let stderr = output.get_output().stderr_lossy();
+    assert!(stderr.contains(r"payload\n\u{1b}[2Jspoofed"), "{stderr:?}");
+    assert!(!stderr.contains("payload\n\u{1b}[2Jspoofed"), "{stderr:?}");
+});
 
 forgetest!(
     #[cfg(unix)]
@@ -379,7 +453,7 @@ forgetest!(build_sizes_respects_configured_code_size_limit, |prj, cmd| {
 forgetest!(build_sizes_respects_monad_network_code_size_limit, |prj, cmd| {
     prj.add_source("LargeContract.sol", generate_large_init_contract(50_000).as_str());
     prj.update_config(|config| {
-        config.networks = NetworkConfigs::with_monad();
+        config.networks = foundry_evm_networks::NetworkConfigs::with_monad();
     });
 
     cmd.args(["build", "--sizes", "--json"]).assert_success().stdout_eq(

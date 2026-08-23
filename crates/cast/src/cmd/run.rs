@@ -42,16 +42,13 @@ use foundry_config::{
         value::{Dict, Map},
     },
 };
-#[cfg(feature = "monad")]
-use foundry_evm::core::evm::MonadEvmNetwork;
 #[cfg(feature = "optimism")]
 use foundry_evm::core::evm::OpEvmNetwork;
 use foundry_evm::{
     core::{
-        FoundryBlock as _,
+        FoundryBlock as _, FoundryChain,
         evm::{
-            BlockContext, EthEvmNetwork, FoundryEvmFactory, FoundryEvmNetwork, TempoEvmNetwork,
-            TxEnvFor,
+            BlockContext, ChainFor, EthEvmNetwork, FoundryEvmNetwork, TempoEvmNetwork, TxEnvFor,
         },
     },
     executors::{EvmError, Executor, TracingExecutor},
@@ -59,6 +56,7 @@ use foundry_evm::{
     opts::EvmOpts,
     traces::{InternalTraceMode, SparsedTraceArena, TraceRequirements, Traces},
 };
+use foundry_evm_networks::NetworkConfigs;
 use futures::{StreamExt, TryFutureExt};
 use revm::{DatabaseRef, context::Block, primitives::hardfork::SpecId};
 
@@ -171,7 +169,9 @@ impl RunArgs {
 
         #[cfg(feature = "monad")]
         if evm_opts.networks.is_monad() {
-            return self.run_with_evm::<MonadEvmNetwork>(config, evm_opts).await;
+            return self
+                .run_with_evm::<foundry_evm::core::evm::MonadEvmNetwork>(config, evm_opts)
+                .await;
         }
 
         #[cfg(feature = "optimism")]
@@ -373,22 +373,9 @@ impl RunArgs {
             return Ok(());
         }
 
-        let factory = FEN::EvmFactory::default();
         let target_tx_env = TxEnvFor::<FEN>::from_recovered_tx(tx.as_ref(), tx.from());
-        let target_is_protocol_system = factory.protocol_system_call(&target_tx_env)?.is_some();
-
-        // Generic system transactions remain opt-in. Protocol system envelopes are always
-        // replayed through their network's dedicated execution path.
-        if !target_is_protocol_system
-            && !self.replay_system_txes
-            && (is_known_system_sender(tx.from())
-                || tx.transaction_type() == Some(SYSTEM_TRANSACTION_TYPE))
-        {
-            return Err(eyre::eyre!(
-                "{:?} is a system transaction.\nReplaying system transactions is currently not supported.",
-                tx.tx_hash()
-            ));
-        }
+        let target_is_system = is_known_system_sender(tx.from())
+            || tx.transaction_type() == Some(SYSTEM_TRANSACTION_TYPE);
 
         let tx_block_number = tx
             .block_number()
@@ -451,7 +438,7 @@ impl RunArgs {
         );
         TracingExecutor::<FEN>::extend_precompile_labels(&mut config, networks, resolved_hardfork);
 
-        let block_context = if FEN::EvmFactory::NEEDS_BLOCK_CONTEXT {
+        let block_context = if networks.is_monad() {
             let block = block.as_ref().ok_or_else(|| {
                 eyre::eyre!(
                     "block {tx_block_number} is required to reconstruct transaction context"
@@ -478,7 +465,7 @@ impl RunArgs {
         let spec_id = (*evm_env.cfg_env.spec()).into();
 
         if let Some(parent_beacon_block_root) =
-            parent_beacon_block_root_for_network::<FEN>(spec_id, parent_beacon_block_root)?
+            parent_beacon_block_root_for_network(networks, spec_id, parent_beacon_block_root)?
         {
             executor.apply_beacon_root(parent_beacon_block_root)?;
         }
@@ -533,47 +520,49 @@ impl RunArgs {
                     }
 
                     let tx_env = TxEnvFor::<FEN>::from_recovered_tx(tx.as_ref(), tx.from());
-                    let is_protocol_system = factory.protocol_system_call(&tx_env)?.is_some();
-                    // Generic system transactions remain opt-in because they may omit pricing
-                    // fields. Protocol envelopes must be replayed to reconstruct canonical state.
-                    if !is_protocol_system
-                        && !self.replay_system_txes
-                        && (is_known_system_sender(tx.from())
-                            || tx.transaction_type() == Some(SYSTEM_TRANSACTION_TYPE))
-                    {
-                        pb.set_position((index + 1) as u64);
-                        continue;
-                    }
-
-                    let context_aux = block_context.as_ref().map_or_else(
-                        || FEN::EvmFactory::default().context_for_transaction(&tx_env),
+                    let is_system = is_known_system_sender(tx.from())
+                        || tx.transaction_type() == Some(SYSTEM_TRANSACTION_TYPE);
+                    let chain_context = block_context.as_ref().map_or_else(
+                        || ChainFor::<FEN>::for_transaction(&tx_env),
                         |context| context.transaction(index),
                     );
 
                     evm_env.cfg_env.disable_balance_check = true;
 
-                    if is_protocol_system {
-                        trace!(tx=?tx.tx_hash(), "executing previous protocol system transaction");
-                        executor
-                            .transact_protocol_system_with_env_and_context(
+                    if is_system {
+                        #[cfg(feature = "monad")]
+                        if executor
+                            .try_transact_system_replay_with_env_and_context(
                                 evm_env.clone(),
                                 tx_env.clone(),
-                                context_aux,
+                                chain_context.clone(),
                             )
                             .wrap_err_with(|| {
                                 format!(
-                                    "Failed to execute protocol system transaction: {:?} in block {}",
+                                    "Failed to replay system transaction: {:?} in block {}",
                                     tx.tx_hash(),
                                     evm_env.block_env.number()
                                 )
-                            })?;
-                    } else if let Some(to) = Transaction::to(tx) {
+                            })?
+                            .is_some()
+                        {
+                            trace!(tx=?tx.tx_hash(), "executed previous canonical system transaction");
+                            pb.set_position((index + 1) as u64);
+                            continue;
+                        }
+                        if !self.replay_system_txes {
+                            pb.set_position((index + 1) as u64);
+                            continue;
+                        }
+                    }
+
+                    if let Some(to) = Transaction::to(tx) {
                         trace!(tx=?tx.tx_hash(),?to, "executing previous call transaction");
                         executor
                             .transact_with_env_and_context(
                                 evm_env.clone(),
                                 tx_env.clone(),
-                                context_aux,
+                                chain_context,
                             )
                             .wrap_err_with(|| {
                                 format!(
@@ -587,7 +576,7 @@ impl RunArgs {
                         if let Err(error) = executor.deploy_with_env_and_context(
                             evm_env.clone(),
                             tx_env.clone(),
-                            context_aux,
+                            chain_context,
                             None,
                         ) {
                             match error {
@@ -641,8 +630,8 @@ impl RunArgs {
             } else {
                 0
             };
-            let context_aux = block_context.as_ref().map_or_else(
-                || FEN::EvmFactory::default().context_for_transaction(&tx_env),
+            let chain_context = block_context.as_ref().map_or_else(
+                || ChainFor::<FEN>::for_transaction(&tx_env),
                 |context| context.transaction(target_index),
             );
 
@@ -650,28 +639,46 @@ impl RunArgs {
                 evm_env.cfg_env.disable_balance_check = true;
             }
 
-            if target_is_protocol_system {
-                trace!(tx=?tx.tx_hash(), "executing protocol system transaction");
-                TraceResult::from(executor.transact_protocol_system_with_env_and_context(
-                    evm_env,
-                    tx_env,
-                    context_aux,
-                )?)
-            } else if let Some(to) = Transaction::to(&tx) {
-                trace!(tx=?tx.tx_hash(), to=?to, "executing call transaction");
-                TraceResult::from(executor.transact_with_env_and_context(
-                    evm_env,
-                    tx_env,
-                    context_aux,
-                )?)
+            #[cfg(feature = "monad")]
+            let replay_result = if target_is_system {
+                executor.try_transact_system_replay_with_env_and_context(
+                    evm_env.clone(),
+                    tx_env.clone(),
+                    chain_context.clone(),
+                )?
             } else {
-                trace!(tx=?tx.tx_hash(), "executing create transaction");
-                TraceResult::try_from(executor.deploy_with_env_and_context(
-                    evm_env,
-                    tx_env,
-                    context_aux,
-                    None,
-                ))?
+                None
+            };
+            #[cfg(not(feature = "monad"))]
+            let replay_result: Option<foundry_evm::executors::RawCallResult<FEN>> = None;
+
+            if let Some(result) = replay_result {
+                trace!(tx=?tx.tx_hash(), "executed canonical system transaction");
+                TraceResult::from(result)
+            } else {
+                if target_is_system && !self.replay_system_txes {
+                    return Err(eyre::eyre!(
+                        "{:?} is a system transaction.\nReplaying system transactions is currently not supported.",
+                        tx.tx_hash()
+                    ));
+                }
+
+                if let Some(to) = Transaction::to(&tx) {
+                    trace!(tx=?tx.tx_hash(), to=?to, "executing call transaction");
+                    TraceResult::from(executor.transact_with_env_and_context(
+                        evm_env,
+                        tx_env,
+                        chain_context,
+                    )?)
+                } else {
+                    trace!(tx=?tx.tx_hash(), "executing create transaction");
+                    TraceResult::try_from(executor.deploy_with_env_and_context(
+                        evm_env,
+                        tx_env,
+                        chain_context,
+                        None,
+                    ))?
+                }
             }
         };
 
@@ -717,11 +724,12 @@ fn ensure_remote_transaction_inclusion(
     Ok(())
 }
 
-fn parent_beacon_block_root_for_network<FEN: FoundryEvmNetwork>(
+fn parent_beacon_block_root_for_network(
+    networks: NetworkConfigs,
     spec_id: SpecId,
     parent_beacon_block_root: Option<B256>,
 ) -> Result<Option<B256>> {
-    if !FEN::EvmFactory::USES_EIP4788_BEACON_ROOTS || !spec_id.is_enabled_in(SpecId::CANCUN) {
+    if networks.is_monad() || !spec_id.is_enabled_in(SpecId::CANCUN) {
         return Ok(None);
     }
 
@@ -962,23 +970,21 @@ mod tests {
 
     #[test]
     fn parent_beacon_block_root_is_required_for_cancun() {
-        let err = parent_beacon_block_root_for_network::<EthEvmNetwork>(SpecId::CANCUN, None)
-            .unwrap_err();
+        let networks = NetworkConfigs::default();
+        let err = parent_beacon_block_root_for_network(networks, SpecId::CANCUN, None).unwrap_err();
         assert!(err.to_string().contains("MissingParentBeaconBlockRoot"));
 
         let root = B256::repeat_byte(0x42);
         assert_eq!(
-            parent_beacon_block_root_for_network::<EthEvmNetwork>(SpecId::CANCUN, Some(root))
-                .unwrap(),
+            parent_beacon_block_root_for_network(networks, SpecId::CANCUN, Some(root)).unwrap(),
             Some(root),
         );
         assert_eq!(
-            parent_beacon_block_root_for_network::<EthEvmNetwork>(SpecId::SHANGHAI, Some(root))
-                .unwrap(),
+            parent_beacon_block_root_for_network(networks, SpecId::SHANGHAI, Some(root)).unwrap(),
             None,
         );
         assert_eq!(
-            parent_beacon_block_root_for_network::<EthEvmNetwork>(SpecId::SHANGHAI, None).unwrap(),
+            parent_beacon_block_root_for_network(networks, SpecId::SHANGHAI, None).unwrap(),
             None,
         );
     }
@@ -986,13 +992,15 @@ mod tests {
     #[cfg(feature = "monad")]
     #[test]
     fn parent_beacon_block_root_is_not_used_by_monad() {
+        let networks = NetworkConfigs::with_monad();
         for spec_id in [SpecId::PRAGUE, SpecId::OSAKA] {
             assert_eq!(
-                parent_beacon_block_root_for_network::<MonadEvmNetwork>(spec_id, None).unwrap(),
+                parent_beacon_block_root_for_network(networks, spec_id, None).unwrap(),
                 None,
             );
             assert_eq!(
-                parent_beacon_block_root_for_network::<MonadEvmNetwork>(
+                parent_beacon_block_root_for_network(
+                    networks,
                     spec_id,
                     Some(B256::repeat_byte(0x42)),
                 )

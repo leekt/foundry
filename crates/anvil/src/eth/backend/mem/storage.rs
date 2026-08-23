@@ -1,6 +1,4 @@
 //! In-memory blockchain storage
-#[cfg(feature = "monad")]
-use crate::eth::backend::db::MonadBlockReplayProfile;
 use crate::eth::{
     backend::{
         db::{
@@ -30,8 +28,6 @@ use anvil_core::eth::{
     block::{Block, create_block},
     transaction::{MaybeImpersonatedTransaction, TransactionInfo},
 };
-#[cfg(feature = "monad")]
-use foundry_evm::core::evm::MonadBlockParticipants;
 use foundry_evm::{
     backend::MemDb,
     traces::{CallKind, ParityTraceBuilder, TracingInspectorConfig},
@@ -265,6 +261,7 @@ impl InMemoryBlockStates {
                 states.push((*hash, state_snapshot));
             }
         }
+        states.sort_unstable_by_key(|(hash, _)| *hash);
 
         SerializableHistoricalStates::new(states)
     }
@@ -320,13 +317,20 @@ pub struct BlockchainStorage<N: Network> {
     pub total_difficulty: U256,
     /// Monad senders and authorities retained even when old transaction bodies are pruned.
     #[cfg(feature = "monad")]
-    pub monad_block_participants: B256HashMap<MonadBlockParticipants>,
+    pub monad_block_participants: B256HashMap<foundry_evm::core::evm::MonadBlockParticipants>,
     /// Execution profile used when each locally stored Monad block was created.
     #[cfg(feature = "monad")]
-    pub monad_block_replay_profiles: B256HashMap<MonadBlockReplayProfile>,
+    pub monad_block_replay_profiles: B256HashMap<crate::eth::backend::db::MonadBlockReplayProfile>,
 }
 
 impl<N: Network> BlockchainStorage<N> {
+    /// Removes all metadata associated with a locally stored Monad block.
+    #[cfg(feature = "monad")]
+    pub(super) fn remove_monad_block_metadata(&mut self, block_hash: &B256) {
+        self.monad_block_participants.remove(block_hash);
+        self.monad_block_replay_profiles.remove(block_hash);
+    }
+
     /// Creates a new storage with a genesis block
     pub fn new(
         evm_env: &EvmEnv,
@@ -420,9 +424,7 @@ impl<N: Network> BlockchainStorage<N> {
                     removed.push(block);
                 }
                 #[cfg(feature = "monad")]
-                self.monad_block_participants.remove(&hash);
-                #[cfg(feature = "monad")]
-                self.monad_block_replay_profiles.remove(&hash);
+                self.remove_monad_block_metadata(&hash);
                 self.hashes.remove(&i);
             }
         }
@@ -467,7 +469,14 @@ impl<N: Network> BlockchainStorage<N> {
 
     /// Serialize all blocks in storage
     pub fn serialized_blocks(&self) -> Vec<SerializableBlock> {
-        self.blocks.values().map(|block| block.clone().into()).collect()
+        let mut blocks = self.blocks.iter().collect::<Vec<_>>();
+        blocks.sort_unstable_by_key(|(hash, block)| {
+            let hash = **hash;
+            let number = block.header.number();
+            let is_canonical = self.hashes.get(&number).is_some_and(|canonical| *canonical == hash);
+            (number, is_canonical, hash)
+        });
+        blocks.into_iter().map(|(_, block)| block.clone().into()).collect()
     }
 
     /// Adds a block to storage and returns its hash.
@@ -523,7 +532,15 @@ impl<N: Network> BlockchainStorage<N> {
 
 impl<N: Network<ReceiptEnvelope = FoundryReceiptEnvelope>> BlockchainStorage<N> {
     pub fn serialized_transactions(&self) -> Vec<SerializableTransaction> {
-        self.transactions.values().map(|tx: &MinedTransaction<N>| tx.clone().into()).collect()
+        let mut transactions = self
+            .transactions
+            .values()
+            .map(|tx: &MinedTransaction<N>| SerializableTransaction::from(tx.clone()))
+            .collect::<Vec<_>>();
+        transactions.sort_unstable_by_key(|tx| {
+            (tx.block_number, tx.info.transaction_index, tx.info.transaction_hash)
+        });
+        transactions
     }
 
     /// Deserialize and add all transactions data to the backend storage
@@ -699,7 +716,7 @@ mod tests {
     use crate::eth::backend::{db::Db, mem::in_memory_db::StateRootDb};
     use alloy_primitives::{Address, hex};
     use alloy_rlp::Decodable;
-    use revm::{database::DatabaseRef, state::AccountInfo};
+    use revm::{database::DatabaseRef, interpreter::InstructionResult, state::AccountInfo};
     use tempo_primitives::TempoHeader;
 
     #[test]
@@ -912,6 +929,88 @@ mod tests {
         assert_eq!(loaded_block.header.gas_limit(), header.gas_limit());
         let loaded_tx = loaded_block.body.transactions.first().unwrap();
         assert_eq!(loaded_tx, &tx);
+    }
+
+    #[test]
+    fn serialized_blocks_puts_canonical_block_last() {
+        let block = |timestamp| {
+            create_block(
+                Header { number: 1, timestamp, ..Default::default() }.into(),
+                Vec::<MaybeImpersonatedTransaction<FoundryTxEnvelope>>::new(),
+            )
+        };
+        let block_a = block(1);
+        let block_b = block(2);
+        let (canonical, stale) = if block_a.header.hash_slow() < block_b.header.hash_slow() {
+            (block_a, block_b)
+        } else {
+            (block_b, block_a)
+        };
+
+        let mut storage = BlockchainStorage::<FoundryNetwork>::empty();
+        let stale_hash = storage.insert_block(stale);
+        let canonical_hash = storage.insert_block(canonical);
+        assert!(canonical_hash < stale_hash);
+
+        let mut loaded = BlockchainStorage::<FoundryNetwork>::empty();
+        loaded.load_blocks(storage.serialized_blocks());
+        assert_eq!(loaded.hashes.get(&1), Some(&canonical_hash));
+    }
+
+    #[test]
+    fn serialized_transactions_are_sorted() {
+        let transaction = |block_number, transaction_index, transaction_hash| MinedTransaction::<
+            FoundryNetwork,
+        > {
+            info: TransactionInfo {
+                transaction_hash,
+                transaction_index,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+                traces: Vec::new(),
+                exit: InstructionResult::Stop,
+                out: None,
+                nonce: 0,
+                gas_used: 0,
+            },
+            receipt: FoundryReceiptEnvelope::Legacy(Default::default()),
+            block_hash: B256::ZERO,
+            block_number,
+        };
+        let first = B256::from(U256::from(1));
+        let second = B256::from(U256::from(2));
+        let third = B256::from(U256::from(3));
+        let fourth = B256::from(U256::from(4));
+        let mut storage = BlockchainStorage::<FoundryNetwork>::empty();
+        for transaction in [
+            transaction(2, 0, fourth),
+            transaction(1, 1, third),
+            transaction(1, 0, second),
+            transaction(1, 0, first),
+        ] {
+            storage.transactions.insert(transaction.info.transaction_hash, transaction);
+        }
+
+        let hashes = storage
+            .serialized_transactions()
+            .into_iter()
+            .map(|transaction| transaction.info.transaction_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(hashes, [first, second, third, fourth]);
+    }
+
+    #[test]
+    fn serialized_historical_states_are_sorted() {
+        let hashes = [3, 1, 2].map(|number| B256::from(U256::from(number)));
+        let mut states = InMemoryBlockStates::default();
+        for hash in hashes {
+            states.insert(hash, StateDb::new(MemDb::default()));
+        }
+
+        let serialized_hashes =
+            states.serialized_states().into_iter().map(|(hash, _)| hash).collect::<Vec<_>>();
+        assert_eq!(serialized_hashes, [hashes[1], hashes[2], hashes[0]]);
     }
 
     #[test]

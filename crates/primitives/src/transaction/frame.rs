@@ -22,6 +22,10 @@ use alloy_primitives::{
     Address, B256, Bytes, ChainId, Sealable, TxKind, U256, keccak256, private::alloy_rlp::Buf,
 };
 use alloy_rlp::{BufMut, Decodable, Encodable, Header, length_of_length};
+use ml_dsa::{
+    EncodedVerifyingKey as MlDsaEncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
+    Verifier as _, VerifyingKey as MlDsaVerifyingKey,
+};
 use serde::{Deserialize, Serialize};
 
 /// Transaction type id of an EIP-8141 frame transaction.
@@ -57,12 +61,20 @@ pub mod scheme {
     pub const SECP256K1: u8 = 0x1;
     /// P256, encoded `r || s || qx || qy`.
     pub const P256: u8 = 0x2;
+    /// Experimental local ML-DSA-44 extension, encoded `signature || public_key`.
+    ///
+    /// Upstream EIP-8141 reserves this value. It is enabled here only as a
+    /// toolkit fixture while Ethereum's post-quantum wire format remains open.
+    pub const ML_DSA_44: u8 = 0x3;
 }
 
-/// Gas constants, mirroring `params/protocol_params.go`.
+/// Gas constants, following the EIP-8141 parameter tables.
 pub mod gas {
-    /// Base intrinsic cost of a frame transaction.
-    pub const INTRINSIC_COST: u64 = 15000;
+    /// Base intrinsic cost of a frame transaction (EIP-2780 `TX_BASE_COST`).
+    pub const INTRINSIC_COST: u64 = 12000;
+    /// Cost per value-bearing frame with an explicit non-sender target
+    /// (EIP-2780 `TX_VALUE_COST`).
+    pub const VALUE_COST: u64 = 6000;
     /// Fixed per-frame cost (CALL overhead + receipt log entry).
     pub const PER_FRAME_COST: u64 = 475;
     /// Maximum number of frames in a frame transaction.
@@ -73,14 +85,32 @@ pub mod gas {
     pub const SIGNATURE_SECP256K1: u64 = 2800;
     /// Cost of verifying a P256 signature entry.
     pub const SIGNATURE_P256: u64 = 6700;
+    /// Provisional cost of the experimental local ML-DSA-44 verifier.
+    pub const SIGNATURE_ML_DSA_44: u64 = 50_000;
     /// Cost of a structurally-checked arbitrary signature entry.
     pub const SIGNATURE_ARBITRARY: u64 = 100;
-    /// Token cost per non-zero byte (EIP-7623).
+    /// Token cost per non-zero byte (EIP-7623/7976).
     pub const TOKEN_PER_NON_ZERO_BYTE: u64 = 4;
-    /// `STANDARD_TOKEN_COST`, which params spells as the per-zero-byte cost.
+    /// `STANDARD_TOKEN_COST` (EIP-7976), which params spells as the
+    /// per-zero-byte cost.
     pub const STANDARD_TOKEN_COST: u64 = 4;
-    /// `TOTAL_COST_FLOOR_PER_TOKEN` (EIP-7623).
-    pub const COST_FLOOR_PER_TOKEN: u64 = 10;
+    /// `TOTAL_COST_FLOOR_PER_TOKEN` (EIP-7976).
+    pub const COST_FLOOR_PER_TOKEN: u64 = 16;
+    /// `TX_MAX_GAS_LIMIT` (EIP-7825): cap on the transaction's execution budget.
+    pub const TX_MAX_GAS_LIMIT: u64 = 16_777_216;
+    /// `CPSB` (EIP-8037): cost per state byte.
+    pub const CPSB: u64 = 1530;
+    /// `STATE_BYTES_PER_NEW_ACCOUNT` (EIP-8037).
+    pub const STATE_BYTES_PER_NEW_ACCOUNT: u64 = 120;
+    /// State gas charged when a value-bearing frame or `APPROVE` creates an
+    /// account: `STATE_BYTES_PER_NEW_ACCOUNT * CPSB`.
+    pub const NEW_ACCOUNT_STATE_GAS: u64 = STATE_BYTES_PER_NEW_ACCOUNT * CPSB;
+    /// `MAX_VERIFY_GAS`: execution-gas budget of a public-mempool validation
+    /// prefix, including signature verification.
+    pub const MAX_VERIFY_GAS: u64 = 100_000;
+    /// `MAX_VERIFY_STATE_GAS`: state-gas budget of a public-mempool validation
+    /// prefix.
+    pub const MAX_VERIFY_STATE_GAS: u64 = 500_000;
 }
 
 /// `ENTRY_POINT`: the caller of `DEFAULT` and `VERIFY` frames.
@@ -107,8 +137,11 @@ pub struct Frame {
     pub flags: u8,
     /// Call target; `None` means `tx.sender`.
     pub target: Option<Address>,
-    /// Gas limit allotted to this frame.
+    /// Execution gas limit allotted to this frame (`limits.execution`).
     pub gas_limit: u64,
+    /// State gas limit allotted to this frame (`limits.state`, EIP-8037).
+    #[serde(default)]
+    pub state_gas_limit: u64,
     /// Value transferred by the frame. Only a `SENDER` frame may be non-zero.
     pub value: U256,
     /// Calldata supplied to the frame.
@@ -128,11 +161,18 @@ impl Frame {
         self.mode == mode::VERIFY && self.target == Some(EXPIRY_VERIFIER_ADDRESS)
     }
 
+    /// Payload length of the nested `limits = [execution, state]` list.
+    fn limits_payload_length(&self) -> usize {
+        self.gas_limit.length() + self.state_gas_limit.length()
+    }
+
     fn rlp_payload_length(&self) -> usize {
+        let limits = self.limits_payload_length();
         self.mode.length()
             + self.flags.length()
             + target_rlp_length(self.target)
-            + self.gas_limit.length()
+            + limits
+            + length_of_length(limits)
             + self.value.length()
             + self.data.length()
     }
@@ -168,7 +208,9 @@ impl Encodable for Frame {
         self.mode.encode(out);
         self.flags.encode(out);
         encode_target(self.target, out);
+        Header { list: true, payload_length: self.limits_payload_length() }.encode(out);
         self.gas_limit.encode(out);
+        self.state_gas_limit.encode(out);
         self.value.encode(out);
         self.data.encode(out);
     }
@@ -182,11 +224,21 @@ impl Encodable for Frame {
 impl Decodable for Frame {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         let mut payload = Header::decode_bytes(buf, true)?;
+        let mode = u8::decode(&mut payload)?;
+        let flags = u8::decode(&mut payload)?;
+        let target = decode_target(&mut payload)?;
+        let mut limits = Header::decode_bytes(&mut payload, true)?;
+        let gas_limit = u64::decode(&mut limits)?;
+        let state_gas_limit = u64::decode(&mut limits)?;
+        if !limits.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
         let this = Self {
-            mode: u8::decode(&mut payload)?,
-            flags: u8::decode(&mut payload)?,
-            target: decode_target(&mut payload)?,
-            gas_limit: u64::decode(&mut payload)?,
+            mode,
+            flags,
+            target,
+            gas_limit,
+            state_gas_limit,
             value: U256::decode(&mut payload)?,
             data: Bytes::decode(&mut payload)?,
         };
@@ -201,7 +253,8 @@ impl Decodable for Frame {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameSignature {
-    /// Signature scheme: 0 `ARBITRARY`, 1 `SECP256K1`, 2 `P256`.
+    /// Signature scheme: 0 `ARBITRARY`, 1 `SECP256K1`, 2 `P256`, or the
+    /// experimental local value 3 `ML_DSA_44`.
     pub scheme: u8,
     /// Empty (meaning `tx.sender`) or a 20-byte address.
     pub signer: Bytes,
@@ -227,6 +280,7 @@ impl FrameSignature {
         match self.scheme {
             scheme::SECP256K1 => Some(gas::SIGNATURE_SECP256K1),
             scheme::P256 => Some(gas::SIGNATURE_P256),
+            scheme::ML_DSA_44 => Some(gas::SIGNATURE_ML_DSA_44),
             scheme::ARBITRARY => Some(gas::SIGNATURE_ARBITRARY),
             _ => None,
         }
@@ -301,15 +355,22 @@ pub struct TxFrame {
 }
 
 impl TxFrame {
+    /// Payload length of the nested `fees = [priority, max, blob]` list.
+    fn fees_payload_length(&self) -> usize {
+        self.max_priority_fee_per_gas.length()
+            + self.max_fee_per_gas.length()
+            + self.max_fee_per_blob_gas.length()
+    }
+
     fn rlp_payload_length(&self) -> usize {
+        let fees = self.fees_payload_length();
         self.chain_id.length()
             + self.nonce.length()
             + self.sender.length()
             + self.frames.length()
             + self.signatures.length()
-            + self.max_priority_fee_per_gas.length()
-            + self.max_fee_per_gas.length()
-            + self.max_fee_per_blob_gas.length()
+            + fees
+            + length_of_length(fees)
             + self.blob_versioned_hashes.length()
     }
 
@@ -321,6 +382,7 @@ impl TxFrame {
         self.sender.encode(out);
         self.frames.encode(out);
         self.signatures.encode(out);
+        Header { list: true, payload_length: self.fees_payload_length() }.encode(out);
         self.max_priority_fee_per_gas.encode(out);
         self.max_fee_per_gas.encode(out);
         self.max_fee_per_blob_gas.encode(out);
@@ -335,15 +397,27 @@ impl TxFrame {
     /// Decodes the RLP payload (without the type byte).
     pub fn decode_payload(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         let mut payload = Header::decode_bytes(buf, true)?;
+        let chain_id = U256::decode(&mut payload)?;
+        let nonce = u64::decode(&mut payload)?;
+        let sender = Address::decode(&mut payload)?;
+        let frames = Vec::<Frame>::decode(&mut payload)?;
+        let signatures = Vec::<FrameSignature>::decode(&mut payload)?;
+        let mut fees = Header::decode_bytes(&mut payload, true)?;
+        let max_priority_fee_per_gas = U256::decode(&mut fees)?;
+        let max_fee_per_gas = U256::decode(&mut fees)?;
+        let max_fee_per_blob_gas = U256::decode(&mut fees)?;
+        if !fees.is_empty() {
+            return Err(alloy_rlp::Error::UnexpectedLength);
+        }
         let this = Self {
-            chain_id: U256::decode(&mut payload)?,
-            nonce: u64::decode(&mut payload)?,
-            sender: Address::decode(&mut payload)?,
-            frames: Vec::<Frame>::decode(&mut payload)?,
-            signatures: Vec::<FrameSignature>::decode(&mut payload)?,
-            max_priority_fee_per_gas: U256::decode(&mut payload)?,
-            max_fee_per_gas: U256::decode(&mut payload)?,
-            max_fee_per_blob_gas: U256::decode(&mut payload)?,
+            chain_id,
+            nonce,
+            sender,
+            frames,
+            signatures,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            max_fee_per_blob_gas,
             blob_versioned_hashes: Vec::<B256>::decode(&mut payload)?,
         };
         if !payload.is_empty() {
@@ -367,9 +441,36 @@ impl TxFrame {
         elided.hash_slow()
     }
 
-    /// Sum of all frame gas limits, or `None` on overflow.
-    pub fn sum_frame_gas(&self) -> Option<u64> {
+    /// Sum of all frame execution gas limits, or `None` on overflow.
+    pub fn sum_frame_execution_gas(&self) -> Option<u64> {
         self.frames.iter().try_fold(0u64, |total, frame| total.checked_add(frame.gas_limit))
+    }
+
+    /// Sum of all frame state gas limits, or `None` on overflow.
+    pub fn sum_frame_state_gas(&self) -> Option<u64> {
+        self.frames.iter().try_fold(0u64, |total, frame| total.checked_add(frame.state_gas_limit))
+    }
+
+    /// Sum of all frame gas limits across both dimensions, or `None` on
+    /// overflow.
+    pub fn sum_frame_gas(&self) -> Option<u64> {
+        self.sum_frame_execution_gas()?.checked_add(self.sum_frame_state_gas()?)
+    }
+
+    /// `TX_VALUE_COST` for every value-bearing frame whose explicitly named
+    /// target is not the sender (EIP-2780): the recipient balance write and
+    /// transfer log are priced statically.
+    pub fn value_transfer_cost(&self) -> Option<u64> {
+        let valued = self
+            .frames
+            .iter()
+            .filter(|frame| {
+                !frame.value.is_zero()
+                    && frame.target.is_some()
+                    && frame.target != Some(self.sender)
+            })
+            .count() as u64;
+        valued.checked_mul(gas::VALUE_COST)
     }
 
     /// Total gas cost of verifying all signature entries, or `None` on overflow
@@ -380,7 +481,7 @@ impl TxFrame {
             .try_fold(0u64, |total, sig| total.checked_add(sig.verification_cost()?))
     }
 
-    /// Total number of calldata tokens across frames and signatures: one token
+    /// Weighted calldata-token count used by the standard intrinsic: one token
     /// per zero byte and `TOKEN_PER_NON_ZERO_BYTE` per non-zero byte.
     pub fn calldata_tokens(&self) -> Option<u64> {
         fn tokens_in(bytes: &[u8]) -> u64 {
@@ -401,25 +502,55 @@ impl TxFrame {
         Some(total)
     }
 
+    /// Uniform calldata-token count used by the EIP-7976 floor: every charged
+    /// byte contributes `TOKEN_PER_NON_ZERO_BYTE` tokens, regardless of value.
+    pub fn calldata_floor_tokens(&self) -> Option<u64> {
+        let bytes = self
+            .frames
+            .iter()
+            .try_fold(0u64, |total, frame| total.checked_add(frame.data.len() as u64))?;
+        let bytes = self.signatures.iter().try_fold(bytes, |total, sig| {
+            [&sig.signer, &sig.msg, &sig.signature]
+                .into_iter()
+                .try_fold(total, |total, field| total.checked_add(field.len() as u64))
+        })?;
+        bytes.checked_mul(gas::TOKEN_PER_NON_ZERO_BYTE)
+    }
+
+    /// `frame_tx_intrinsic_gas` in the EIP-2780 sense: derivable from the
+    /// transaction fields alone, charged entirely in the execution dimension.
+    pub fn intrinsic_gas(&self) -> Option<u64> {
+        let base = (self.frames.len() as u64)
+            .checked_mul(gas::PER_FRAME_COST)?
+            .checked_add(gas::INTRINSIC_COST)?
+            .checked_add(self.signature_verification_cost()?)?
+            .checked_add(self.value_transfer_cost()?)?;
+        base.checked_add(self.calldata_tokens()?.checked_mul(gas::STANDARD_TOKEN_COST)?)
+    }
+
     /// Computes `(standard_gas_limit, calldata_floor_gas, max_gas)`.
     ///
-    /// Both limits share a base of the intrinsic cost, the per-frame cost and
-    /// the signature verification cost. The standard limit adds the calldata
-    /// cost at `STANDARD_TOKEN_COST` per token plus the sum of the frame gas
-    /// limits; the floor charges `COST_FLOOR_PER_TOKEN` per token instead and
-    /// excludes frame gas.
+    /// The standard limit is the intrinsic gas plus the sum of every frame's
+    /// execution and state gas limits. The floor shares the intrinsic base but
+    /// charges `COST_FLOOR_PER_TOKEN` against a uniform four-token count for
+    /// every charged byte, and excludes frame gas. `max_gas` compares the floor
+    /// with the declared state budgets added, since state gas never absorbs into
+    /// the data floor.
     pub fn gas_limits(&self) -> Option<(u64, u64, u64)> {
         let base = (self.frames.len() as u64)
             .checked_mul(gas::PER_FRAME_COST)?
             .checked_add(gas::INTRINSIC_COST)?
-            .checked_add(self.signature_verification_cost()?)?;
-        let tokens = self.calldata_tokens()?;
+            .checked_add(self.signature_verification_cost()?)?
+            .checked_add(self.value_transfer_cost()?)?;
+        let standard_tokens = self.calldata_tokens()?;
+        let floor_tokens = self.calldata_floor_tokens()?;
 
         let standard = base
-            .checked_add(tokens.checked_mul(gas::STANDARD_TOKEN_COST)?)?
+            .checked_add(standard_tokens.checked_mul(gas::STANDARD_TOKEN_COST)?)?
             .checked_add(self.sum_frame_gas()?)?;
-        let floor = base.checked_add(tokens.checked_mul(gas::COST_FLOOR_PER_TOKEN)?)?;
-        Some((standard, floor, standard.max(floor)))
+        let floor = base.checked_add(floor_tokens.checked_mul(gas::COST_FLOOR_PER_TOKEN)?)?;
+        let max_gas = standard.max(floor.checked_add(self.sum_frame_state_gas()?)?);
+        Some((standard, floor, max_gas))
     }
 
     /// Maximum gas the transaction may consume, saturating to `u64::MAX` when
@@ -471,7 +602,7 @@ impl TxFrame {
 
         for sig in &self.signatures {
             match sig.scheme {
-                scheme::SECP256K1 | scheme::P256 => {
+                scheme::SECP256K1 | scheme::P256 | scheme::ML_DSA_44 => {
                     if !sig.signer.is_empty() && sig.signer.len() != 20 {
                         return Err(FrameTxError::SignerLength(sig.signer.len()));
                     }
@@ -497,8 +628,10 @@ impl TxFrame {
             if frame.mode != mode::SENDER && !frame.value.is_zero() {
                 return Err(FrameTxError::ValueOnNonSenderFrame { index: i });
             }
-            total_frame_gas =
-                total_frame_gas.checked_add(frame.gas_limit).ok_or(FrameTxError::GasOverflow)?;
+            total_frame_gas = total_frame_gas
+                .checked_add(frame.gas_limit)
+                .and_then(|total| total.checked_add(frame.state_gas_limit))
+                .ok_or(FrameTxError::GasOverflow)?;
 
             // Approval of execution is only allowed when the target is null or
             // the sender: nothing else may authorise the sender's execution.
@@ -518,21 +651,44 @@ impl TxFrame {
                 }
             }
 
-            // An expiry verifier frame must carry exactly an 8-byte deadline
-            // and no flags, and at most one may appear per transaction.
+            // A frame belongs to a batch when it or its predecessor carries the
+            // flag; batch frames may not carry approval scope, which keeps the
+            // approval context constant across a batch unroll.
+            let in_batch = frame.flags & flags::ATOMIC_BATCH != 0
+                || (i > 0 && self.frames[i - 1].flags & flags::ATOMIC_BATCH != 0);
+            if in_batch && frame.flags & flags::APPROVE_EXECUTION_PAYMENT != 0 {
+                return Err(FrameTxError::ApproveScopeInBatch { index: i });
+            }
+
+            // An expiry verifier frame must carry exactly an 8-byte deadline,
+            // no flags and no state budget, and at most one may appear per
+            // transaction.
             if frame.is_expiry_verifier() {
                 expiry_frames += 1;
                 if expiry_frames > 1 {
                     return Err(FrameTxError::MultipleExpiryFrames);
                 }
-                if frame.flags != 0 || frame.data.len() != gas::EXPIRY_DATA_LENGTH {
+                if frame.flags != 0
+                    || frame.state_gas_limit != 0
+                    || frame.data.len() != gas::EXPIRY_DATA_LENGTH
+                {
                     return Err(FrameTxError::MalformedExpiryFrame { index: i });
                 }
             }
         }
 
         // Overflowing gas figures make the transaction invalid.
-        self.gas_limits().ok_or(FrameTxError::GasOverflow)?;
+        let (_, floor, _) = self.gas_limits().ok_or(FrameTxError::GasOverflow)?;
+
+        // EIP-7825: the execution budget must fit the transaction gas cap.
+        // State gas is excluded; it is bounded by block state-gas capacity.
+        let execution_budget = self
+            .intrinsic_gas()
+            .and_then(|intrinsic| intrinsic.checked_add(self.sum_frame_execution_gas()?))
+            .ok_or(FrameTxError::GasOverflow)?;
+        if execution_budget.max(floor) > gas::TX_MAX_GAS_LIMIT {
+            return Err(FrameTxError::GasCapExceeded);
+        }
         Ok(())
     }
 
@@ -566,6 +722,7 @@ impl TxFrame {
         match sig.scheme {
             scheme::SECP256K1 => verify_secp256k1(&sig.signature, msg, resolved),
             scheme::P256 => verify_p256(&sig.signature, msg, resolved),
+            scheme::ML_DSA_44 => verify_ml_dsa_44(&sig.signature, msg, resolved),
             // An ARBITRARY entry is interpreted by the frame code, not the
             // protocol; it is only required to name no signer.
             scheme::ARBITRARY => sig.signer.is_empty(),
@@ -582,6 +739,12 @@ const SECP256K1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
 const SECP256R1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
     "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
 ));
+
+/// Fixed FIPS 204 ML-DSA-44 wire sizes. The local FrameTx encoding places the
+/// detached signature first, followed by the raw public key.
+const ML_DSA_44_SIGNATURE_SIZE: usize = 2420;
+const ML_DSA_44_PUBLIC_KEY_SIZE: usize = 1312;
+const ML_DSA_44_WIRE_SIZE: usize = ML_DSA_44_SIGNATURE_SIZE + ML_DSA_44_PUBLIC_KEY_SIZE;
 
 /// Verifies a secp256k1 entry, whose 65 bytes are encoded `v || r || s` with
 /// `v` the recovery id (0 or 1) -- note this is *not* the usual `r || s || v`.
@@ -636,6 +799,44 @@ fn verify_p256(signature: &[u8], msg: B256, resolved: Address) -> bool {
     input[..32].copy_from_slice(msg.as_slice());
     input[32..].copy_from_slice(&signature[..128]);
     revm::precompile::secp256r1::verify_impl(&input)
+}
+
+/// Verifies the toolkit's experimental ML-DSA-44 scheme.
+///
+/// This is pure FIPS 204 ML-DSA with an empty context over the existing
+/// 32-byte FrameTx message. The raw public key is carried with every signature
+/// because ML-DSA does not support public-key recovery. Prefixing it with the
+/// scheme byte before hashing keeps its 20-byte identity in a separate domain
+/// from every other signature scheme.
+fn verify_ml_dsa_44(signature: &[u8], msg: B256, resolved: Address) -> bool {
+    if signature.len() != ML_DSA_44_WIRE_SIZE {
+        return false;
+    }
+    let (encoded_signature, public_key) = signature.split_at(ML_DSA_44_SIGNATURE_SIZE);
+
+    let mut identity_input = [0u8; 1 + ML_DSA_44_PUBLIC_KEY_SIZE];
+    identity_input[0] = scheme::ML_DSA_44;
+    identity_input[1..].copy_from_slice(public_key);
+    if Address::from_slice(&keccak256(identity_input)[12..]) != resolved {
+        return false;
+    }
+
+    let Ok(encoded_public_key) = MlDsaEncodedVerifyingKey::<MlDsa44>::try_from(public_key) else {
+        return false;
+    };
+    let verifying_key = MlDsaVerifyingKey::<MlDsa44>::decode(&encoded_public_key);
+    if verifying_key.encode().as_slice() != public_key {
+        return false;
+    }
+
+    let Ok(signature) = MlDsaSignature::<MlDsa44>::try_from(encoded_signature) else {
+        return false;
+    };
+    if signature.encode().as_slice() != encoded_signature {
+        return false;
+    }
+
+    verifying_key.verify(msg.as_slice(), &signature).is_ok()
 }
 
 /// Why a frame transaction envelope is invalid.
@@ -704,6 +905,12 @@ pub enum FrameTxError {
         /// Index of the offending frame.
         index: usize,
     },
+    /// A frame inside an atomic batch carried approval scope flags.
+    #[error("frame {index}: approval scope inside an atomic batch")]
+    ApproveScopeInBatch {
+        /// Index of the offending frame.
+        index: usize,
+    },
     /// At most one expiry verifier frame may appear per transaction.
     #[error("multiple expiry verifier frames")]
     MultipleExpiryFrames,
@@ -716,6 +923,9 @@ pub enum FrameTxError {
     /// The declared gas figures do not fit in 64 bits.
     #[error("frame transaction gas overflow")]
     GasOverflow,
+    /// The execution budget exceeds the EIP-7825 transaction gas cap.
+    #[error("execution budget exceeds TX_MAX_GAS_LIMIT")]
+    GasCapExceeded,
     /// A signature entry failed structural or cryptographic validation.
     #[error("signature {index} invalid")]
     InvalidSignature {
@@ -859,6 +1069,7 @@ impl Transaction for TxFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ml_dsa::{Keypair as _, Seed, Signer as _, SigningKey};
 
     /// A minimal single-frame transaction: a DEFAULT frame with no target.
     fn sample() -> TxFrame {
@@ -872,6 +1083,7 @@ mod tests {
                     flags: flags::APPROVE_EXECUTION_PAYMENT,
                     target: None,
                     gas_limit: 50_000,
+                    state_gas_limit: 0,
                     value: U256::ZERO,
                     data: Bytes::from_static(b"\x01\x02\x00\x03"),
                 },
@@ -880,6 +1092,7 @@ mod tests {
                     flags: 0,
                     target: Some(Address::repeat_byte(0x22)),
                     gas_limit: 21_000,
+                    state_gas_limit: 200_000,
                     value: U256::from(1_000u64),
                     data: Bytes::new(),
                 },
@@ -897,20 +1110,21 @@ mod tests {
         }
     }
 
-    /// Byte-exact agreement with the go-ethereum reference implementation for
-    /// the transaction built by `sample()`. Generated from `FrameTx` on
-    /// `leekt/go-ethereum@fix/eip8141-frame-tx`; if the RLP field order, the
-    /// null-target encoding or the sig-hash eliding drifts, this test breaks.
-    const REFERENCE_RAW: &str = "06f89c827a6907941111111111111111111111111111111111111111eccc01038082c350808401020003de028094222222222222222222222222222222222222222282520882\
-03e880f848f846018080b841ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab843b9aca008477359400\
-80c0";
+    /// Pinned wire vector for the transaction built by `sample()`, under the
+    /// master-spec envelope (`fees` and `limits` sublists). The previous
+    /// go-ethereum cross-check (`leekt/go-ethereum@fix/eip8141-frame-tx`)
+    /// implements the pinned envelope and predates this format; regenerate the
+    /// cross-check once the reference adopts the new wire format. If the RLP
+    /// field order, the null-target encoding or the sig-hash eliding drifts,
+    /// this test breaks.
+    const REFERENCE_RAW: &str = "06f8a4827a6907941111111111111111111111111111111111111111f3ce010380c482c35080808401020003e30280942222222222222222222222222222222222222222c782520883030d408203e880f848f846018080b841abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababcb843b9aca00847735940080c0";
     const REFERENCE_TX_HASH: &str =
-        "0x74cb5b842b70918cbccf31e9522537fa72406961c9a589b30620bc29e3357d3d";
+        "0x274786f735c1d5f8cf673a4865d25e5c83aa72805d1668d65b48f89e5a221ff4";
     const REFERENCE_SIG_HASH: &str =
-        "0xa489131fd3a35916dc4faa1e13f4de92a191736258a76031802f513136a187a0";
+        "0x23d97c249576b62ed4d31a1e331af99cea9fcc6910ed9c1dd2b57d03cd6bb9ed";
 
     #[test]
-    fn encoding_matches_the_go_ethereum_reference() {
+    fn encoding_matches_the_pinned_vector() {
         let tx = sample();
 
         let mut encoded = Vec::new();
@@ -919,9 +1133,6 @@ mod tests {
 
         assert_eq!(tx.hash_slow(), REFERENCE_TX_HASH.parse::<B256>().unwrap());
         assert_eq!(tx.signature_hash(), REFERENCE_SIG_HASH.parse::<B256>().unwrap());
-
-        // The reference reports standard=90842, floor=21480, max_gas=90842.
-        assert_eq!(tx.gas_limits().unwrap(), (90_842, 21_480, 90_842));
     }
 
     #[test]
@@ -931,14 +1142,47 @@ mod tests {
         assert_eq!(decoded, sample());
     }
 
-    /// A fully signed single-frame transaction produced by the go-ethereum
-    /// reference using anvil's first dev key. The reference asserts its own
-    /// `ValidateSignature` accepts it before emitting these bytes.
-    const SIGNED_RAW: &str = "06f879827a698094f39fd6e51aad88f6f4ce6ab8827279cfffb92266c9c801038082c3508080f848f846018080b8410183f2f7d3321170e7cb523462693ed9480f7be7b49b\
-317fa340c03949e3a5054c0c5900775a8e3478e75eb049b8598c6acdb41b6f25ffa9c700416e6db5fa45b6843b9aca00847735940080c0";
+    /// A fully signed single-frame transaction over the master-spec envelope,
+    /// signed with anvil's first dev key
+    /// (`0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80`)
+    /// over the canonical signature hash of `signed_sample()`. Encoded
+    /// `v || r || s` with `v` the recovery id.
+    const SIGNED_SIGNATURE: &str = "0106834df11a4f16c17824695a77de51ae3d12f2a6946f1c056be75d1b6228259a28420899b8e8b16652ee694b4a6fd6551717c456a7d51fa348abb2cdf8c8f399";
+    const SIGNED_RAW: &str = "06f87c827a698094f39fd6e51aad88f6f4ce6ab8827279cfffb92266cbca010380c482c350808080f848f846018080b8410106834df11a4f16c17824695a77de51ae3d12f2a694\
+6f1c056be75d1b6228259a28420899b8e8b16652ee694b4a6fd6551717c456a7d51fa348abb2cdf8c8f399cb843b9aca00847735940080c0";
     const SIGNED_SENDER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
     const SIGNED_SIG_HASH: &str =
-        "0x8fb9b3ddc010b51b33a22f243eef5688509bb0862087360ec49ac51597da3237";
+        "0x10db3f07e098246cdf4056883c5a2754d90dff087c410b2bbc3af2a75891c7d9";
+
+    /// The signed vector's envelope: one self-verifying frame, no state gas.
+    fn signed_sample() -> TxFrame {
+        TxFrame {
+            chain_id: U256::from(31337u64),
+            nonce: 0,
+            sender: SIGNED_SENDER.parse().unwrap(),
+            frames: vec![Frame {
+                mode: mode::VERIFY,
+                flags: flags::APPROVE_EXECUTION_PAYMENT,
+                target: None,
+                gas_limit: 50_000,
+                state_gas_limit: 0,
+                value: U256::ZERO,
+                data: Bytes::new(),
+            }],
+            signatures: vec![FrameSignature {
+                scheme: scheme::SECP256K1,
+                signer: Bytes::new(),
+                msg: Bytes::new(),
+                signature: alloy_primitives::hex::decode(SIGNED_SIGNATURE)
+                    .unwrap_or_else(|_| vec![0xAB; 65])
+                    .into(),
+            }],
+            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+            max_fee_per_gas: U256::from(2_000_000_000u64),
+            max_fee_per_blob_gas: U256::ZERO,
+            blob_versioned_hashes: vec![],
+        }
+    }
 
     fn signed_vector() -> TxFrame {
         let raw = alloy_primitives::hex::decode(SIGNED_RAW).unwrap();
@@ -949,9 +1193,9 @@ mod tests {
     fn accepts_the_reference_signed_transaction() {
         let tx = signed_vector();
 
+        assert_eq!(tx, signed_sample());
         assert_eq!(tx.sender, SIGNED_SENDER.parse::<Address>().unwrap());
         assert_eq!(tx.signature_hash(), SIGNED_SIG_HASH.parse::<B256>().unwrap());
-        assert_eq!(tx.gas_limits().unwrap(), (69_291, 20_815, 69_291));
 
         tx.validate().expect("reference envelope must be valid");
         tx.validate_signatures().expect("reference signature must verify");
@@ -1002,6 +1246,174 @@ mod tests {
         let mut mutated = tx.clone();
         mutated.signatures[0].signature = malleable.into();
         assert!(mutated.validate_signatures().is_err());
+    }
+
+    /// Daimo's first EIP-7951 vector, split as
+    /// `msg || r || s || qx || qy`. EIP-8141 carries the last four words in
+    /// the signature field and resolves the signer from `keccak256(qx || qy)`.
+    const P256_VECTOR: &str = "4cee90eb86eaa050036147a12d49004b6b9c72bd725d39d4785011fe190f0b4da73bd4903f0ce3b639bbbf6e8e80d16931ff4bcf5993d58468e8fb19086e8cac36dbcd03009df8c59286b162af3bd7fcc0450c9aa81be5d10d312af6c66b1d604aebd3099c618202fcfe16ae7770b0c49ab5eadf74b754204a3bb6060e44eff37618b065f9832de4ca6ca971a7a1adc826d0f7c00181a5fb2ddf79ae00b4e10e";
+
+    fn p256_vector() -> (FrameSignature, B256) {
+        let input = alloy_primitives::hex::decode(P256_VECTOR).unwrap();
+        let msg = B256::from_slice(&input[..32]);
+        let resolved = Address::from_slice(&keccak256(&input[96..160])[12..]);
+        let signature = FrameSignature {
+            scheme: scheme::P256,
+            signer: Bytes::copy_from_slice(resolved.as_slice()),
+            msg: Bytes::new(),
+            signature: Bytes::copy_from_slice(&input[32..]),
+        };
+        (signature, msg)
+    }
+
+    #[test]
+    fn accepts_a_canonical_p256_wire_signature() {
+        let (signature, canonical_hash) = p256_vector();
+        assert!(sample().validate_signature(&signature, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_p256_wrong_hash_signer_and_wire_length() {
+        let (signature, canonical_hash) = p256_vector();
+        let tx = sample();
+
+        assert!(!tx.validate_signature(&signature, B256::repeat_byte(0x42)));
+
+        let mut wrong_signer = signature.clone();
+        wrong_signer.signer = Bytes::from(vec![0x42; 20]);
+        assert!(!tx.validate_signature(&wrong_signer, canonical_hash));
+
+        let mut short = signature;
+        short.signature = Bytes::copy_from_slice(&short.signature[..127]);
+        assert!(!tx.validate_signature(&short, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_a_high_s_p256_signature_from_the_pinned_profile() {
+        let (mut signature, canonical_hash) = p256_vector();
+        let s = U256::from_be_slice(&signature.signature[32..64]);
+        let high_s = SECP256R1_N - s;
+        let mut high_s_signature = signature.signature.to_vec();
+        high_s_signature[32..64].copy_from_slice(&high_s.to_be_bytes::<32>());
+        signature.signature = high_s_signature.into();
+
+        // EIP-7951 verifies both forms, but the toolkit's pinned EIP-8141
+        // profile requires the unique low-s encoding before frame execution.
+        assert!(!sample().validate_signature(&signature, canonical_hash));
+    }
+
+    fn ml_dsa_44_signer(public_key: &[u8]) -> Address {
+        assert_eq!(public_key.len(), ML_DSA_44_PUBLIC_KEY_SIZE);
+        let mut identity_input = [0u8; 1 + ML_DSA_44_PUBLIC_KEY_SIZE];
+        identity_input[0] = scheme::ML_DSA_44;
+        identity_input[1..].copy_from_slice(public_key);
+        Address::from_slice(&keccak256(identity_input)[12..])
+    }
+
+    fn ml_dsa_44_vector() -> (FrameSignature, B256) {
+        let seed = Seed::from([0x42; 32]);
+        let signing_key = SigningKey::<MlDsa44>::from_seed(&seed);
+        let public_key = signing_key.verifying_key().encode();
+        let canonical_hash = B256::repeat_byte(0x5a);
+        let signature: MlDsaSignature<MlDsa44> = signing_key.sign(canonical_hash.as_slice());
+
+        let mut wire = Vec::with_capacity(ML_DSA_44_WIRE_SIZE);
+        wire.extend_from_slice(signature.encode().as_slice());
+        wire.extend_from_slice(public_key.as_slice());
+        assert_eq!(wire.len(), ML_DSA_44_WIRE_SIZE);
+
+        (
+            FrameSignature {
+                scheme: scheme::ML_DSA_44,
+                signer: Bytes::copy_from_slice(ml_dsa_44_signer(public_key.as_slice()).as_slice()),
+                msg: Bytes::new(),
+                signature: wire.into(),
+            },
+            canonical_hash,
+        )
+    }
+
+    #[test]
+    fn accepts_a_canonical_ml_dsa_44_wire_signature() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+
+        assert_eq!(signature.verification_cost(), Some(gas::SIGNATURE_ML_DSA_44));
+        assert!(sample().validate_signature(&signature, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_ml_dsa_44_wrong_hash_and_signer() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+        let tx = sample();
+
+        assert!(!tx.validate_signature(&signature, B256::repeat_byte(0x42)));
+
+        let mut wrong_signer = signature;
+        wrong_signer.signer = Bytes::from(vec![0x42; 20]);
+        assert!(!tx.validate_signature(&wrong_signer, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_corrupt_ml_dsa_44_signature_and_public_key() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+        let tx = sample();
+
+        let mut corrupt_signature = signature.clone();
+        let mut corrupt_signature_wire = corrupt_signature.signature.to_vec();
+        corrupt_signature_wire[0] ^= 1;
+        corrupt_signature.signature = corrupt_signature_wire.into();
+        assert!(!tx.validate_signature(&corrupt_signature, canonical_hash));
+
+        // Recompute the identity for the corrupted key so the negative case
+        // reaches ML-DSA verification instead of stopping at signer matching.
+        let mut corrupt_public_key = signature;
+        let mut corrupt_public_key_wire = corrupt_public_key.signature.to_vec();
+        corrupt_public_key_wire[ML_DSA_44_SIGNATURE_SIZE] ^= 1;
+        let public_key = &corrupt_public_key_wire[ML_DSA_44_SIGNATURE_SIZE..];
+        corrupt_public_key.signer = Bytes::copy_from_slice(ml_dsa_44_signer(public_key).as_slice());
+        corrupt_public_key.signature = corrupt_public_key_wire.into();
+        assert!(!tx.validate_signature(&corrupt_public_key, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_non_canonical_or_wrong_length_ml_dsa_44_wire() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+        let tx = sample();
+
+        // ML-DSA-44's final 84 signature bytes encode 80 hint indices and
+        // four cumulative cuts. Duplicate indices within a polynomial and
+        // decreasing cuts are both forbidden canonical encodings.
+        const HINT_OFFSET: usize = ML_DSA_44_SIGNATURE_SIZE - 84;
+        const HINT_CUTS_OFFSET: usize = HINT_OFFSET + 80;
+
+        let mut repeated_hint = signature.clone();
+        let mut repeated_hint_wire = repeated_hint.signature.to_vec();
+        repeated_hint_wire[HINT_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(0);
+        repeated_hint_wire[HINT_OFFSET] = 1;
+        repeated_hint_wire[HINT_OFFSET + 1] = 1;
+        repeated_hint_wire[HINT_CUTS_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(2);
+        repeated_hint.signature = repeated_hint_wire.into();
+        assert!(!tx.validate_signature(&repeated_hint, canonical_hash));
+
+        let mut decreasing_cuts = signature.clone();
+        let mut decreasing_cuts_wire = decreasing_cuts.signature.to_vec();
+        decreasing_cuts_wire[HINT_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(0);
+        decreasing_cuts_wire[HINT_CUTS_OFFSET] = 2;
+        decreasing_cuts_wire[HINT_CUTS_OFFSET + 1] = 1;
+        decreasing_cuts_wire[HINT_CUTS_OFFSET + 2] = 1;
+        decreasing_cuts_wire[HINT_CUTS_OFFSET + 3] = 1;
+        decreasing_cuts.signature = decreasing_cuts_wire.into();
+        assert!(!tx.validate_signature(&decreasing_cuts, canonical_hash));
+
+        let mut short = signature.clone();
+        short.signature = Bytes::copy_from_slice(&short.signature[..ML_DSA_44_WIRE_SIZE - 1]);
+        assert!(!tx.validate_signature(&short, canonical_hash));
+
+        let mut long = signature;
+        let mut long_wire = long.signature.to_vec();
+        long_wire.push(0);
+        long.signature = long_wire.into();
+        assert!(!tx.validate_signature(&long, canonical_hash));
     }
 
     #[test]
@@ -1178,20 +1590,181 @@ mod tests {
     }
 
     #[test]
+    fn value_transfer_cost_only_charges_explicit_external_targets() {
+        let sender = Address::repeat_byte(0x11);
+        let tx = TxFrame {
+            sender,
+            frames: vec![
+                // A missing target resolves to the sender and does not write a
+                // distinct recipient balance or emit a transfer log.
+                Frame { value: U256::ONE, target: None, ..Default::default() },
+                Frame { value: U256::ONE, target: Some(sender), ..Default::default() },
+                Frame {
+                    value: U256::ONE,
+                    target: Some(Address::repeat_byte(0x22)),
+                    ..Default::default()
+                },
+                Frame {
+                    value: U256::ZERO,
+                    target: Some(Address::repeat_byte(0x33)),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(tx.value_transfer_cost(), Some(gas::VALUE_COST));
+        assert_eq!(
+            tx.intrinsic_gas(),
+            Some(gas::INTRINSIC_COST + 4 * gas::PER_FRAME_COST + gas::VALUE_COST)
+        );
+    }
+
+    #[test]
     fn gas_limits_follow_the_reference_formula() {
         let tx = sample();
         let (standard, floor, max_gas) = tx.gas_limits().unwrap();
 
         // 4 bytes of frame data (2 zero-ish: 0x01,0x02,0x00,0x03 -> one zero)
         // plus the 65 signature bytes, all non-zero.
-        let tokens = tx.calldata_tokens().unwrap();
-        assert_eq!(tokens, (1 + 3 * 4) + 65 * 4);
+        let standard_tokens = tx.calldata_tokens().unwrap();
+        let floor_tokens = tx.calldata_floor_tokens().unwrap();
+        assert_eq!(standard_tokens, (1 + 3 * 4) + 65 * 4);
+        assert_eq!(floor_tokens, (4 + 65) * 4);
 
-        let base = 2 * gas::PER_FRAME_COST + gas::INTRINSIC_COST + gas::SIGNATURE_SECP256K1;
-        assert_eq!(standard, base + tokens * gas::STANDARD_TOKEN_COST + 71_000);
-        assert_eq!(floor, base + tokens * gas::COST_FLOOR_PER_TOKEN);
-        assert_eq!(max_gas, standard.max(floor));
+        // One value-bearing frame charges TX_VALUE_COST inside the intrinsic.
+        let base = 2 * gas::PER_FRAME_COST
+            + gas::INTRINSIC_COST
+            + gas::SIGNATURE_SECP256K1
+            + gas::VALUE_COST;
+        // Frame execution limits sum to 71_000, state limits to 200_000.
+        assert_eq!(standard, base + standard_tokens * gas::STANDARD_TOKEN_COST + 71_000 + 200_000);
+        assert_eq!(floor, base + floor_tokens * gas::COST_FLOOR_PER_TOKEN);
+        // State gas never absorbs into the data floor.
+        assert_eq!(max_gas, standard.max(floor + 200_000));
         assert_eq!(tx.max_gas(), max_gas);
+        assert_eq!(tx.intrinsic_gas().unwrap(), base + standard_tokens * gas::STANDARD_TOKEN_COST);
+    }
+
+    #[test]
+    fn calldata_floor_prices_zero_and_nonzero_bytes_uniformly() {
+        let transaction = |byte| TxFrame {
+            frames: vec![Frame { data: Bytes::from(vec![byte; 2]), ..Default::default() }],
+            signatures: vec![FrameSignature {
+                scheme: scheme::ARBITRARY,
+                signer: Bytes::new(),
+                msg: Bytes::new(),
+                signature: Bytes::from(vec![byte; 2]),
+            }],
+            ..Default::default()
+        };
+        let zero = transaction(0);
+        let nonzero = transaction(0xff);
+
+        assert_eq!(zero.calldata_tokens(), Some(4));
+        assert_eq!(nonzero.calldata_tokens(), Some(16));
+        assert_eq!(zero.calldata_floor_tokens(), Some(16));
+        assert_eq!(nonzero.calldata_floor_tokens(), Some(16));
+
+        let base = gas::INTRINSIC_COST + gas::PER_FRAME_COST + gas::SIGNATURE_ARBITRARY;
+        assert_eq!(zero.intrinsic_gas(), Some(base + 4 * gas::STANDARD_TOKEN_COST));
+        assert_eq!(nonzero.intrinsic_gas(), Some(base + 16 * gas::STANDARD_TOKEN_COST));
+        assert_eq!(zero.gas_limits().unwrap().1, base + 16 * gas::COST_FLOOR_PER_TOKEN);
+        assert_eq!(zero.gas_limits().unwrap().1, nonzero.gas_limits().unwrap().1);
+    }
+
+    #[test]
+    fn uniform_calldata_floor_enforces_the_transaction_gas_cap() {
+        let base = gas::INTRINSIC_COST + gas::PER_FRAME_COST;
+        let gas_per_floor_byte = gas::TOKEN_PER_NON_ZERO_BYTE * gas::COST_FLOOR_PER_TOKEN;
+        let max_floor_bytes = ((gas::TX_MAX_GAS_LIMIT - base) / gas_per_floor_byte) as usize;
+        let transaction = |length| TxFrame {
+            frames: vec![Frame { data: Bytes::from(vec![0; length]), ..Default::default() }],
+            ..Default::default()
+        };
+
+        let at_cap = transaction(max_floor_bytes);
+        assert!(at_cap.gas_limits().unwrap().1 <= gas::TX_MAX_GAS_LIMIT);
+        at_cap.validate().unwrap();
+
+        let above_cap = transaction(max_floor_bytes + 1);
+        assert!(above_cap.intrinsic_gas().unwrap() < gas::TX_MAX_GAS_LIMIT);
+        assert!(above_cap.gas_limits().unwrap().1 > gas::TX_MAX_GAS_LIMIT);
+        assert_eq!(above_cap.validate(), Err(FrameTxError::GasCapExceeded));
+    }
+
+    #[test]
+    fn validate_enforces_batch_scope_and_state_gas_rules() {
+        let base = signed_vector();
+
+        // Approval scope on a frame that carries the batch flag.
+        let mut scoped_batch = base.clone();
+        scoped_batch.frames = vec![
+            base.frames[0].clone(),
+            Frame {
+                mode: mode::SENDER,
+                flags: flags::ATOMIC_BATCH | flags::APPROVE_PAYMENT,
+                target: Some(Address::repeat_byte(0x22)),
+                gas_limit: 21_000,
+                ..Default::default()
+            },
+            Frame {
+                mode: mode::SENDER,
+                flags: 0,
+                target: Some(Address::repeat_byte(0x22)),
+                gas_limit: 21_000,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(scoped_batch.validate(), Err(FrameTxError::ApproveScopeInBatch { index: 1 }));
+
+        // Approval scope on a batch terminator (predecessor carries the flag).
+        let mut scoped_terminator = base.clone();
+        scoped_terminator.frames = vec![
+            base.frames[0].clone(),
+            Frame {
+                mode: mode::SENDER,
+                flags: flags::ATOMIC_BATCH,
+                target: Some(Address::repeat_byte(0x22)),
+                gas_limit: 21_000,
+                ..Default::default()
+            },
+            Frame {
+                mode: mode::SENDER,
+                flags: flags::APPROVE_PAYMENT,
+                target: Some(Address::repeat_byte(0x22)),
+                gas_limit: 21_000,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            scoped_terminator.validate(),
+            Err(FrameTxError::ApproveScopeInBatch { index: 2 })
+        );
+
+        // An expiry verifier frame may not carry a state budget.
+        let mut expiry_state = base.clone();
+        expiry_state.frames.insert(
+            0,
+            Frame {
+                mode: mode::VERIFY,
+                flags: 0,
+                target: Some(EXPIRY_VERIFIER_ADDRESS),
+                gas_limit: 5_000,
+                state_gas_limit: 1,
+                value: U256::ZERO,
+                data: Bytes::from(vec![0u8; gas::EXPIRY_DATA_LENGTH]),
+            },
+        );
+        assert_eq!(expiry_state.validate(), Err(FrameTxError::MalformedExpiryFrame { index: 0 }));
+
+        // The EIP-7825 cap binds the execution budget, not the state budget.
+        let mut over_cap = base.clone();
+        over_cap.frames[0].gas_limit = gas::TX_MAX_GAS_LIMIT;
+        assert_eq!(over_cap.validate(), Err(FrameTxError::GasCapExceeded));
+        let mut state_heavy = base.clone();
+        state_heavy.frames[0].state_gas_limit = gas::TX_MAX_GAS_LIMIT * 4;
+        state_heavy.validate().unwrap();
     }
 
     #[test]

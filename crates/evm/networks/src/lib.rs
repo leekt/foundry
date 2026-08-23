@@ -14,15 +14,14 @@ use alloy_evm::precompiles::{DynPrecompile, PrecompilesMap};
 use alloy_primitives::{Address, ChainId, address, map::AddressHashMap};
 use clap::Parser;
 #[cfg(feature = "monad")]
-use foundry_evm_hardforks::MonadHardfork;
-use foundry_evm_hardforks::{FoundryHardfork, TempoHardfork};
+type MonadHardfork = foundry_evm_hardforks::MonadHardfork;
+#[cfg(feature = "optimism")]
+use foundry_evm_hardforks::OpHardfork;
+use foundry_evm_hardforks::{
+    EthereumHardfork, FoundryHardfork, TempoHardfork, latest_active_tempo_hardfork,
+};
 #[cfg(not(feature = "monad"))]
 type MonadHardfork = ();
-#[cfg(feature = "monad")]
-use monad_revm::{
-    MONAD_MAX_CODE_SIZE, MONAD_MAX_INITCODE_SIZE, reserve_balance::abi::RESERVE_BALANCE_ADDRESS,
-    staking::STAKING_ADDRESS,
-};
 use revm::precompile::{
     Precompile as RevmPrecompile,
     secp256r1::{P256VERIFY, P256VERIFY_OSAKA},
@@ -36,6 +35,12 @@ use tempo_contracts::precompiles::{
     TIP20_CHANNEL_RESERVE_ADDRESS, TIP20_FACTORY_ADDRESS, TIP403_REGISTRY_ADDRESS,
     VALIDATOR_CONFIG_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
 };
+
+/// The Monad cheatcode handler address.
+pub const MONAD_CHEATCODE_ADDRESS: Address = address!("0xc0FFeeCD43A10e1C2b0De63c6CDCFe5B7d0e0CEA");
+
+#[cfg(feature = "monad")]
+const MONAD_CHEATCODE_ADDRESSES: &[Address] = &[MONAD_CHEATCODE_ADDRESS];
 
 pub mod arbitrum;
 pub mod celo;
@@ -61,12 +66,16 @@ const TEMPO_PRECOMPILES: &[(&str, Address)] = &[
 ];
 
 #[cfg(feature = "monad")]
-const MONAD_PRECOMPILE_LABELS: &[(&str, Address)] =
-    &[("Staking", STAKING_ADDRESS), ("ReserveBalance", RESERVE_BALANCE_ADDRESS)];
+const MONAD_PRECOMPILE_LABELS: &[(&str, Address)] = &[
+    ("Staking", monad_revm::staking::STAKING_ADDRESS),
+    ("ReserveBalance", monad_revm::reserve_balance::abi::RESERVE_BALANCE_ADDRESS),
+];
 
 #[cfg(feature = "monad")]
-const MONAD_PRECOMPILES: &[(&str, Address)] =
-    &[("MonadStaking", STAKING_ADDRESS), ("MonadReserveBalance", RESERVE_BALANCE_ADDRESS)];
+const MONAD_PRECOMPILES: &[(&str, Address)] = &[
+    ("MonadStaking", monad_revm::staking::STAKING_ADDRESS),
+    ("MonadReserveBalance", monad_revm::reserve_balance::abi::RESERVE_BALANCE_ADDRESS),
+];
 
 /// BSC secp256r1 precompile address introduced by the Haber hardfork.
 const BSC_P256_ADDRESS: Address = address!("0000000000000000000000000000000000000100");
@@ -142,8 +151,9 @@ pub fn active_tempo_precompile_addresses(hardfork: TempoHardfork) -> impl Iterat
 /// Returns whether a well-known Monad precompile address is active at `hardfork`.
 #[cfg(feature = "monad")]
 pub fn is_monad_precompile_active_at(address: Address, hardfork: MonadHardfork) -> bool {
-    address == STAKING_ADDRESS
-        || (address == RESERVE_BALANCE_ADDRESS && MonadHardfork::MonadNine.is_enabled_in(hardfork))
+    address == monad_revm::staking::STAKING_ADDRESS
+        || (address == monad_revm::reserve_balance::abi::RESERVE_BALANCE_ADDRESS
+            && MonadHardfork::MonadNine.is_enabled_in(hardfork))
 }
 
 #[derive(
@@ -281,6 +291,33 @@ impl NetworkVariant {
     /// Parses a hardfork name reported by an RPC endpoint in this network's namespace.
     pub fn parse_hardfork(self, hardfork: &str) -> Result<FoundryHardfork, String> {
         format!("{}:{hardfork}", self.name()).parse()
+    }
+
+    /// Returns the active hardfork for this network at the given chain and timestamp.
+    ///
+    /// Unknown chain IDs fall back to the network's default hardfork. The selected network owns
+    /// the lookup so an explicit network choice is not overridden by the chain ID's family.
+    pub fn hardfork_at(self, chain_id: ChainId, timestamp: u64) -> FoundryHardfork {
+        match self {
+            Self::Ethereum => {
+                EthereumHardfork::from_chain_and_timestamp(Chain::from_id(chain_id), timestamp)
+                    .unwrap_or_default()
+                    .into()
+            }
+            Self::Tempo => TempoHardfork::from_chain_and_timestamp(chain_id, timestamp)
+                .unwrap_or_else(latest_active_tempo_hardfork)
+                .into(),
+            #[cfg(feature = "optimism")]
+            Self::Optimism => {
+                OpHardfork::from_chain_and_timestamp(Chain::from_id(chain_id), timestamp)
+                    .unwrap_or_default()
+                    .into()
+            }
+            #[cfg(feature = "monad")]
+            Self::Monad => MonadHardfork::from_chain_and_timestamp(chain_id, timestamp)
+                .unwrap_or_default()
+                .into(),
+        }
     }
 
     /// Returns `true` if this is the Ethereum network variant.
@@ -475,6 +512,15 @@ impl NetworkConfigs {
         false
     }
 
+    /// Returns additional cheatcode contract addresses for the active network.
+    pub const fn extra_cheatcode_addresses(&self) -> &'static [Address] {
+        #[cfg(feature = "monad")]
+        if self.is_monad() {
+            return MONAD_CHEATCODE_ADDRESSES;
+        }
+        &[]
+    }
+
     pub const fn is_celo(&self) -> bool {
         self.celo
     }
@@ -566,8 +612,8 @@ impl NetworkConfigs {
     #[cfg(feature = "monad")]
     pub fn contract_size_limits(&self) -> Option<NetworkContractSizeLimits> {
         self.is_monad().then_some(NetworkContractSizeLimits {
-            runtime: MONAD_MAX_CODE_SIZE,
-            initcode: MONAD_MAX_INITCODE_SIZE,
+            runtime: monad_revm::MONAD_MAX_CODE_SIZE,
+            initcode: monad_revm::MONAD_MAX_INITCODE_SIZE,
         })
     }
 
@@ -654,11 +700,20 @@ impl NetworkConfigs {
         }
     }
 
-    /// Applies an endpoint-reported execution profile while preserving orthogonal settings.
-    pub fn with_rpc_profile(self, profile: Self) -> Self {
-        let mut resolved = profile.canonical_execution_profile();
+    /// Applies an authoritative execution profile while preserving orthogonal settings.
+    pub fn with_execution_profile(self, profile: Self) -> Self {
+        let mut resolved = if profile.is_celo() {
+            Self::with_celo()
+        } else {
+            profile.resolved_network().map(Into::into).unwrap_or_default()
+        };
         resolved.bypass_prevrandao = self.bypass_prevrandao;
         resolved
+    }
+
+    /// Applies an endpoint-reported execution profile while preserving orthogonal settings.
+    pub fn with_rpc_profile(self, profile: Self) -> Self {
+        self.with_execution_profile(profile.canonical_execution_profile())
     }
 
     /// Parses the execution profile reported by `anvil_nodeInfo`.
@@ -672,9 +727,10 @@ impl NetworkConfigs {
 
     /// Resolves an RPC endpoint's complete execution profile.
     ///
-    /// Explicit metadata is authoritative. Legacy Anvil responses and ordinary RPC endpoints
-    /// recover Celo only from a canonical Celo chain ID; a caller-supplied fallback handles custom
-    /// chain IDs when the profile was selected explicitly.
+    /// Explicit metadata is authoritative. When metadata is absent or omits the profile, a
+    /// caller-supplied explicit profile takes precedence over chain-ID inference. Otherwise,
+    /// legacy Anvil responses and ordinary RPC endpoints recover Celo from a canonical Celo chain
+    /// ID and preserve the historical behavior for custom chain IDs.
     pub fn from_rpc_identity_profile_with_fallback(
         chain_id: ChainId,
         node_info_profile: Option<Option<&str>>,
@@ -685,11 +741,19 @@ impl NetworkConfigs {
                 network.map(|network| Self::default().with_rpc_identity(network, chain_id))
             })
         };
+        let fallback_is_explicit =
+            unknown_fallback.is_some_and(|fallback| fallback.has_network_selection());
         let fallback = unknown_fallback.map(Self::canonical_execution_profile);
+        if let Some(Some(profile)) = node_info_profile {
+            return Self::from_node_info_profile(profile).map(Some);
+        }
+        if fallback_is_explicit && let Some(fallback) = fallback {
+            return Ok(Some(fallback));
+        }
         match node_info_profile {
-            Some(Some(profile)) => Self::from_node_info_profile(profile).map(Some),
             Some(None) => Ok(known_profile()?.or(fallback).or(Some(Self::default()))),
             None => Ok(known_profile()?.or(fallback)),
+            Some(Some(_)) => unreachable!(),
         }
     }
 
@@ -1090,6 +1154,80 @@ mod tests {
     }
 
     #[test]
+    fn default_fallback_still_infers_known_execution_profile() {
+        for node_info in [None, Some(None)] {
+            assert_eq!(
+                NetworkConfigs::from_rpc_identity_profile_with_fallback(
+                    NamedChain::Tempo as u64,
+                    node_info,
+                    Some(NetworkConfigs::default()),
+                )
+                .unwrap(),
+                Some(NetworkConfigs::with_tempo())
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_ethereum_overrides_known_execution_profile() {
+        for node_info in [None, Some(None)] {
+            assert_eq!(
+                NetworkConfigs::from_rpc_identity_profile_with_fallback(
+                    NamedChain::Tempo as u64,
+                    node_info,
+                    Some(NetworkConfigs::with_ethereum()),
+                )
+                .unwrap(),
+                Some(NetworkConfigs::default())
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "monad"))]
+    fn explicit_ethereum_overrides_disabled_monad_without_node_info() {
+        assert_eq!(
+            NetworkConfigs::from_rpc_identity_profile_with_fallback(
+                NamedChain::Monad as u64,
+                None,
+                Some(NetworkConfigs::with_ethereum()),
+            )
+            .unwrap(),
+            Some(NetworkConfigs::default())
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "monad"))]
+    fn explicit_ethereum_overrides_disabled_monad_with_legacy_node_info() {
+        assert_eq!(
+            NetworkConfigs::from_rpc_identity_profile_with_fallback(
+                NamedChain::Monad as u64,
+                Some(None),
+                Some(NetworkConfigs::with_ethereum()),
+            )
+            .unwrap(),
+            Some(NetworkConfigs::default())
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "monad"))]
+    fn disabled_monad_without_explicit_profile_still_errors() {
+        for node_info in [None, Some(None)] {
+            assert_eq!(
+                NetworkConfigs::from_rpc_identity_profile_with_fallback(
+                    NamedChain::Monad as u64,
+                    node_info,
+                    None,
+                )
+                .unwrap_err(),
+                "network family `monad` is not enabled in this build"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(feature = "monad")]
     fn rpc_identity_fallback_preserves_explicit_custom_networks() {
         let custom_chain_id = 98_765_432;
@@ -1142,6 +1280,39 @@ mod tests {
         );
         assert_eq!(NetworkConfigs::with_celo().execution_family_name(), "ethereum");
         assert_eq!(NetworkConfigs::with_celo().execution_profile_name(), "celo");
+    }
+
+    #[test]
+    fn authoritative_execution_profile_preserves_orthogonal_settings() {
+        let inline = NetworkConfigs { bypass_prevrandao: true, ..NetworkConfigs::with_tempo() };
+
+        #[cfg_attr(not(any(feature = "optimism", feature = "monad")), allow(unused_mut))]
+        let mut profiles = vec![
+            NetworkConfigs::with_ethereum(),
+            NetworkConfigs::with_tempo(),
+            NetworkConfigs::with_celo(),
+        ];
+        #[cfg(feature = "optimism")]
+        profiles.push(NetworkVariant::Optimism.into());
+        #[cfg(feature = "monad")]
+        profiles.push(NetworkConfigs::with_monad());
+
+        for profile in profiles {
+            let resolved = inline.with_execution_profile(profile);
+            assert!(resolved.has_same_execution_profile(&profile));
+            assert!(resolved.has_network_selection());
+            assert!(resolved.bypass_prevrandao(NamedChain::Mainnet as u64));
+        }
+
+        let ethereum = inline.with_execution_profile(NetworkConfigs::with_ethereum());
+        assert_eq!(
+            ethereum.try_with_chain_id(NamedChain::Tempo as u64).unwrap(),
+            ethereum,
+            "an authoritative Ethereum profile must prevent later endpoint inference",
+        );
+
+        let rpc_ethereum = inline.with_rpc_profile(NetworkConfigs::with_ethereum());
+        assert!(!rpc_ethereum.has_network_selection());
     }
 
     #[test]
@@ -1326,7 +1497,7 @@ mod tests {
 
         assert_eq!(
             cfg.precompiles(None, Some(MonadHardfork::MonadEight)).get("MonadStaking"),
-            Some(&STAKING_ADDRESS)
+            Some(&monad_revm::staking::STAKING_ADDRESS)
         );
         assert!(
             !cfg.precompiles(None, Some(MonadHardfork::MonadEight))
@@ -1334,17 +1505,20 @@ mod tests {
         );
         assert_eq!(
             cfg.precompiles(None, Some(MonadHardfork::MonadNine)).get("MonadReserveBalance"),
-            Some(&RESERVE_BALANCE_ADDRESS)
+            Some(&monad_revm::reserve_balance::abi::RESERVE_BALANCE_ADDRESS)
         );
         assert_eq!(
             cfg.precompiles_label(None, Some(MonadHardfork::MonadNine))
-                .get(&RESERVE_BALANCE_ADDRESS),
+                .get(&monad_revm::reserve_balance::abi::RESERVE_BALANCE_ADDRESS),
             Some(&"ReserveBalance".to_string())
         );
-        assert!(cfg.precompiles_label(None, None).contains_key(&RESERVE_BALANCE_ADDRESS));
+        assert!(
+            cfg.precompiles_label(None, None)
+                .contains_key(&monad_revm::reserve_balance::abi::RESERVE_BALANCE_ADDRESS)
+        );
         assert!(
             !cfg.precompiles_label(None, Some(MonadHardfork::MonadEight))
-                .contains_key(&RESERVE_BALANCE_ADDRESS)
+                .contains_key(&monad_revm::reserve_balance::abi::RESERVE_BALANCE_ADDRESS)
         );
     }
 
@@ -1385,20 +1559,23 @@ mod tests {
         let cfg = NetworkConfigs::with_monad();
         assert_eq!(cfg.active_network_name(), Some("monad"));
         assert!(cfg.is_monad());
+        assert_eq!(cfg.extra_cheatcode_addresses(), &[MONAD_CHEATCODE_ADDRESS]);
     }
 
     #[test]
     #[cfg(feature = "monad")]
     fn contract_size_limits_monad() {
         let limits = NetworkConfigs::with_monad().contract_size_limits().unwrap();
-        assert_eq!(limits.runtime, MONAD_MAX_CODE_SIZE);
-        assert_eq!(limits.initcode, MONAD_MAX_INITCODE_SIZE);
+        assert_eq!(limits.runtime, monad_revm::MONAD_MAX_CODE_SIZE);
+        assert_eq!(limits.initcode, monad_revm::MONAD_MAX_INITCODE_SIZE);
         assert!(NetworkConfigs::default().contract_size_limits().is_none());
     }
 
     #[test]
     fn active_network_name_default_is_none() {
-        assert_eq!(NetworkConfigs::default().active_network_name(), None);
+        let cfg = NetworkConfigs::default();
+        assert_eq!(cfg.active_network_name(), None);
+        assert!(cfg.extra_cheatcode_addresses().is_empty());
     }
 
     // --- Serde round-trip ---

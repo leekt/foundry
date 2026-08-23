@@ -1,6 +1,6 @@
 use crate::{
     Cheatcode, Cheatcodes, CheatcodesExecutor, CheatsCtxt, DatabaseExt, Result, Vm::*,
-    inspector::rebase_context_after_state_transition, json::json_value_to_token,
+    json::json_value_to_token,
 };
 use alloy_dyn_abi::DynSolValue;
 use alloy_evm::EvmEnv;
@@ -12,8 +12,8 @@ use alloy_sol_types::SolValue;
 use foundry_common::provider::ProviderBuilder;
 use foundry_evm_core::{
     FoundryContextExt,
-    backend::{ContextAuxUpdate, JournaledState, LocalForkId},
-    evm::{BlockEnvFor, ContextAuxFor, FoundryContextFor, FoundryEvmNetwork, SpecFor, TxEnvFor},
+    backend::{ContextUpdateFor, JournaledState, LocalForkId},
+    evm::{BlockEnvFor, EvmFactoryFor, FoundryContextFor, FoundryEvmNetwork, SpecFor, TxEnvFor},
     fork::CreateFork,
 };
 use revm::context::ContextTr;
@@ -421,6 +421,24 @@ fn create_fork_request<FEN: FoundryEvmNetwork>(
     Ok(fork)
 }
 
+/// Applies a fork/roll/transact context update to the active EVM context.
+#[cfg(feature = "monad")]
+fn apply_context_update<FEN: FoundryEvmNetwork>(
+    ecx: &mut FoundryContextFor<'_, FEN>,
+    context_update: foundry_evm_core::backend::ContextUpdate<foundry_evm_core::evm::ChainFor<FEN>>,
+) {
+    match context_update {
+        foundry_evm_core::backend::ContextUpdate::Unchanged => {}
+        foundry_evm_core::backend::ContextUpdate::Replace(chain_context) => {
+            *ecx.chain_mut() = chain_context;
+            foundry_evm_core::refresh_chain_journal(ecx);
+        }
+        foundry_evm_core::backend::ContextUpdate::Rebase => {
+            foundry_evm_core::refresh_chain_journal(ecx);
+        }
+    }
+}
+
 /// Clones the EVM and tx environments, runs a fork operation that may modify them, then writes
 /// them back. This is the common pattern for all fork-switching cheatcodes (rollFork, selectFork,
 /// createSelectFork).
@@ -431,25 +449,18 @@ fn fork_env_op<FEN: FoundryEvmNetwork, T: SolValue>(
         &mut EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>,
         &mut TxEnvFor<FEN>,
         &mut JournaledState,
-    ) -> eyre::Result<(T, ContextAuxUpdate<ContextAuxFor<FEN>>)>,
+    ) -> eyre::Result<(T, ContextUpdateFor<EvmFactoryFor<FEN>>)>,
 ) -> Result {
     let mut evm_env = ecx.evm_clone();
     let mut tx_env = ecx.tx_clone();
-    let current_aux = ecx.aux_state();
     let (db, inner) = ecx.db_journal_inner_mut();
     let (result, context_update) = f(db, &mut evm_env, &mut tx_env, inner)?;
     ecx.set_evm(evm_env);
     ecx.set_tx(tx_env);
-    match context_update {
-        ContextAuxUpdate::Unchanged => {}
-        ContextAuxUpdate::Replace(auxiliary) => {
-            rebase_context_after_state_transition::<FEN>(ecx, &current_aux, auxiliary);
-        }
-        ContextAuxUpdate::Rebase => {
-            let replacement = current_aux.clone();
-            rebase_context_after_state_transition::<FEN>(ecx, &current_aux, replacement);
-        }
-    }
+    #[cfg(not(feature = "monad"))]
+    let _ = context_update;
+    #[cfg(feature = "monad")]
+    apply_context_update::<FEN>(ecx, context_update);
     Ok(result.abi_encode())
 }
 
@@ -471,6 +482,7 @@ fn record_fork_switch<FEN: FoundryEvmNetwork>(
     propagated: Vec<(Address, usize)>,
 ) {
     let target_fork_id = ccx.ecx.db().active_fork_id();
+    ccx.state.fork_block_number_override = ccx.ecx.db().active_fork_block_number();
     if source_fork_id != target_fork_id {
         ccx.state.commit_created_account_changes(source_fork_id);
     }
@@ -484,6 +496,7 @@ fn record_fork_roll<FEN: FoundryEvmNetwork>(
 ) {
     let active_fork_id = ccx.ecx.db().active_fork_id();
     if target_fork_id.is_none() || target_fork_id == active_fork_id {
+        ccx.state.fork_block_number_override = ccx.ecx.db().active_fork_block_number();
         ccx.state.commit_created_account_changes(active_fork_id);
     }
 }
@@ -502,18 +515,11 @@ fn transact<FEN: FoundryEvmNetwork>(
     transaction: B256,
     fork_id: Option<U256>,
 ) -> Result {
-    let current_aux = ccx.ecx.aux_state();
     let context_update = executor.transact_on_db(ccx.state, ccx.ecx, fork_id, transaction)?;
-    match context_update {
-        ContextAuxUpdate::Replace(auxiliary) => {
-            rebase_context_after_state_transition::<FEN>(ccx.ecx, &current_aux, auxiliary);
-        }
-        ContextAuxUpdate::Rebase => {
-            let replacement = current_aux.clone();
-            rebase_context_after_state_transition::<FEN>(ccx.ecx, &current_aux, replacement);
-        }
-        ContextAuxUpdate::Unchanged => {}
-    }
+    #[cfg(not(feature = "monad"))]
+    let _ = context_update;
+    #[cfg(feature = "monad")]
+    apply_context_update::<FEN>(ccx.ecx, context_update);
     Ok(Default::default())
 }
 

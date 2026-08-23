@@ -7,8 +7,6 @@ use eyre::{Context, Result};
 use foundry_cli::utils::{self, LoadConfig};
 use foundry_common::fs;
 use foundry_config::Config;
-#[cfg(feature = "monad")]
-use foundry_evm::core::evm::MonadEvmNetwork;
 #[cfg(feature = "optimism")]
 use foundry_evm::core::evm::OpEvmNetwork;
 use foundry_evm::{
@@ -33,7 +31,7 @@ pub fn run() -> Result<()> {
 
 /// Setup the global logger and other utilities.
 pub fn setup() -> Result<()> {
-    utils::common_setup();
+    utils::common_setup::<Chisel>()?;
     utils::subscriber();
 
     Ok(())
@@ -74,7 +72,7 @@ pub async fn run_command(args: Chisel) -> Result<()> {
 
     #[cfg(feature = "monad")]
     if evm_opts.networks.is_monad() {
-        return Box::pin(run_command_with_network::<MonadEvmNetwork>(
+        return Box::pin(run_command_with_network::<foundry_evm::core::evm::MonadEvmNetwork>(
             args,
             config,
             evm_opts,

@@ -30,8 +30,6 @@ use anvil_core::{
 };
 use foundry_common::version::{COMMIT_SHA, SEMVER_VERSION};
 use foundry_evm::hardfork::EthereumHardfork;
-#[cfg(feature = "monad")]
-use foundry_evm::hardfork::MonadHardfork;
 use foundry_evm_networks::NetworkConfigs;
 use foundry_primitives::FoundryTxEnvelope;
 use futures::{FutureExt, StreamExt};
@@ -391,6 +389,35 @@ async fn can_mine_manually() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn get_last_block_wall_time_updates_after_mining() {
+    let before_spawn =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+    let genesis_wall_time: u64 =
+        provider.raw_request("anvil_getLastBlockWallTime".into(), ()).await.unwrap();
+    let after_spawn =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+    assert!((before_spawn..=after_spawn).contains(&genesis_wall_time));
+
+    api.evm_set_time(api.backend.time().current_call_timestamp() + 60).unwrap();
+    let unchanged_wall_time: u64 =
+        provider.raw_request("anvil_getLastBlockWallTime".into(), ()).await.unwrap();
+    assert_eq!(unchanged_wall_time, genesis_wall_time);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let before_mining =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+    api.mine_one().await.unwrap();
+
+    let block_wall_time: u64 =
+        provider.raw_request("anvil_getLastBlockWallTime".into(), ()).await.unwrap();
+    let after_mining =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+    assert!((before_mining..=after_mining).contains(&block_wall_time));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_set_next_timestamp() {
     let (api, handle) = spawn(NodeConfig::test()).await;
     let provider = handle.http_provider();
@@ -719,6 +746,39 @@ async fn test_fork_revert_next_block_timestamp() {
     api.mine_one().await.unwrap();
     let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
     assert!(block.header.timestamp >= latest_block.header.timestamp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revert_invalidates_newer_snapshots() {
+    let (api, _handle) = spawn(NodeConfig::test()).await;
+    let initial_block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+
+    let first_snapshot = api.evm_snapshot().await.unwrap();
+    api.mine_one().await.unwrap();
+    let second_snapshot = api.evm_snapshot().await.unwrap();
+
+    assert!(api.evm_revert(first_snapshot).await.unwrap());
+    assert!(!api.evm_revert(second_snapshot).await.unwrap());
+
+    let latest_block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_eq!(latest_block, initial_block);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_revert_restores_next_block_base_fee() {
+    let (api, _handle) = spawn(NodeConfig::test()).await;
+    let base_fee = api.base_fee().unwrap();
+    let state_snapshot = api.evm_snapshot().await.unwrap();
+
+    api.mine_one().await.unwrap();
+    let first_block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_ne!(api.base_fee().unwrap(), base_fee);
+    api.evm_revert(state_snapshot).await.unwrap();
+    assert_eq!(api.base_fee().unwrap(), base_fee);
+
+    api.mine_one().await.unwrap();
+    let remined_block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_eq!(remined_block.header.base_fee_per_gas, first_block.header.base_fee_per_gas);
 }
 
 // Tests that `anvil_setNextBlockPrevRandao` overrides the `prevrandao` (block header `mixHash`) of
@@ -1853,7 +1913,8 @@ async fn can_get_node_info_tempo_t1() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "monad")]
 async fn can_get_node_info_monad() {
-    let config = NodeConfig::test_monad().with_hardfork(Some(MonadHardfork::MonadEight.into()));
+    let config = NodeConfig::test_monad()
+        .with_hardfork(Some(foundry_evm::hardfork::MonadHardfork::MonadEight.into()));
     let (api, handle) = spawn(config).await;
 
     let node_info = api.anvil_node_info().await.unwrap();

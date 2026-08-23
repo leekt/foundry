@@ -37,7 +37,7 @@ use foundry_common::{
     compile::ContractSizeLimits,
     shell,
 };
-use foundry_compilers::ArtifactId;
+use foundry_compilers::{ArtifactId, artifacts::output_selection::ContractOutputSelection};
 use foundry_config::{
     Config, Eip1559FeeEstimatePreset, FoundryHardfork, figment,
     figment::{
@@ -46,8 +46,6 @@ use foundry_config::{
     },
 };
 use foundry_debugger::DebuggerLayout;
-#[cfg(feature = "monad")]
-use foundry_evm::core::evm::MonadEvmNetwork;
 #[cfg(feature = "optimism")]
 use foundry_evm::core::evm::OpEvmNetwork;
 use foundry_evm::{
@@ -347,6 +345,9 @@ impl ScriptArgs {
 
         tempo.resolve_expires();
         config.tracing = args.tracing.resolve(&config.tracing, evm_opts.verbosity);
+        if args.debug && !config.extra_output.contains(&ContractOutputSelection::StorageLayout) {
+            config.extra_output.push(ContractOutputSelection::StorageLayout);
+        }
 
         let script_config =
             ScriptConfig::new(config, evm_opts, args.batch, tempo, args.sender_nonce).await?;
@@ -410,7 +411,12 @@ impl ScriptArgs {
 
         #[cfg(feature = "monad")]
         if evm_opts.networks.is_monad() {
-            return Box::pin(self.run_generic_script::<MonadEvmNetwork>(config, evm_opts)).await;
+            return Box::pin(
+                self.run_generic_script::<foundry_evm::core::evm::MonadEvmNetwork>(
+                    config, evm_opts,
+                ),
+            )
+            .await;
         }
 
         #[cfg(feature = "optimism")]
@@ -871,9 +877,10 @@ pub struct ScriptConfig<FEN: FoundryEvmNetwork> {
     pub tempo: TempoOpts,
 }
 
-async fn resolve_script_fork<FEN: FoundryEvmNetwork>(
+async fn resolve_script_fork(
     config: &mut Config,
     evm_opts: &mut EvmOpts,
+    active_networks: Option<NetworkConfigs>,
 ) -> Result<Option<ResolvedFork>> {
     if evm_opts.fork_url.is_none() {
         return Ok(None);
@@ -881,11 +888,14 @@ async fn resolve_script_fork<FEN: FoundryEvmNetwork>(
     if evm_opts.fork_endpoint.is_none() {
         evm_opts.infer_network_from_fork().await?;
     }
-    eyre::ensure!(
-        FEN::supports_network(evm_opts.networks.execution_network()),
-        "fork network `{}` is incompatible with the active EVM",
-        evm_opts.networks.execution_network()
-    );
+    if let Some(active_networks) = active_networks
+        && !active_networks.supports_fork_source(&evm_opts.networks)
+    {
+        eyre::bail!(
+            "fork network `{}` is incompatible with the active EVM",
+            evm_opts.networks.execution_network()
+        );
+    }
     config.networks = evm_opts.networks;
     if let Some(identity) = evm_opts.fork_endpoint.clone() {
         let network_is_inferred = evm_opts.fork_network_is_inferred;
@@ -895,7 +905,7 @@ async fn resolve_script_fork<FEN: FoundryEvmNetwork>(
 }
 
 impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
-    pub async fn new(
+    pub(crate) async fn new(
         mut config: Config,
         mut evm_opts: EvmOpts,
         batch: bool,
@@ -904,7 +914,7 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
     ) -> Result<Self> {
         // Linking happens before runner construction, so resolve the fork context now and reuse it
         // for all preflight reads and environment construction.
-        let resolved_fork = resolve_script_fork::<FEN>(&mut config, &mut evm_opts).await?;
+        let resolved_fork = resolve_script_fork(&mut config, &mut evm_opts, None).await?;
         let sender_nonce = if let Some(sender_nonce) = sender_nonce_override {
             sender_nonce
         } else if evm_opts.fork_url.is_some() {
@@ -972,11 +982,15 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
         {
             return Ok(Some(fork.clone()));
         }
+        // Script execution was already dispatched to `FEN`; compare the new selection with that
+        // execution profile, not with the previous RPC source profile.
+        let active_networks = Some(self.config.networks);
         if let Some(fork) = &self.resolved_fork {
             self.evm_opts.invalidate_fork_endpoint_if_source_changed(fork);
         }
 
-        let fork = resolve_script_fork::<FEN>(&mut self.config, &mut self.evm_opts).await?;
+        let fork =
+            resolve_script_fork(&mut self.config, &mut self.evm_opts, active_networks).await?;
         self.resolved_fork = fork.clone();
         Ok(fork)
     }
@@ -1002,7 +1016,17 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
         target: ArtifactId,
         restricted: bool,
     ) -> Result<ScriptRunner<FEN>> {
-        self._get_runner(Some((known_contracts, script_wallets, target)), debug, restricted).await
+        let mut runner = self
+            ._get_runner(Some((known_contracts, script_wallets, target)), debug, restricted)
+            .await?;
+
+        // Script execution is synthetic. Keep the Tempo transaction context, but do not charge
+        // protocol fees for deploying or calling the local script contract.
+        if self.evm_opts.networks.is_tempo() {
+            runner.executor.evm_env_mut().cfg_env.disable_fee_charge = true;
+        }
+
+        Ok(runner)
     }
 
     async fn _get_runner(
@@ -1037,7 +1061,6 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
                 stack
                     .logs(self.config.live_logs)
                     .trace_requirements(script_trace_requirements(&self.config, debug))
-                    .networks(self.evm_opts.networks)
                     .create2_deployer(self.evm_opts.create2_deployer)
             })
             .gas_limit(self.evm_opts.gas_limit())
@@ -1050,7 +1073,6 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
                     self.evm_opts.clone(),
                     Some(known_contracts),
                     Some(target),
-                    self.tempo.fee_token,
                     self.batch,
                 );
                 if restricted {
@@ -1068,9 +1090,11 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
         // (e.g. script deployment, setUp) use the correct fee token for Tempo networks.
         tx_env.set_fee_token(self.tempo.fee_token);
 
-        let mut runner =
-            ScriptRunner::new(builder.build(evm_env, tx_env, db), self.evm_opts.clone())
-                .with_debug_bytecodes(debug);
+        let mut runner = ScriptRunner::new(
+            builder.build(evm_env, tx_env, db, self.evm_opts.networks),
+            self.evm_opts.clone(),
+        )
+        .with_debug_bytecodes(debug);
 
         if self.sender_nonce_override.is_some() {
             runner.executor.set_nonce(self.evm_opts.sender, self.sender_nonce)?;
@@ -1131,14 +1155,13 @@ mod tests {
         upsert_session_entry,
     };
     use foundry_config::UnresolvedEnvVarError;
-    #[cfg(feature = "monad")]
-    use foundry_evm::hardforks::MonadHardfork;
     use foundry_evm::{
         revm::context::Block as _,
         traces::{
             CallKind, CallTrace, CallTraceArena, CallTraceNode, SparsedTraceArena, TraceKind,
         },
     };
+    use semver::Version;
     use std::{fs, num::NonZeroU64, sync::LazyLock};
     use tempfile::tempdir;
     use tokio::sync::{Mutex, MutexGuard};
@@ -1197,6 +1220,39 @@ mod tests {
         assert_eq!(config.evm_opts.fork_block_number, None);
         assert!(config.evm_opts.resolved_fork_matches(&second));
         assert_ne!(first, second);
+    }
+
+    #[cfg(feature = "monad")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn script_explicit_network_is_preserved_for_a_new_rpc() {
+        let (api_a, handle_a) = spawn(NodeConfig::test_monad()).await;
+        let (api_b, handle_b) = spawn(NodeConfig::test_monad()).await;
+        api_a.anvil_mine(Some(U256::from(1)), None).await.unwrap();
+        api_b.anvil_mine(Some(U256::from(3)), None).await.unwrap();
+
+        let evm_opts = EvmOpts {
+            fork_url: Some(handle_a.http_endpoint()),
+            sender: handle_a.dev_accounts().next().unwrap(),
+            networks: NetworkConfigs::with_ethereum(),
+            ..Default::default()
+        };
+        let mut config = ScriptConfig::<EthEvmNetwork>::new(
+            Config::default(),
+            evm_opts,
+            false,
+            TempoOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.evm_opts.networks, NetworkConfigs::with_ethereum());
+
+        config.set_fork_url(handle_b.http_endpoint());
+        let second = config.ensure_resolved_fork().await.unwrap().unwrap();
+
+        assert_eq!(second.number(), 3);
+        assert_eq!(second.context().network_profile, NetworkConfigs::with_monad());
+        assert_eq!(config.evm_opts.networks, NetworkConfigs::with_ethereum());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1864,7 +1920,7 @@ mod tests {
         let (_origin_api, origin_handle) = spawn(
             NodeConfig::test_monad()
                 .with_chain_id(Some(NamedChain::MonadTestnet as u64))
-                .with_hardfork(Some(MonadHardfork::MonadNine.into())),
+                .with_hardfork(Some(foundry_evm::hardforks::MonadHardfork::MonadNine.into())),
         )
         .await;
         let (_fork_api, fork_handle) = spawn(
@@ -1879,7 +1935,7 @@ mod tests {
             EvmOpts { fork_url: Some(fork_handle.http_endpoint()), ..Default::default() };
         evm_opts.infer_network_from_fork().await.unwrap();
         let config = Config { networks: evm_opts.networks, ..Default::default() };
-        let mut script = ScriptConfig::<MonadEvmNetwork>::new(
+        let mut script = ScriptConfig::<foundry_evm::core::evm::MonadEvmNetwork>::new(
             config,
             evm_opts,
             false,
@@ -1892,7 +1948,55 @@ mod tests {
         let _runner = script._get_runner(None, false, false).await.unwrap();
 
         assert_eq!(script.source_chain_id, Some(NamedChain::MonadTestnet as u64));
-        assert_eq!(script.hardfork, Some(FoundryHardfork::Monad(MonadHardfork::MonadNine)));
+        assert_eq!(
+            script.hardfork,
+            Some(FoundryHardfork::Monad(foundry_evm::hardforks::MonadHardfork::MonadNine))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tempo_runner_fee_charge_matches_execution_context() {
+        let (_api, handle) = spawn(NodeConfig::test_tempo()).await;
+        let networks = NetworkConfigs::with_tempo();
+        let evm_opts = EvmOpts {
+            fork_url: Some(handle.http_endpoint()),
+            sender: handle.dev_accounts().next().unwrap(),
+            networks,
+            ..Default::default()
+        };
+        let config = Config { networks, ..Default::default() };
+        let mut script = ScriptConfig::<TempoEvmNetwork>::new(
+            config,
+            evm_opts,
+            false,
+            TempoOpts::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rpc_runner = script._get_runner(None, false, false).await.unwrap();
+        assert!(!rpc_runner.executor.evm_env().cfg_env.disable_fee_charge);
+
+        let target = ArtifactId {
+            path: PathBuf::from("Script.json"),
+            name: "Script".to_string(),
+            source: PathBuf::from("Script.sol"),
+            version: Version::new(0, 8, 30),
+            build_id: String::new(),
+            profile: "default".to_string(),
+        };
+        let synthetic_runner = script
+            .get_runner_with_cheatcodes(
+                ContractsByArtifact::default(),
+                Wallets::new(Default::default(), None),
+                false,
+                target,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(synthetic_runner.executor.evm_env().cfg_env.disable_fee_charge);
     }
 
     #[test]
@@ -2223,7 +2327,10 @@ mod tests {
             ScriptArgs::parse_from(["foundry-cli", "script", "script/Test.s.sol:TestScript"]);
         let evm_opts = EvmOpts { networks: NetworkConfigs::with_monad(), ..Default::default() };
 
-        let limits = args.contract_size_limits::<MonadEvmNetwork>(&Config::default(), &evm_opts);
+        let limits = args.contract_size_limits::<foundry_evm::core::evm::MonadEvmNetwork>(
+            &Config::default(),
+            &evm_opts,
+        );
 
         assert!(limits.runtime > ContractSizeLimits::default().runtime);
         assert!(limits.initcode > ContractSizeLimits::default().initcode);
@@ -2242,7 +2349,9 @@ mod tests {
         let mut config = Config { code_size_limit: Some(128), ..Default::default() };
         let evm_opts = EvmOpts { networks: NetworkConfigs::with_monad(), ..Default::default() };
         assert_eq!(
-            args.contract_size_limits::<MonadEvmNetwork>(&config, &evm_opts),
+            args.contract_size_limits::<foundry_evm::core::evm::MonadEvmNetwork>(
+                &config, &evm_opts,
+            ),
             ContractSizeLimits::with_runtime_limit(64)
         );
 
@@ -2250,7 +2359,9 @@ mod tests {
             ScriptArgs::parse_from(["foundry-cli", "script", "script/Test.s.sol:TestScript"]);
         config.code_size_limit = Some(128);
         assert_eq!(
-            args.contract_size_limits::<MonadEvmNetwork>(&config, &evm_opts),
+            args.contract_size_limits::<foundry_evm::core::evm::MonadEvmNetwork>(
+                &config, &evm_opts,
+            ),
             ContractSizeLimits::with_runtime_limit(128)
         );
     }

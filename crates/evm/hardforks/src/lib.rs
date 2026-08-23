@@ -359,6 +359,13 @@ impl FromEvmVersion for SpecId {
             EvmVersion::Prague => Self::PRAGUE,
             EvmVersion::Osaka => Self::OSAKA,
             EvmVersion::Amsterdam => Self::AMSTERDAM,
+            // The toolkit deliberately executes `@future` bytecode with the
+            // pre-Amsterdam Osaka rules: Amsterdam's node-level state-gas rules
+            // would reject frame transactions, while Osaka activates P256VERIFY
+            // for WebAuthn validators. This is a runtime mapping, not a promise
+            // that every later opcode exposed by the experimental compiler is
+            // executable in this profile.
+            EvmVersion::Future => Self::OSAKA,
         }
     }
 }
@@ -400,7 +407,7 @@ impl FromEvmVersion for OpSpecId {
             EvmVersion::Shanghai => Self::CANYON,
             EvmVersion::Cancun => Self::ECOTONE,
             EvmVersion::Prague => Self::ISTHMUS,
-            EvmVersion::Osaka | EvmVersion::Amsterdam => Self::KARST,
+            EvmVersion::Osaka | EvmVersion::Amsterdam | EvmVersion::Future => Self::KARST,
         }
     }
 }
@@ -529,8 +536,6 @@ pub fn ethereum_hardfork_from_block_tag(block: impl Into<BlockNumberOrTag>) -> E
 mod tests {
     use super::*;
     use alloy_hardforks::ethereum::mainnet::*;
-    #[cfg(feature = "monad")]
-    use monad_revm::{MONAD_MAINNET_CHAIN_ID, MONAD_TESTNET_CHAIN_ID};
     use tempo_hardfork::constants::{mainnet::*, moderato::*};
 
     #[test]
@@ -543,6 +548,12 @@ mod tests {
         assert_eq!(spec_id_from_ethereum_hardfork(EthereumHardfork::Prague), SpecId::PRAGUE);
         assert_eq!(spec_id_from_ethereum_hardfork(EthereumHardfork::Osaka), SpecId::OSAKA);
         assert_eq!(spec_id_from_ethereum_hardfork(EthereumHardfork::Amsterdam), SpecId::AMSTERDAM);
+    }
+
+    #[test]
+    fn test_future_evm_version_uses_pre_amsterdam_osaka_profile() {
+        assert_eq!(evm_spec_id::<SpecId>(EvmVersion::Future), SpecId::OSAKA);
+        assert_eq!(evm_spec_id_from_str::<SpecId>("@future"), Some(SpecId::OSAKA));
     }
 
     #[test]
@@ -673,19 +684,31 @@ mod tests {
     #[cfg(feature = "monad")]
     fn test_monad_hardfork_from_chain_and_timestamp() {
         assert_eq!(
-            FoundryHardfork::from_chain_and_timestamp(MONAD_MAINNET_CHAIN_ID, 1_763_648_999),
+            FoundryHardfork::from_chain_and_timestamp(
+                monad_revm::MONAD_MAINNET_CHAIN_ID,
+                1_763_648_999,
+            ),
             Some(FoundryHardfork::Monad(MonadHardfork::MonadEight))
         );
         assert_eq!(
-            FoundryHardfork::from_chain_and_timestamp(MONAD_MAINNET_CHAIN_ID, 1_773_930_600),
+            FoundryHardfork::from_chain_and_timestamp(
+                monad_revm::MONAD_MAINNET_CHAIN_ID,
+                1_773_930_600,
+            ),
             Some(FoundryHardfork::Monad(MonadHardfork::MonadNine))
         );
         assert_eq!(
-            FoundryHardfork::from_chain_and_timestamp(MONAD_TESTNET_CHAIN_ID, 1_773_152_999),
+            FoundryHardfork::from_chain_and_timestamp(
+                monad_revm::MONAD_TESTNET_CHAIN_ID,
+                1_773_152_999,
+            ),
             Some(FoundryHardfork::Monad(MonadHardfork::MonadEight))
         );
         assert_eq!(
-            FoundryHardfork::from_chain_and_timestamp(MONAD_TESTNET_CHAIN_ID, 1_773_153_000),
+            FoundryHardfork::from_chain_and_timestamp(
+                monad_revm::MONAD_TESTNET_CHAIN_ID,
+                1_773_153_000,
+            ),
             Some(FoundryHardfork::Monad(MonadHardfork::MonadNine))
         );
     }

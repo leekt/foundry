@@ -51,7 +51,7 @@ alloy-signer = { workspace = true, features = ["eip712"] }
 alloy-signer-local = { workspace = true, features = ["mnemonic"] }
 alloy-sol-types = { workspace = true, features = ["std"] }
 alloy-dyn-abi = { workspace = true, features = ["std", "eip712"] }
-alloy-rpc-types = { workspace = true, features = ["anvil", "trace", "txpool"] }
+alloy-rpc-types = { workspace = true, features = ["anvil", "debug", "trace", "txpool"] }
 alloy-rpc-types-beacon.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-mev.workspace = true
@@ -128,6 +128,8 @@ alloy-pubsub.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 foundry-test-utils.workspace = true
+ml-dsa.workspace = true
+p256 = "0.13"
 tokio = { workspace = true, features = ["full"] }
 
 tempo-alloy.workspace = true

@@ -50,8 +50,11 @@ alloy_sol_types::sol! {
     }
 }
 
-pub(crate) fn is_monad_cheatcode_call<FEN: FoundryEvmNetwork>(target: Address) -> bool {
-    target == MONAD_CHEATCODE_ADDRESS && FEN::is_extra_cheatcode_address(target)
+pub(crate) fn is_monad_cheatcode_call(
+    extra_cheatcode_addresses: &[Address],
+    target: Address,
+) -> bool {
+    target == MONAD_CHEATCODE_ADDRESS && extra_cheatcode_addresses.contains(&target)
 }
 
 pub(crate) fn apply_monad_cheatcode<FEN: FoundryEvmNetwork>(

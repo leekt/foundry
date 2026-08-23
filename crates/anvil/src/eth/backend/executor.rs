@@ -226,6 +226,10 @@ pub struct AnvilTxResult<H> {
 /// EIP-8141 receipt fields retained alongside the ordinary EVM result.
 #[derive(Clone, Debug)]
 pub(crate) struct FrameReceiptData {
+    /// EIP-8141 settlement gas, whose calldata floor excludes state gas.
+    pub(crate) gas_used: u64,
+    /// Final state-gas component of `gas_used`.
+    pub(crate) state_gas_used: u64,
     pub(crate) payer: Address,
     pub(crate) frame_receipts: Vec<FrameReceipt>,
 }
@@ -448,7 +452,14 @@ where
             frame_receipt,
         } = output;
 
-        let gas_used = result.tx_gas_used();
+        // `ResultGas` models the ordinary transaction-total calldata floor.
+        // Frame transactions instead floor only their execution component and
+        // add final state gas afterwards, so use the settlement values retained
+        // by the frame executor for receipts and block accounting.
+        let (gas_used, state_gas_used) = frame_receipt.as_ref().map_or_else(
+            || (result.tx_gas_used(), result.gas().block_state_gas_used()),
+            |frame| (frame.gas_used, frame.state_gas_used),
+        );
         self.gas_used += gas_used;
 
         if self.spec_id >= SpecId::CANCUN {
@@ -512,7 +523,7 @@ where
         self.receipts.push(receipt);
         self.evm.db_mut().commit(state);
 
-        GasOutput::new(gas_used)
+        GasOutput::with_state_gas(gas_used, state_gas_used)
     }
 
     fn finish(
@@ -707,9 +718,11 @@ where
         match (hooks.execute_transaction)(executor, tx_env, recovered, pool_tx.is_replay) {
             Ok(result) => {
                 let exec_result = result.result().result.clone();
-                let gas_used = result.result().result.tx_gas_used();
-
-                executor.commit_transaction(result);
+                // The block executor is the authority for final gas accounting.
+                // In particular, EIP-8141 applies its calldata floor to the
+                // execution component before adding state gas, which cannot be
+                // reconstructed from the ordinary EVM `ResultGas` getters.
+                let gas_used = executor.commit_transaction(result).tx_gas_used();
 
                 let traces =
                     executor.evm_mut().inspector_mut().finish_transaction(inspector_config);

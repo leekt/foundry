@@ -15,7 +15,7 @@ interface Vm {
     struct EthGetLogs { address emitter; bytes32[] topics; bytes data; bytes32 blockHash; uint64 blockNumber; bytes32 transactionHash; uint64 transactionIndex; uint256 logIndex; bool removed; }
     struct DirEntry { string errorMessage; string path; uint64 depth; bool isDir; bool isSymlink; }
     struct FsMetadata { bool isDir; bool isSymlink; uint256 length; bool readOnly; uint256 modified; uint256 accessed; uint256 created; }
-    struct FrameTxFrame { uint8 mode; uint8 flags; address target; uint64 gasLimit; uint256 value; bytes data; uint8 status; }
+    struct FrameTxFrame { uint8 mode; uint8 flags; address target; uint64 gasLimit; uint64 stateGasLimit; uint256 value; bytes data; uint8 status; uint64 executionGasUsed; uint64 stateGasUsed; }
     struct FrameTxSignature { uint8 scheme; address signer; bytes32 msgHash; bytes signature; }
     struct FrameTxRecentRootReference { bytes32 sourceId; uint64 slot; bytes32 root; }
     struct FrameTxBalanceDiff { address account; uint256 balanceBefore; uint256 balanceAfter; }
@@ -24,7 +24,7 @@ interface Vm {
     struct FrameTxAccountDiff { address account; bool nonceChanged; bytes32 codeHashBefore; bytes32 codeHashAfter; }
     struct FrameTxEvent { address emitter; bytes32[] topics; bytes data; }
     struct FrameTxTrace { FrameTxBalanceDiff[] balanceDiffs; FrameTxStorageDiff[] storageDiffs; FrameTxDeployedContract[] deployedContracts; FrameTxAccountDiff[] accountDiffs; FrameTxEvent[] events; uint256 gasPreCharge; address gasPayer; }
-    struct FrameTx { address sender; uint64 nonce; uint64 legacyNonce; uint256[] nonceKeys; bytes32 nonceKeysHash; bytes32 sigHash; uint256 maxCost; uint256 maxPriorityFeePerGas; uint256 maxFeePerGas; uint256 maxFeePerBlobGas; uint64 blobCount; uint64 frameIndex; FrameTxFrame[] frames; FrameTxSignature[] signatures; FrameTxRecentRootReference[] recentRootReferences; FrameTxTrace trace; uint64 approvableScopes; }
+    struct FrameTx { address sender; uint64 nonce; uint64 legacyNonce; uint256[] nonceKeys; bytes32 nonceKeysHash; uint64 stateGasLeft; bytes32 sigHash; uint256 maxCost; uint256 maxPriorityFeePerGas; uint256 maxFeePerGas; uint256 maxFeePerBlobGas; uint64 blobCount; uint64 frameIndex; FrameTxFrame[] frames; FrameTxSignature[] signatures; FrameTxRecentRootReference[] recentRootReferences; FrameTxTrace trace; uint64 approvableScopes; }
     struct Wallet { address addr; uint256 publicKeyX; uint256 publicKeyY; uint256 privateKey; }
     struct FfiResult { int32 exitCode; bytes stdout; bytes stderr; }
     struct ChainInfo { uint256 forkId; uint256 chainId; }
@@ -224,6 +224,10 @@ interface Vm {
     function deriveKey(string calldata mnemonic, string calldata derivationPath, uint32 index, string calldata language) external pure returns (uint256 privateKey);
     function difficulty(uint256 newDifficulty) external;
     function dumpState(string calldata pathToStateJson) external;
+    function ecAddAffine(uint256 pointX1, uint256 pointY1, uint256 pointX2, uint256 pointY2) external pure returns (uint256 resultX, uint256 resultY);
+    function ecAddProjective(uint256 pointX1, uint256 pointY1, uint256 pointZ1, uint256 pointX2, uint256 pointY2, uint256 pointZ2) external pure returns (uint256 resultX, uint256 resultY, uint256 resultZ);
+    function ecMulAffine(uint256 pointX, uint256 pointY, uint256 scalar) external pure returns (uint256 resultX, uint256 resultY);
+    function ecMulProjective(uint256 pointX, uint256 pointY, uint256 pointZ, uint256 scalar) external pure returns (uint256 resultX, uint256 resultY, uint256 resultZ);
     function eip712HashStruct(string calldata typeNameOrDefinition, bytes calldata abiEncodedData) external pure returns (bytes32 typeHash);
     function eip712HashStruct(string calldata bindingsPath, string calldata typeName, bytes calldata abiEncodedData) external pure returns (bytes32 typeHash);
     function eip712HashType(string calldata typeNameOrDefinition) external pure returns (bytes32 typeHash);
@@ -273,6 +277,7 @@ interface Vm {
     function expectCall(address callee, uint256 msgValue, uint64 gas, bytes calldata data, uint64 count) external;
     function expectCreate(bytes calldata bytecode, address deployer) external;
     function expectCreate2(bytes calldata bytecode, address deployer) external;
+    function expectDelegateCall(address callee, bytes calldata data) external;
     function expectEmitAnonymous(bool checkTopic0, bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData) external;
     function expectEmitAnonymous(bool checkTopic0, bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData, address emitter) external;
     function expectEmitAnonymous() external;
@@ -307,6 +312,9 @@ interface Vm {
     function expectTip20LogoURIUpdated(address token, address updater, string calldata newLogoURI) external;
     function fee(uint256 newBasefee) external;
     function ffi(string[] calldata commandInput) external returns (bytes memory result);
+    function ffiBytes(string[] calldata commandInput) external returns (bytes memory result);
+    function ffiString(string[] calldata commandInput) external returns (string memory result);
+    function ffiUint(string[] calldata commandInput) external returns (uint256 result);
     function foundryVersionAtLeast(string calldata version) external view returns (bool);
     function foundryVersionCmp(string calldata version) external view returns (int256);
     function fromRlp(bytes calldata rlp) external pure returns (bytes[] memory data);
@@ -383,45 +391,73 @@ interface Vm {
     function parseBytes(string calldata stringifiedValue) external pure returns (bytes memory parsedValue);
     function parseBytes32(string calldata stringifiedValue) external pure returns (bytes32 parsedValue);
     function parseInt(string calldata stringifiedValue) external pure returns (int256 parsedValue);
-    function parseJsonAddress(string calldata json, string calldata key) external pure returns (address);
     function parseJsonAddressArray(string calldata json, string calldata key) external pure returns (address[] memory);
+    function parseJsonAddressArray(string calldata json, string calldata key, address[] calldata defaultValue) external pure returns (address[] memory);
+    function parseJsonAddress(string calldata json, string calldata key) external pure returns (address);
+    function parseJsonAddress(string calldata json, string calldata key, address defaultValue) external pure returns (address);
     function parseJsonArrayLength(string calldata json, string calldata key) external pure returns (uint256 length);
-    function parseJsonBool(string calldata json, string calldata key) external pure returns (bool);
     function parseJsonBoolArray(string calldata json, string calldata key) external pure returns (bool[] memory);
-    function parseJsonBytes(string calldata json, string calldata key) external pure returns (bytes memory);
-    function parseJsonBytes32(string calldata json, string calldata key) external pure returns (bytes32);
+    function parseJsonBoolArray(string calldata json, string calldata key, bool[] calldata defaultValue) external pure returns (bool[] memory);
+    function parseJsonBool(string calldata json, string calldata key) external pure returns (bool);
+    function parseJsonBool(string calldata json, string calldata key, bool defaultValue) external pure returns (bool);
     function parseJsonBytes32Array(string calldata json, string calldata key) external pure returns (bytes32[] memory);
+    function parseJsonBytes32Array(string calldata json, string calldata key, bytes32[] calldata defaultValue) external pure returns (bytes32[] memory);
+    function parseJsonBytes32(string calldata json, string calldata key) external pure returns (bytes32);
+    function parseJsonBytes32(string calldata json, string calldata key, bytes32 defaultValue) external pure returns (bytes32);
     function parseJsonBytesArray(string calldata json, string calldata key) external pure returns (bytes[] memory);
-    function parseJsonInt(string calldata json, string calldata key) external pure returns (int256);
+    function parseJsonBytesArray(string calldata json, string calldata key, bytes[] calldata defaultValue) external pure returns (bytes[] memory);
+    function parseJsonBytes(string calldata json, string calldata key) external pure returns (bytes memory);
+    function parseJsonBytes(string calldata json, string calldata key, bytes calldata defaultValue) external pure returns (bytes memory);
     function parseJsonIntArray(string calldata json, string calldata key) external pure returns (int256[] memory);
+    function parseJsonIntArray(string calldata json, string calldata key, int256[] calldata defaultValue) external pure returns (int256[] memory);
+    function parseJsonInt(string calldata json, string calldata key) external pure returns (int256);
+    function parseJsonInt(string calldata json, string calldata key, int256 defaultValue) external pure returns (int256);
     function parseJsonKeys(string calldata json, string calldata key) external pure returns (string[] memory keys);
-    function parseJsonString(string calldata json, string calldata key) external pure returns (string memory);
     function parseJsonStringArray(string calldata json, string calldata key) external pure returns (string[] memory);
+    function parseJsonStringArray(string calldata json, string calldata key, string[] calldata defaultValue) external pure returns (string[] memory);
+    function parseJsonString(string calldata json, string calldata key) external pure returns (string memory);
+    function parseJsonString(string calldata json, string calldata key, string calldata defaultValue) external pure returns (string memory);
     function parseJsonTypeArray(string calldata json, string calldata key, string calldata typeDescription) external pure returns (bytes memory);
     function parseJsonType(string calldata json, string calldata typeDescription) external pure returns (bytes memory);
     function parseJsonType(string calldata json, string calldata key, string calldata typeDescription) external pure returns (bytes memory);
-    function parseJsonUint(string calldata json, string calldata key) external pure returns (uint256);
     function parseJsonUintArray(string calldata json, string calldata key) external pure returns (uint256[] memory);
+    function parseJsonUintArray(string calldata json, string calldata key, uint256[] calldata defaultValue) external pure returns (uint256[] memory);
+    function parseJsonUint(string calldata json, string calldata key) external pure returns (uint256);
+    function parseJsonUint(string calldata json, string calldata key, uint256 defaultValue) external pure returns (uint256);
     function parseJson(string calldata json) external pure returns (bytes memory abiEncodedData);
     function parseJson(string calldata json, string calldata key) external pure returns (bytes memory abiEncodedData);
-    function parseTomlAddress(string calldata toml, string calldata key) external pure returns (address);
     function parseTomlAddressArray(string calldata toml, string calldata key) external pure returns (address[] memory);
-    function parseTomlBool(string calldata toml, string calldata key) external pure returns (bool);
+    function parseTomlAddressArray(string calldata toml, string calldata key, address[] calldata defaultValue) external pure returns (address[] memory);
+    function parseTomlAddress(string calldata toml, string calldata key) external pure returns (address);
+    function parseTomlAddress(string calldata toml, string calldata key, address defaultValue) external pure returns (address);
     function parseTomlBoolArray(string calldata toml, string calldata key) external pure returns (bool[] memory);
-    function parseTomlBytes(string calldata toml, string calldata key) external pure returns (bytes memory);
-    function parseTomlBytes32(string calldata toml, string calldata key) external pure returns (bytes32);
+    function parseTomlBoolArray(string calldata toml, string calldata key, bool[] calldata defaultValue) external pure returns (bool[] memory);
+    function parseTomlBool(string calldata toml, string calldata key) external pure returns (bool);
+    function parseTomlBool(string calldata toml, string calldata key, bool defaultValue) external pure returns (bool);
     function parseTomlBytes32Array(string calldata toml, string calldata key) external pure returns (bytes32[] memory);
+    function parseTomlBytes32Array(string calldata toml, string calldata key, bytes32[] calldata defaultValue) external pure returns (bytes32[] memory);
+    function parseTomlBytes32(string calldata toml, string calldata key) external pure returns (bytes32);
+    function parseTomlBytes32(string calldata toml, string calldata key, bytes32 defaultValue) external pure returns (bytes32);
     function parseTomlBytesArray(string calldata toml, string calldata key) external pure returns (bytes[] memory);
-    function parseTomlInt(string calldata toml, string calldata key) external pure returns (int256);
+    function parseTomlBytesArray(string calldata toml, string calldata key, bytes[] calldata defaultValue) external pure returns (bytes[] memory);
+    function parseTomlBytes(string calldata toml, string calldata key) external pure returns (bytes memory);
+    function parseTomlBytes(string calldata toml, string calldata key, bytes calldata defaultValue) external pure returns (bytes memory);
     function parseTomlIntArray(string calldata toml, string calldata key) external pure returns (int256[] memory);
+    function parseTomlIntArray(string calldata toml, string calldata key, int256[] calldata defaultValue) external pure returns (int256[] memory);
+    function parseTomlInt(string calldata toml, string calldata key) external pure returns (int256);
+    function parseTomlInt(string calldata toml, string calldata key, int256 defaultValue) external pure returns (int256);
     function parseTomlKeys(string calldata toml, string calldata key) external pure returns (string[] memory keys);
-    function parseTomlString(string calldata toml, string calldata key) external pure returns (string memory);
     function parseTomlStringArray(string calldata toml, string calldata key) external pure returns (string[] memory);
+    function parseTomlStringArray(string calldata toml, string calldata key, string[] calldata defaultValue) external pure returns (string[] memory);
+    function parseTomlString(string calldata toml, string calldata key) external pure returns (string memory);
+    function parseTomlString(string calldata toml, string calldata key, string calldata defaultValue) external pure returns (string memory);
     function parseTomlTypeArray(string calldata toml, string calldata key, string calldata typeDescription) external pure returns (bytes memory);
     function parseTomlType(string calldata toml, string calldata typeDescription) external pure returns (bytes memory);
     function parseTomlType(string calldata toml, string calldata key, string calldata typeDescription) external pure returns (bytes memory);
-    function parseTomlUint(string calldata toml, string calldata key) external pure returns (uint256);
     function parseTomlUintArray(string calldata toml, string calldata key) external pure returns (uint256[] memory);
+    function parseTomlUintArray(string calldata toml, string calldata key, uint256[] calldata defaultValue) external pure returns (uint256[] memory);
+    function parseTomlUint(string calldata toml, string calldata key) external pure returns (uint256);
+    function parseTomlUint(string calldata toml, string calldata key, uint256 defaultValue) external pure returns (uint256);
     function parseToml(string calldata toml) external pure returns (bytes memory abiEncodedData);
     function parseToml(string calldata toml, string calldata key) external pure returns (bytes memory abiEncodedData);
     function parseUint(string calldata stringifiedValue) external pure returns (uint256 parsedValue);

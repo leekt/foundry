@@ -10,8 +10,11 @@ use rayon::iter::{self, ParallelIterator};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -190,7 +193,17 @@ fn save_wallet_to_file(wallet: &PrivateKeySigner, path: &Path) -> Result<()> {
 
     wallets.wallets.push(WalletData::new(wallet));
 
-    fs::write(path, serde_json::to_string_pretty(&wallets)?)?;
+    let contents = serde_json::to_string_pretty(&wallets)?;
+    let mut options = fs::File::options();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.set_len(0)?;
+    file.write_all(contents.as_bytes())?;
     Ok(())
 }
 
@@ -360,6 +373,10 @@ fn parse_pattern(pattern: &str, is_start: bool) -> Result<Either<Vec<u8>, Regex>
         }
         Ok(Either::Left(decoded))
     } else {
+        // a non regex literal containing non-hex characters can never match
+        if !is_hex && pattern.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(eyre::eyre!("Pattern contains non-hex characters and can never match"));
+        }
         let (prefix, suffix) = if is_start { ("^", "") } else { ("", "$") };
         let pattern = if is_hex { pattern.to_ascii_lowercase() } else { pattern.to_string() };
         Ok(Either::Right(Regex::new(&format!("{prefix}{pattern}{suffix}"))?))
@@ -426,6 +443,28 @@ mod tests {
         assert_eq!(fs::read_to_string(tmp.path()).unwrap(), original);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn new_wallet_file_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wallets.json");
+
+        save_wallet_to_file(&PrivateKeySigner::random(), &path).unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_wallet_file_is_made_owner_only() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_wallet_to_file(&PrivateKeySigner::random(), tmp.path()).unwrap();
+
+        assert_eq!(fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
     #[test]
     fn parse_odd_length_hex_case_insensitively() {
         let mut starts_with = [0; 20];
@@ -476,5 +515,15 @@ mod tests {
     fn reject_empty_prefixed_vanity_pattern() {
         let err = parse_pattern("0x", true).unwrap_err();
         assert_eq!(err.to_string(), "Vanity pattern cannot be empty");
+    }
+
+    #[test]
+    fn reject_unmatchable_pattern() {
+        // non-hex chars can never appear in a hex address
+        assert!(parse_pattern("zzz", true).is_err());
+        assert!(parse_pattern("foobar", false).is_err());
+
+        // regex patterns stay supported
+        assert!(parse_pattern("a.c", true).is_ok());
     }
 }

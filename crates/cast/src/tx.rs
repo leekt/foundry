@@ -13,7 +13,7 @@ use clap::Args;
 use eyre::{Result, WrapErr};
 use foundry_cli::{
     opts::{CliAuthorizationList, EthereumOpts, TempoOpts, TransactionOpts},
-    utils::{self, parse_function_args},
+    utils::{self, apply_gas_estimate_multiplier, parse_function_args},
 };
 use foundry_common::{
     FoundryTransactionBuilder, TransactionReceiptWithRevertReason,
@@ -442,6 +442,8 @@ pub struct CastTxBuilder<N: Network, P, S> {
     browser: bool,
     /// The preset used when estimating EIP-1559 fees.
     eip1559_fee_estimate: Eip1559FeeEstimatePreset,
+    /// Optional percentage applied to provider gas estimates.
+    gas_estimate_multiplier: Option<u64>,
     auth: Vec<CliAuthorizationList>,
     chain: Chain,
     etherscan_api_key: Option<String>,
@@ -459,6 +461,12 @@ impl<N: Network, P, S> CastTxBuilder<N, P, S> {
     /// Marks this transaction as destined for browser wallet submission.
     pub const fn with_browser_wallet(mut self) -> Self {
         self.browser = true;
+        self
+    }
+
+    /// Applies a percentage multiplier to provider gas estimates.
+    pub const fn with_gas_estimate_multiplier(mut self, multiplier: Option<u64>) -> Self {
+        self.gas_estimate_multiplier = multiplier;
         self
     }
 
@@ -511,6 +519,7 @@ where
             fill: true,
             browser: false,
             eip1559_fee_estimate: config.eip1559_fee_estimate,
+            gas_estimate_multiplier: None,
             chain,
             etherscan_api_key,
             etherscan_api_url,
@@ -532,6 +541,7 @@ where
             fill: self.fill,
             browser: self.browser,
             eip1559_fee_estimate: self.eip1559_fee_estimate,
+            gas_estimate_multiplier: self.gas_estimate_multiplier,
             chain: self.chain,
             etherscan_api_key: self.etherscan_api_key,
             etherscan_api_url: self.etherscan_api_url,
@@ -597,6 +607,7 @@ where
             fill: self.fill,
             browser: self.browser,
             eip1559_fee_estimate: self.eip1559_fee_estimate,
+            gas_estimate_multiplier: self.gas_estimate_multiplier,
             chain: self.chain,
             etherscan_api_key: self.etherscan_api_key,
             etherscan_api_url: self.etherscan_api_url,
@@ -617,8 +628,7 @@ where
         self,
         sender: impl Into<SenderKind<'_>>,
     ) -> Result<(N::TransactionRequest, Option<Function>)> {
-        let fill = self.fill;
-        self._build(sender, fill, None).await
+        self.build_inner(sender, None).await
     }
 
     /// Builds a transaction that will be signed by a Tempo access key.
@@ -630,18 +640,18 @@ where
         self,
         wallet: &TempoAccountsWallet,
     ) -> Result<(N::TransactionRequest, Option<Function>, TempoAccountsWallet)> {
-        let fill = self.fill;
         let mut prepared = wallet.clone();
-        let (tx, func) = self._build(wallet.account(), fill, Some(&mut prepared)).await?;
+        let (tx, func) = self.build_inner(wallet.account(), Some(&mut prepared)).await?;
         Ok((tx, func, prepared))
     }
 
-    async fn _build(
+    async fn build_inner(
         mut self,
         sender: impl Into<SenderKind<'_>>,
-        fill: bool,
         tempo_wallet: Option<&mut TempoAccountsWallet>,
     ) -> Result<(N::TransactionRequest, Option<Function>)> {
+        let fill = self.fill;
+
         // prepare
         let sender = sender.into();
         self.prepare(&sender);
@@ -681,9 +691,13 @@ where
                 ),
                 async {
                     match gas_request {
-                        Some(request) => {
-                            Self::estimate_gas(&self.provider, request).await.map(Some)
-                        }
+                        Some(request) => Self::estimate_gas(
+                            &self.provider,
+                            request,
+                            self.gas_estimate_multiplier,
+                        )
+                        .await
+                        .map(Some),
                         None => Ok(None),
                     }
                 },
@@ -826,7 +840,8 @@ where
             } else {
                 self.tx.clone()
             };
-            let estimated = Self::estimate_gas(&self.provider, request).await?;
+            let estimated =
+                Self::estimate_gas(&self.provider, request, self.gas_estimate_multiplier).await?;
             self.tx.set_gas_limit(estimated);
         }
 
@@ -834,9 +849,13 @@ where
     }
 
     /// Estimate tx gas from provider call. Tries to decode custom error if execution reverted.
-    async fn estimate_gas(provider: &P, request: N::TransactionRequest) -> Result<u64> {
+    async fn estimate_gas(
+        provider: &P,
+        request: N::TransactionRequest,
+        multiplier: Option<u64>,
+    ) -> Result<u64> {
         match provider.estimate_gas(request).await {
-            Ok(estimated) => Ok(estimated),
+            Ok(estimated) => apply_gas_estimate_multiplier(estimated, multiplier),
             Err(err) => {
                 if let TransportError::ErrorResp(payload) = &err {
                     // If execution reverted with code 3 during provider gas estimation then try
@@ -933,14 +952,18 @@ where
 
 /// Helper function that tries to decode custom error name and inputs from error payload data.
 async fn decode_execution_revert(data: &RawValue) -> Result<Option<String>> {
-    let err_data = serde_json::from_str::<Bytes>(data.get())?;
-    let Some(selector) = err_data.get(..4) else { return Ok(None) };
+    let data = serde_json::from_str::<Bytes>(data.get())?;
+    decode_custom_error(&data).await
+}
+
+pub(crate) async fn decode_custom_error(data: &[u8]) -> Result<Option<String>> {
+    let Some(selector) = data.get(..4) else { return Ok(None) };
     if let Some(known_error) =
         SignaturesIdentifier::new(false)?.identify_error(selector.try_into().unwrap()).await
     {
         let mut decoded_error = known_error.name.clone();
         if !known_error.inputs.is_empty()
-            && let Ok(error) = known_error.decode_error(&err_data)
+            && let Ok(error) = known_error.decode_error(data)
         {
             write!(decoded_error, "({})", format_tokens(&error.body).format(", "))?;
         }
@@ -1008,10 +1031,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filled_build_fetches_nonce_and_gas_concurrently_with_explicit_fees() {
+    async fn filled_build_applies_multiplier_to_concurrent_gas_estimate() {
         let asserter = Asserter::new();
         for _ in 0..2 {
-            asserter.push_success(&U64::from(1));
+            asserter.push_success(&U64::from(100));
         }
         let fill_methods = Arc::new(Mutex::new(Vec::new()));
         let transport = BarrierTransport {
@@ -1030,6 +1053,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .with_gas_estimate_multiplier(Some(150))
         .with_to(Some(Address::repeat_byte(0x11).into()))
         .await
         .unwrap()
@@ -1041,9 +1065,9 @@ mod tests {
             .expect("nonce and gas requests were not in flight together")
             .unwrap();
 
-        assert_eq!(tx.nonce, Some(1));
+        assert_eq!(tx.nonce, Some(100));
         assert_eq!(tx.gas_price, Some(1));
-        assert_eq!(tx.gas, Some(1));
+        assert_eq!(tx.gas, Some(150));
         let mut fill_methods = fill_methods.lock().unwrap().clone();
         fill_methods.sort();
         assert_eq!(fill_methods, ["eth_estimateGas", "eth_getTransactionCount"]);

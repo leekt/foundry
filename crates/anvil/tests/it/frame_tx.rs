@@ -25,7 +25,11 @@ use foundry_common::provider::RetryProvider;
 use foundry_evm::hardfork::EthereumHardfork;
 use foundry_primitives::{
     EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE, FoundryNetwork, FoundryReceiptEnvelope,
-    Frame, FrameReceipt, FrameSignature, TxFrame, flags, mode, scheme,
+    Frame, FrameReceipt, FrameSignature, TxFrame, flags, frame_gas as gas, mode, scheme,
+};
+use ml_dsa::{
+    Keypair as _, MlDsa44, Seed, Signature as MlDsaSignature, Signer as _,
+    SigningKey as MlDsaSigningKey,
 };
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, signature::hazmat::PrehashSigner,
@@ -50,7 +54,24 @@ const MUTATING_APPROVER_INITCODE: Bytes = bytes!("685f355f5560035f5faa5f52600960
 /// Regenerate after rebuilding the contracts with:
 /// `jq -r .deployedBytecode.object contracts/out/P256Account.sol/P256Account.json`.
 const P256_ACCOUNT_RUNTIME: Bytes = bytes!(
-    "608060405260043610610041575f3560e01c806325b904941461004c5780636fa364651461006d5780638d2b1f571461008c578063f3376a09146100c6575f5ffd5b3661004857005b5f5ffd5b348015610057575f5ffd5b5061006b61006636600461029e565b6100e5565b005b348015610078575f5ffd5b5061006b61008736600461030f565b6101c1565b348015610097575f5ffd5b505f546100aa906001600160a01b031681565b6040516001600160a01b03909116815260200160405180910390f35b3480156100d1575f5ffd5b506100aa6100e036600461030f565b610234565b5f80546001600160a01b031690805b8381101561016e575f85858381811061010f5761010f61032f565b905060200201359050600261012582600190b490565b146101305750610166565b600281b41561013f5750610166565b6001600160a01b0384165f82b46001600160a01b03160361016457600192505061016e565b505b6001016100f4565b508061018d5760405163afd2b59d60e01b815260040160405180910390fd5b6006600ab0b3806101b15760405163353dfba360e21b815260040160405180910390fd5b6101ba81805f5faa5b5050505050565b3330146101e1576040516314e1dbf760e11b815260040160405180910390fd5b6101eb8282610246565b5f80546001600160a01b0319166001600160a01b039290921691821781556040517f316aad49c9322783338ad5a4800300704fe9b4005f32d40bb8c1348713e975919190a25050565b5f61023f8383610246565b9392505050565b5f82158015610253575081155b156102715760405163145a1fdd60e31b815260040160405180910390fd5b50604080516020808201949094528082019290925280518083038201815260609092019052805191012090565b5f5f602083850312156102af575f5ffd5b823567ffffffffffffffff8111156102c5575f5ffd5b8301601f810185136102d5575f5ffd5b803567ffffffffffffffff8111156102eb575f5ffd5b8560208260051b84010111156102ff575f5ffd5b6020919091019590945092505050565b5f5f60408385031215610320575f5ffd5b50508035926020909101359150565b634e487b7160e01b5f52603260045260245ffd"
+    "608060405260043610610041575f3560e01c80636fa364651461004c5780638d2b1f571461006d578063ce4d01a3146100a7578063f3376a09146100c6575f5ffd5b3661004857005b5f5ffd5b348015610057575f5ffd5b5061006b61006636600461026f565b6100e5565b005b348015610078575f5ffd5b505f5461008b906001600160a01b031681565b6040516001600160a01b03909116815260200160405180910390f35b3480156100b2575f5ffd5b5061006b6100c136600461028f565b610158565b3480156100d1575f5ffd5b5061008b6100e036600461026f565b610205565b333014610105576040516314e1dbf760e11b815260040160405180910390fd5b61010f8282610217565b5f80546001600160a01b0319166001600160a01b039290921691821781556040517f316aad49c9322783338ad5a4800300704fe9b4005f32d40bb8c1348713e975919190a25050565b6002600182b41461017c5760405163afd2b59d60e01b815260040160405180910390fd5b600281b41561019e5760405163afd2b59d60e01b815260040160405180910390fd5b5f80546001600160a01b03169082b46001600160a01b0316146101d45760405163afd2b59d60e01b815260040160405180910390fd5b6006600ab0b3806101f85760405163353dfba360e21b815260040160405180910390fd5b61020181805f5faa5b5050565b5f6102108383610217565b9392505050565b5f82158015610224575081155b156102425760405163145a1fdd60e31b815260040160405180910390fd5b50604080516020808201949094528082019290925280518083038201815260609092019052805191012090565b5f5f60408385031215610280575f5ffd5b50508035926020909101359150565b5f6020828403121561029f575f5ffd5b503591905056"
+);
+
+/// The metadata-free runtime emitted for `contracts/src/accounts/MLDSAAccount.sol`.
+///
+/// As with the P256 fixture above, the test installs production runtime and
+/// writes slot zero exactly as the constructor does. Regenerate with:
+/// `jq -r .deployedBytecode.object contracts/out/MLDSAAccount.sol/MLDSAAccount.json`.
+const MLDSA_ACCOUNT_RUNTIME: Bytes = bytes!(
+    "608060405260043610610041575f3560e01c80639b0453f31461004c578063ce4d01a31461006d578063d52fafa41461008c578063e21e5a82146100c6575f5ffd5b3661004857005b5f5ffd5b348015610057575f5ffd5b5061006b6100663660046102e6565b6100e5565b005b348015610078575f5ffd5b5061006b610087366004610354565b61018c565b348015610097575f5ffd5b505f546100aa906001600160a01b031681565b6040516001600160a01b03909116815260200160405180910390f35b3480156100d1575f5ffd5b506100aa6100e03660046102e6565b610239565b333014610105576040516314e1dbf760e11b815260040160405180910390fd5b61014382828080601f0160208091040260200160405190810160405280939291908181526020018383808284375f9201919091525061027f92505050565b5f80546001600160a01b0319166001600160a01b039290921691821781556040517f139b5b7b89277bad2ac5217262c52f1eca5af1b14c6709ce1cfe93975ac921959190a25050565b6003600182b4146101b05760405163afd2b59d60e01b815260040160405180910390fd5b600281b4156101d25760405163afd2b59d60e01b815260040160405180910390fd5b5f80546001600160a01b03169082b46001600160a01b0316146102085760405163afd2b59d60e01b815260040160405180910390fd5b6006600ab0b38061022c5760405163353dfba360e21b815260040160405180910390fd5b61023581805f5faa5b5050565b5f61027883838080601f0160208091040260200160405190810160405280939291908181526020018383808284375f9201919091525061027f92505050565b9392505050565b5f6105208251146102b15781516040516317ab7d5d60e11b81526004016102a891815260200190565b60405180910390fd5b6040516102c890600360f81b90849060200161036b565b60408051601f19818403018152919052805160209091012092915050565b5f5f602083850312156102f7575f5ffd5b823567ffffffffffffffff81111561030d575f5ffd5b8301601f8101851361031d575f5ffd5b803567ffffffffffffffff811115610333575f5ffd5b856020828401011115610344575f5ffd5b6020919091019590945092505050565b5f60208284031215610364575f5ffd5b5035919050565b6001600160f81b03198316815281515f908060208501600185015e5f9201600101918252509291505056"
+);
+
+/// The metadata-free runtime emitted for `contracts/src/accounts/MultisigAccount.sol`.
+/// Storage is initialized below as constructor-equivalent owner mappings and
+/// threshold. Regenerate with:
+/// `jq -r .deployedBytecode.object contracts/out/MultisigAccount.sol/MultisigAccount.json`.
+const MULTISIG_ACCOUNT_RUNTIME: Bytes = bytes!(
+    "608060405260043610610036575f3560e01c806325b90494146100415780632f54bf6e1461006257806342cde4e8146100a5575f5ffd5b3661003d57005b5f5ffd5b34801561004c575f5ffd5b5061006061005b366004610224565b6100c8565b005b34801561006d575f5ffd5b5061009061007c366004610295565b5f6020819052908152604090205460ff1681565b60405190151581526020015b60405180910390f35b3480156100b0575f5ffd5b506100ba60015481565b60405190815260200161009c565b5f80805b838110156101c5575f8585838181106100e7576100e76102c2565b9050602002013590505f6100fc82600190b490565b905060018114158015610110575060028114155b801561011d575060038114155b156101295750506101bd565b600282b4156101395750506101bd565b5f8083b46001600160a01b03165f8181526020819052604090205490915060ff16610166575050506101bd565b8481116101b25760405162461bcd60e51b81526020600482015260156024820152741bdddb995c881cda59dcc81b9bdd081cdbdc9d1959605a1b60448201526064015b60405180910390fd5b600190950194935050505b6001016100cc565b5060015482101561020c5760405162461bcd60e51b81526020600482015260116024820152701d1a1c995cda1bdb19081b9bdd081b595d607a1b60448201526064016101a9565b61021e6006600ab0b3805f5faa805f5faa5b50505050565b5f5f60208385031215610235575f5ffd5b823567ffffffffffffffff81111561024b575f5ffd5b8301601f8101851361025b575f5ffd5b803567ffffffffffffffff811115610271575f5ffd5b8560208260051b8401011115610285575f5ffd5b6020919091019590945092505050565b5f602082840312156102a5575f5ffd5b81356001600160a01b03811681146102bb575f5ffd5b9392505050565b634e487b7160e01b5f52603260045260245ffd"
 );
 
 fn eip7851_designation(target: Address) -> Bytes {
@@ -152,14 +173,57 @@ fn sign_p256_entry(tx: &mut TxFrame, index: usize, key: &P256SigningKey) {
     tx.signatures[index].signature = encoded.into();
 }
 
-/// ABI encoding of `validate(uint256[])` selecting signature entry zero.
+/// Deterministic ML-DSA-44 key used by the native protocol/account fixture.
+fn ml_dsa_44_test_key() -> MlDsaSigningKey<MlDsa44> {
+    MlDsaSigningKey::from_seed(&Seed::from([0x42; 32]))
+}
+
+/// Toolkit-local ML-DSA signer identity: `keccak256(0x03 || public_key)[12..]`.
+fn ml_dsa_44_signer(key: &MlDsaSigningKey<MlDsa44>) -> Address {
+    let public_key = key.verifying_key().encode();
+    let mut identity = Vec::with_capacity(1 + public_key.len());
+    identity.push(scheme::ML_DSA_44);
+    identity.extend_from_slice(public_key.as_slice());
+    Address::from_slice(&keccak256(identity)[12..])
+}
+
+/// Signs the canonical transaction hash into the experimental native wire
+/// encoding `signature[2420] || public_key[1312]`.
+fn sign_ml_dsa_44_entry(tx: &mut TxFrame, index: usize, key: &MlDsaSigningKey<MlDsa44>) {
+    let signature: MlDsaSignature<MlDsa44> = key.sign(tx.signature_hash().as_slice());
+    let public_key = key.verifying_key().encode();
+
+    let mut encoded = Vec::with_capacity(3_732);
+    encoded.extend_from_slice(signature.encode().as_slice());
+    encoded.extend_from_slice(public_key.as_slice());
+    debug_assert_eq!(encoded.len(), 3_732);
+    tx.signatures[index].signature = encoded.into();
+}
+
+/// ABI encoding of `validate(uint256)` selecting signature entry zero.
 fn validate_signature_zero_calldata() -> Bytes {
-    let mut data = Vec::with_capacity(100);
-    data.extend_from_slice(&[0x25, 0xb9, 0x04, 0x94]);
-    data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
-    data.extend_from_slice(&U256::ONE.to_be_bytes::<32>());
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(&[0xce, 0x4d, 0x01, 0xa3]);
     data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
     data.into()
+}
+
+/// ABI encoding of `validate(uint256[])` selecting entries zero and one.
+fn validate_signature_zero_one_calldata() -> Bytes {
+    let mut data = Vec::with_capacity(132);
+    data.extend_from_slice(&[0x25, 0xb9, 0x04, 0x94]);
+    data.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+    data.extend_from_slice(&U256::from(2).to_be_bytes::<32>());
+    data.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+    data.extend_from_slice(&U256::ONE.to_be_bytes::<32>());
+    data.into()
+}
+
+/// Storage slot for `mapping(address => bool)` at Solidity slot zero.
+fn owner_mapping_slot(owner: Address) -> U256 {
+    let mut preimage = [0u8; 64];
+    preimage[12..32].copy_from_slice(owner.as_slice());
+    U256::from_be_slice(keccak256(preimage).as_slice())
 }
 
 /// An empty-`msg` secp256k1 entry for `signer`, left unsigned. An empty `signer`
@@ -438,6 +502,70 @@ async fn frame_tx_is_mined_and_its_sender_frame_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn calldata_floor_with_state_gas_is_reflected_in_receipt_and_block() {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let fresh = Address::repeat_byte(0xf1);
+    assert!(provider.get_code_at(fresh).await.unwrap().is_empty());
+    assert_eq!(provider.get_balance(fresh).await.unwrap(), U256::ZERO);
+
+    let nonce = provider.get_transaction_count(sender).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = self_relay_tx(
+        sender,
+        nonce,
+        fresh,
+        U256::ONE,
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    tx.frames[1].gas_limit = 30_000;
+    tx.frames[1].state_gas_limit = gas::NEW_ACCOUNT_STATE_GAS;
+    // Make the EIP-7976 uniform calldata floor dominate actual execution gas.
+    tx.frames[1].data = vec![0xff; 2_048].into();
+    sign_entry(&mut tx, 0, &wallet);
+
+    let (standard_gas, floor_gas, _) = tx.gas_limits().unwrap();
+    let overhead = standard_gas - tx.sum_frame_gas().unwrap();
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .unwrap()
+        .expect("floor-binding frame transaction was not mined");
+    let frame_receipts = receipt
+        .0
+        .other
+        .get_deserialized::<Vec<FrameReceipt<alloy_rpc_types::Log>>>("frameReceipts")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has nested receipts");
+    let execution_gas = frame_receipts.iter().map(|frame| frame.execution_gas_used).sum::<u64>();
+    let state_gas = frame_receipts.iter().map(|frame| frame.state_gas_used).sum::<u64>();
+    let gas_before_refund = overhead + execution_gas + state_gas;
+
+    assert_eq!(state_gas, gas::NEW_ACCOUNT_STATE_GAS);
+    assert!(
+        gas_before_refund - state_gas < floor_gas,
+        "test transaction did not bind its calldata floor"
+    );
+    // This transaction performs no refund-producing operation, so settlement
+    // is exactly calldata_floor_gas + final state gas.
+    let expected_gas_used = floor_gas + state_gas;
+    assert_eq!(receipt.gas_used(), expected_gas_used);
+    assert_eq!(receipt.cumulative_gas_used(), expected_gas_used);
+
+    let block = provider
+        .get_block_by_number(receipt.block_number.unwrap().into())
+        .await
+        .unwrap()
+        .expect("receipt block exists");
+    assert_eq!(block.header.gas_used, expected_gas_used);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn raw_p256_frame_tx_runs_the_p256_account_authorization_path() {
     let (api, handle) = spawn(frame_node_config()).await;
     let provider = http_provider(&handle.http_endpoint());
@@ -519,6 +647,195 @@ async fn raw_p256_frame_tx_runs_the_p256_account_authorization_path() {
     );
     assert!(wrote_magic(&provider, writer).await, "authorized SENDER frame did not execute");
     assert_eq!(provider.get_transaction_count(account).await.unwrap(), nonce + 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_ml_dsa_44_frame_tx_runs_the_production_account_authorization_path() {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let deployer = handle.dev_wallets().next().unwrap();
+    let writer = deploy(&provider, deployer.address(), STORAGE_WRITER_INITCODE).await;
+
+    // Install production MLDSAAccount runtime with the constructor-equivalent
+    // key identity in slot zero.
+    let account = Address::repeat_byte(0xa6);
+    let key = ml_dsa_44_test_key();
+    let signer = ml_dsa_44_signer(&key);
+    api.anvil_set_code(account, MLDSA_ACCOUNT_RUNTIME.clone()).await.unwrap();
+    api.anvil_set_storage_at(
+        account,
+        U256::ZERO,
+        B256::from(U256::from_be_slice(signer.as_slice())),
+    )
+    .await
+    .unwrap();
+    api.anvil_set_balance(account, U256::MAX / U256::from(2)).await.unwrap();
+
+    let nonce = provider.get_transaction_count(account).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = frame_tx(
+        account,
+        nonce,
+        &[(writer, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    tx.frames[0].gas_limit = 45_000;
+    tx.frames[0].state_gas_limit = 100_000;
+    tx.frames[0].data = validate_signature_zero_calldata();
+    tx.signatures[0] = FrameSignature {
+        scheme: scheme::ML_DSA_44,
+        signer: Bytes::copy_from_slice(signer.as_slice()),
+        msg: Bytes::new(),
+        signature: Bytes::new(),
+    };
+    sign_ml_dsa_44_entry(&mut tx, 0, &key);
+
+    assert_eq!(tx.signatures[0].signature.len(), 3_732, "ML-DSA-44 wire length");
+    assert!(
+        gas::SIGNATURE_ML_DSA_44 + tx.frames[0].gas_limit <= gas::MAX_VERIFY_GAS,
+        "native verification plus the declared VERIFY frame must fit the public-pool limit"
+    );
+    assert!(tx.frames[0].state_gas_limit <= gas::MAX_VERIFY_STATE_GAS);
+    tx.validate().unwrap();
+    tx.validate_signatures().unwrap();
+    assert_eq!(tx.encoded_2718()[0], 0x06, "raw transaction type");
+
+    // A signature corruption is rejected during raw-envelope admission, so
+    // neither the sender nonce nor any SENDER-frame state can move.
+    let mut invalid = tx.clone();
+    let mut invalid_wire_signature = invalid.signatures[0].signature.to_vec();
+    invalid_wire_signature[0] ^= 1;
+    invalid.signatures[0].signature = invalid_wire_signature.into();
+    assert!(invalid.validate_signatures().is_err());
+    provider.send_raw_transaction(&invalid.encoded_2718()).await.unwrap_err();
+    assert_eq!(provider.get_transaction_count(account).await.unwrap(), nonce);
+    assert!(!wrote_magic(&provider, writer).await);
+
+    let payer_balance_before = provider.get_balance(account).await.unwrap();
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .unwrap()
+        .expect("native ML-DSA-44 frame transaction was not mined");
+    assert!(receipt.status(), "native ML-DSA-44 frame transaction reverted");
+    let payer = receipt
+        .0
+        .other
+        .get_deserialized::<Address>("payer")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has payer");
+    assert_eq!(payer, account, "MLDSAAccount did not approve its own payment");
+    assert!(
+        provider.get_balance(account).await.unwrap() < payer_balance_before,
+        "MLDSAAccount was named as payer but was not charged"
+    );
+    assert!(wrote_magic(&provider, writer).await, "authorized SENDER frame did not execute");
+    assert_eq!(provider.get_transaction_count(account).await.unwrap(), nonce + 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multisig_owner_reuses_its_execution_signature_to_pay_via_default_eoa_code() {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let mut owners = handle.dev_wallets().take(2).collect::<Vec<_>>();
+    owners.sort_by_key(|owner| owner.address());
+    let owner_a = owners.remove(0);
+    let owner_b = owners.remove(0);
+    let deployer = handle.dev_wallets().nth(2).unwrap();
+    let writer = deploy(&provider, deployer.address(), STORAGE_WRITER_INITCODE).await;
+
+    // Install the production 2-of-2 account and reproduce its constructor
+    // storage: isOwner lives in mapping slot zero; threshold lives in slot one.
+    let account = Address::repeat_byte(0xa7);
+    api.anvil_set_code(account, MULTISIG_ACCOUNT_RUNTIME.clone()).await.unwrap();
+    for owner in [owner_a.address(), owner_b.address()] {
+        api.anvil_set_storage_at(account, owner_mapping_slot(owner), B256::from(U256::ONE))
+            .await
+            .unwrap();
+    }
+    api.anvil_set_storage_at(account, U256::ONE, B256::from(U256::from(2))).await.unwrap();
+    api.anvil_set_balance(account, U256::ZERO).await.unwrap();
+    assert!(provider.get_code_at(owner_b.address()).await.unwrap().is_empty());
+
+    let nonce = provider.get_transaction_count(account).await.unwrap();
+    let owner_b_nonce_before = provider.get_transaction_count(owner_b.address()).await.unwrap();
+    let owner_a_balance_before = provider.get_balance(owner_a.address()).await.unwrap();
+    let owner_b_balance_before = provider.get_balance(owner_b.address()).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = frame_tx(
+        account,
+        nonce,
+        &[(writer, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    tx.frames[0].flags = flags::APPROVE_EXECUTION;
+    tx.frames[0].gas_limit = 50_000;
+    tx.frames[0].state_gas_limit = 100_000;
+    tx.frames[0].data = validate_signature_zero_one_calldata();
+    tx.frames.insert(
+        1,
+        Frame {
+            mode: mode::VERIFY,
+            flags: flags::APPROVE_PAYMENT,
+            target: Some(owner_b.address()),
+            gas_limit: 10_000,
+            state_gas_limit: 0,
+            value: U256::ZERO,
+            data: Bytes::new(),
+        },
+    );
+    tx.signatures = vec![
+        signature_entry(Bytes::copy_from_slice(owner_a.address().as_slice())),
+        signature_entry(Bytes::copy_from_slice(owner_b.address().as_slice())),
+    ];
+    sign_entry(&mut tx, 0, &owner_a);
+    sign_entry(&mut tx, 1, &owner_b);
+    assert!(
+        2 * gas::SIGNATURE_SECP256K1 + tx.frames[0].gas_limit + tx.frames[1].gas_limit
+            <= gas::MAX_VERIFY_GAS,
+        "both native signatures and the VERIFY prefix must fit the public-pool limit"
+    );
+    assert!(tx.frames[0].state_gas_limit <= gas::MAX_VERIFY_STATE_GAS);
+    tx.validate().unwrap();
+    tx.validate_signatures().unwrap();
+
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .unwrap()
+        .expect("multisig owner-funded frame transaction was not mined");
+    assert!(receipt.status(), "multisig owner-funded frame transaction reverted");
+    let payer = receipt
+        .0
+        .other
+        .get_deserialized::<Address>("payer")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has payer");
+
+    assert_eq!(payer, owner_b.address(), "the selected multisig owner was not the payer");
+    assert!(
+        provider.get_balance(owner_b.address()).await.unwrap() < owner_b_balance_before,
+        "the selected owner did not pay the frame transaction fee"
+    );
+    assert_eq!(
+        provider.get_balance(owner_a.address()).await.unwrap(),
+        owner_a_balance_before,
+        "the execution-only owner was unexpectedly charged"
+    );
+    assert_eq!(provider.get_balance(account).await.unwrap(), U256::ZERO);
+    assert_eq!(provider.get_transaction_count(account).await.unwrap(), nonce + 1);
+    assert_eq!(
+        provider.get_transaction_count(owner_b.address()).await.unwrap(),
+        owner_b_nonce_before,
+        "paying through default EOA code must not consume the owner's account nonce"
+    );
+    assert!(wrote_magic(&provider, writer).await, "multisig-authorized SENDER frame did not run");
 }
 
 #[tokio::test(flavor = "multi_thread")]

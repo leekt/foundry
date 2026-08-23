@@ -22,6 +22,10 @@ use alloy_primitives::{
     Address, B256, Bytes, ChainId, Sealable, TxKind, U256, keccak256, private::alloy_rlp::Buf,
 };
 use alloy_rlp::{BufMut, Decodable, Encodable, Header, length_of_length};
+use ml_dsa::{
+    EncodedVerifyingKey as MlDsaEncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
+    Verifier as _, VerifyingKey as MlDsaVerifyingKey,
+};
 use serde::{Deserialize, Serialize};
 
 /// Transaction type id of an EIP-8141 frame transaction.
@@ -57,13 +61,19 @@ pub mod scheme {
     pub const SECP256K1: u8 = 0x1;
     /// P256, encoded `r || s || qx || qy`.
     pub const P256: u8 = 0x2;
+    /// Experimental local ML-DSA-44 extension, encoded `signature || public_key`.
+    ///
+    /// Upstream EIP-8141 reserves this value. It is enabled here only as a
+    /// toolkit fixture while Ethereum's post-quantum wire format remains open.
+    pub const ML_DSA_44: u8 = 0x3;
 }
 
 /// Gas constants, following the EIP-8141 parameter tables.
 pub mod gas {
     /// Base intrinsic cost of a frame transaction (EIP-2780 `TX_BASE_COST`).
     pub const INTRINSIC_COST: u64 = 12000;
-    /// Cost per value-bearing frame (EIP-2780 `TX_VALUE_COST`).
+    /// Cost per value-bearing frame with an explicit non-sender target
+    /// (EIP-2780 `TX_VALUE_COST`).
     pub const VALUE_COST: u64 = 6000;
     /// Fixed per-frame cost (CALL overhead + receipt log entry).
     pub const PER_FRAME_COST: u64 = 475;
@@ -75,6 +85,8 @@ pub mod gas {
     pub const SIGNATURE_SECP256K1: u64 = 2800;
     /// Cost of verifying a P256 signature entry.
     pub const SIGNATURE_P256: u64 = 6700;
+    /// Provisional cost of the experimental local ML-DSA-44 verifier.
+    pub const SIGNATURE_ML_DSA_44: u64 = 50_000;
     /// Cost of a structurally-checked arbitrary signature entry.
     pub const SIGNATURE_ARBITRARY: u64 = 100;
     /// Token cost per non-zero byte (EIP-7623/7976).
@@ -241,7 +253,8 @@ impl Decodable for Frame {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameSignature {
-    /// Signature scheme: 0 `ARBITRARY`, 1 `SECP256K1`, 2 `P256`.
+    /// Signature scheme: 0 `ARBITRARY`, 1 `SECP256K1`, 2 `P256`, or the
+    /// experimental local value 3 `ML_DSA_44`.
     pub scheme: u8,
     /// Empty (meaning `tx.sender`) or a 20-byte address.
     pub signer: Bytes,
@@ -267,6 +280,7 @@ impl FrameSignature {
         match self.scheme {
             scheme::SECP256K1 => Some(gas::SIGNATURE_SECP256K1),
             scheme::P256 => Some(gas::SIGNATURE_P256),
+            scheme::ML_DSA_44 => Some(gas::SIGNATURE_ML_DSA_44),
             scheme::ARBITRARY => Some(gas::SIGNATURE_ARBITRARY),
             _ => None,
         }
@@ -443,10 +457,19 @@ impl TxFrame {
         self.sum_frame_execution_gas()?.checked_add(self.sum_frame_state_gas()?)
     }
 
-    /// `TX_VALUE_COST` for every value-bearing frame (EIP-2780): the recipient
-    /// balance write and transfer log are priced statically.
+    /// `TX_VALUE_COST` for every value-bearing frame whose explicitly named
+    /// target is not the sender (EIP-2780): the recipient balance write and
+    /// transfer log are priced statically.
     pub fn value_transfer_cost(&self) -> Option<u64> {
-        let valued = self.frames.iter().filter(|frame| !frame.value.is_zero()).count() as u64;
+        let valued = self
+            .frames
+            .iter()
+            .filter(|frame| {
+                !frame.value.is_zero()
+                    && frame.target.is_some()
+                    && frame.target != Some(self.sender)
+            })
+            .count() as u64;
         valued.checked_mul(gas::VALUE_COST)
     }
 
@@ -458,7 +481,7 @@ impl TxFrame {
             .try_fold(0u64, |total, sig| total.checked_add(sig.verification_cost()?))
     }
 
-    /// Total number of calldata tokens across frames and signatures: one token
+    /// Weighted calldata-token count used by the standard intrinsic: one token
     /// per zero byte and `TOKEN_PER_NON_ZERO_BYTE` per non-zero byte.
     pub fn calldata_tokens(&self) -> Option<u64> {
         fn tokens_in(bytes: &[u8]) -> u64 {
@@ -479,6 +502,21 @@ impl TxFrame {
         Some(total)
     }
 
+    /// Uniform calldata-token count used by the EIP-7976 floor: every charged
+    /// byte contributes `TOKEN_PER_NON_ZERO_BYTE` tokens, regardless of value.
+    pub fn calldata_floor_tokens(&self) -> Option<u64> {
+        let bytes = self
+            .frames
+            .iter()
+            .try_fold(0u64, |total, frame| total.checked_add(frame.data.len() as u64))?;
+        let bytes = self.signatures.iter().try_fold(bytes, |total, sig| {
+            [&sig.signer, &sig.msg, &sig.signature]
+                .into_iter()
+                .try_fold(total, |total, field| total.checked_add(field.len() as u64))
+        })?;
+        bytes.checked_mul(gas::TOKEN_PER_NON_ZERO_BYTE)
+    }
+
     /// `frame_tx_intrinsic_gas` in the EIP-2780 sense: derivable from the
     /// transaction fields alone, charged entirely in the execution dimension.
     pub fn intrinsic_gas(&self) -> Option<u64> {
@@ -494,22 +532,23 @@ impl TxFrame {
     ///
     /// The standard limit is the intrinsic gas plus the sum of every frame's
     /// execution and state gas limits. The floor shares the intrinsic base but
-    /// charges `COST_FLOOR_PER_TOKEN` per calldata token instead of
-    /// `STANDARD_TOKEN_COST`, and excludes frame gas. `max_gas` compares the
-    /// floor with the declared state budgets added, since state gas never
-    /// absorbs into the data floor.
+    /// charges `COST_FLOOR_PER_TOKEN` against a uniform four-token count for
+    /// every charged byte, and excludes frame gas. `max_gas` compares the floor
+    /// with the declared state budgets added, since state gas never absorbs into
+    /// the data floor.
     pub fn gas_limits(&self) -> Option<(u64, u64, u64)> {
         let base = (self.frames.len() as u64)
             .checked_mul(gas::PER_FRAME_COST)?
             .checked_add(gas::INTRINSIC_COST)?
             .checked_add(self.signature_verification_cost()?)?
             .checked_add(self.value_transfer_cost()?)?;
-        let tokens = self.calldata_tokens()?;
+        let standard_tokens = self.calldata_tokens()?;
+        let floor_tokens = self.calldata_floor_tokens()?;
 
         let standard = base
-            .checked_add(tokens.checked_mul(gas::STANDARD_TOKEN_COST)?)?
+            .checked_add(standard_tokens.checked_mul(gas::STANDARD_TOKEN_COST)?)?
             .checked_add(self.sum_frame_gas()?)?;
-        let floor = base.checked_add(tokens.checked_mul(gas::COST_FLOOR_PER_TOKEN)?)?;
+        let floor = base.checked_add(floor_tokens.checked_mul(gas::COST_FLOOR_PER_TOKEN)?)?;
         let max_gas = standard.max(floor.checked_add(self.sum_frame_state_gas()?)?);
         Some((standard, floor, max_gas))
     }
@@ -563,7 +602,7 @@ impl TxFrame {
 
         for sig in &self.signatures {
             match sig.scheme {
-                scheme::SECP256K1 | scheme::P256 => {
+                scheme::SECP256K1 | scheme::P256 | scheme::ML_DSA_44 => {
                     if !sig.signer.is_empty() && sig.signer.len() != 20 {
                         return Err(FrameTxError::SignerLength(sig.signer.len()));
                     }
@@ -683,6 +722,7 @@ impl TxFrame {
         match sig.scheme {
             scheme::SECP256K1 => verify_secp256k1(&sig.signature, msg, resolved),
             scheme::P256 => verify_p256(&sig.signature, msg, resolved),
+            scheme::ML_DSA_44 => verify_ml_dsa_44(&sig.signature, msg, resolved),
             // An ARBITRARY entry is interpreted by the frame code, not the
             // protocol; it is only required to name no signer.
             scheme::ARBITRARY => sig.signer.is_empty(),
@@ -699,6 +739,12 @@ const SECP256K1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
 const SECP256R1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
     "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
 ));
+
+/// Fixed FIPS 204 ML-DSA-44 wire sizes. The local FrameTx encoding places the
+/// detached signature first, followed by the raw public key.
+const ML_DSA_44_SIGNATURE_SIZE: usize = 2420;
+const ML_DSA_44_PUBLIC_KEY_SIZE: usize = 1312;
+const ML_DSA_44_WIRE_SIZE: usize = ML_DSA_44_SIGNATURE_SIZE + ML_DSA_44_PUBLIC_KEY_SIZE;
 
 /// Verifies a secp256k1 entry, whose 65 bytes are encoded `v || r || s` with
 /// `v` the recovery id (0 or 1) -- note this is *not* the usual `r || s || v`.
@@ -753,6 +799,44 @@ fn verify_p256(signature: &[u8], msg: B256, resolved: Address) -> bool {
     input[..32].copy_from_slice(msg.as_slice());
     input[32..].copy_from_slice(&signature[..128]);
     revm::precompile::secp256r1::verify_impl(&input)
+}
+
+/// Verifies the toolkit's experimental ML-DSA-44 scheme.
+///
+/// This is pure FIPS 204 ML-DSA with an empty context over the existing
+/// 32-byte FrameTx message. The raw public key is carried with every signature
+/// because ML-DSA does not support public-key recovery. Prefixing it with the
+/// scheme byte before hashing keeps its 20-byte identity in a separate domain
+/// from every other signature scheme.
+fn verify_ml_dsa_44(signature: &[u8], msg: B256, resolved: Address) -> bool {
+    if signature.len() != ML_DSA_44_WIRE_SIZE {
+        return false;
+    }
+    let (encoded_signature, public_key) = signature.split_at(ML_DSA_44_SIGNATURE_SIZE);
+
+    let mut identity_input = [0u8; 1 + ML_DSA_44_PUBLIC_KEY_SIZE];
+    identity_input[0] = scheme::ML_DSA_44;
+    identity_input[1..].copy_from_slice(public_key);
+    if Address::from_slice(&keccak256(identity_input)[12..]) != resolved {
+        return false;
+    }
+
+    let Ok(encoded_public_key) = MlDsaEncodedVerifyingKey::<MlDsa44>::try_from(public_key) else {
+        return false;
+    };
+    let verifying_key = MlDsaVerifyingKey::<MlDsa44>::decode(&encoded_public_key);
+    if verifying_key.encode().as_slice() != public_key {
+        return false;
+    }
+
+    let Ok(signature) = MlDsaSignature::<MlDsa44>::try_from(encoded_signature) else {
+        return false;
+    };
+    if signature.encode().as_slice() != encoded_signature {
+        return false;
+    }
+
+    verifying_key.verify(msg.as_slice(), &signature).is_ok()
 }
 
 /// Why a frame transaction envelope is invalid.
@@ -985,6 +1069,7 @@ impl Transaction for TxFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ml_dsa::{Keypair as _, Seed, Signer as _, SigningKey};
 
     /// A minimal single-frame transaction: a DEFAULT frame with no target.
     fn sample() -> TxFrame {
@@ -1217,6 +1302,120 @@ mod tests {
         assert!(!sample().validate_signature(&signature, canonical_hash));
     }
 
+    fn ml_dsa_44_signer(public_key: &[u8]) -> Address {
+        assert_eq!(public_key.len(), ML_DSA_44_PUBLIC_KEY_SIZE);
+        let mut identity_input = [0u8; 1 + ML_DSA_44_PUBLIC_KEY_SIZE];
+        identity_input[0] = scheme::ML_DSA_44;
+        identity_input[1..].copy_from_slice(public_key);
+        Address::from_slice(&keccak256(identity_input)[12..])
+    }
+
+    fn ml_dsa_44_vector() -> (FrameSignature, B256) {
+        let seed = Seed::from([0x42; 32]);
+        let signing_key = SigningKey::<MlDsa44>::from_seed(&seed);
+        let public_key = signing_key.verifying_key().encode();
+        let canonical_hash = B256::repeat_byte(0x5a);
+        let signature: MlDsaSignature<MlDsa44> = signing_key.sign(canonical_hash.as_slice());
+
+        let mut wire = Vec::with_capacity(ML_DSA_44_WIRE_SIZE);
+        wire.extend_from_slice(signature.encode().as_slice());
+        wire.extend_from_slice(public_key.as_slice());
+        assert_eq!(wire.len(), ML_DSA_44_WIRE_SIZE);
+
+        (
+            FrameSignature {
+                scheme: scheme::ML_DSA_44,
+                signer: Bytes::copy_from_slice(ml_dsa_44_signer(public_key.as_slice()).as_slice()),
+                msg: Bytes::new(),
+                signature: wire.into(),
+            },
+            canonical_hash,
+        )
+    }
+
+    #[test]
+    fn accepts_a_canonical_ml_dsa_44_wire_signature() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+
+        assert_eq!(signature.verification_cost(), Some(gas::SIGNATURE_ML_DSA_44));
+        assert!(sample().validate_signature(&signature, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_ml_dsa_44_wrong_hash_and_signer() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+        let tx = sample();
+
+        assert!(!tx.validate_signature(&signature, B256::repeat_byte(0x42)));
+
+        let mut wrong_signer = signature;
+        wrong_signer.signer = Bytes::from(vec![0x42; 20]);
+        assert!(!tx.validate_signature(&wrong_signer, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_corrupt_ml_dsa_44_signature_and_public_key() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+        let tx = sample();
+
+        let mut corrupt_signature = signature.clone();
+        let mut corrupt_signature_wire = corrupt_signature.signature.to_vec();
+        corrupt_signature_wire[0] ^= 1;
+        corrupt_signature.signature = corrupt_signature_wire.into();
+        assert!(!tx.validate_signature(&corrupt_signature, canonical_hash));
+
+        // Recompute the identity for the corrupted key so the negative case
+        // reaches ML-DSA verification instead of stopping at signer matching.
+        let mut corrupt_public_key = signature;
+        let mut corrupt_public_key_wire = corrupt_public_key.signature.to_vec();
+        corrupt_public_key_wire[ML_DSA_44_SIGNATURE_SIZE] ^= 1;
+        let public_key = &corrupt_public_key_wire[ML_DSA_44_SIGNATURE_SIZE..];
+        corrupt_public_key.signer = Bytes::copy_from_slice(ml_dsa_44_signer(public_key).as_slice());
+        corrupt_public_key.signature = corrupt_public_key_wire.into();
+        assert!(!tx.validate_signature(&corrupt_public_key, canonical_hash));
+    }
+
+    #[test]
+    fn rejects_non_canonical_or_wrong_length_ml_dsa_44_wire() {
+        let (signature, canonical_hash) = ml_dsa_44_vector();
+        let tx = sample();
+
+        // ML-DSA-44's final 84 signature bytes encode 80 hint indices and
+        // four cumulative cuts. Duplicate indices within a polynomial and
+        // decreasing cuts are both forbidden canonical encodings.
+        const HINT_OFFSET: usize = ML_DSA_44_SIGNATURE_SIZE - 84;
+        const HINT_CUTS_OFFSET: usize = HINT_OFFSET + 80;
+
+        let mut repeated_hint = signature.clone();
+        let mut repeated_hint_wire = repeated_hint.signature.to_vec();
+        repeated_hint_wire[HINT_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(0);
+        repeated_hint_wire[HINT_OFFSET] = 1;
+        repeated_hint_wire[HINT_OFFSET + 1] = 1;
+        repeated_hint_wire[HINT_CUTS_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(2);
+        repeated_hint.signature = repeated_hint_wire.into();
+        assert!(!tx.validate_signature(&repeated_hint, canonical_hash));
+
+        let mut decreasing_cuts = signature.clone();
+        let mut decreasing_cuts_wire = decreasing_cuts.signature.to_vec();
+        decreasing_cuts_wire[HINT_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(0);
+        decreasing_cuts_wire[HINT_CUTS_OFFSET] = 2;
+        decreasing_cuts_wire[HINT_CUTS_OFFSET + 1] = 1;
+        decreasing_cuts_wire[HINT_CUTS_OFFSET + 2] = 1;
+        decreasing_cuts_wire[HINT_CUTS_OFFSET + 3] = 1;
+        decreasing_cuts.signature = decreasing_cuts_wire.into();
+        assert!(!tx.validate_signature(&decreasing_cuts, canonical_hash));
+
+        let mut short = signature.clone();
+        short.signature = Bytes::copy_from_slice(&short.signature[..ML_DSA_44_WIRE_SIZE - 1]);
+        assert!(!tx.validate_signature(&short, canonical_hash));
+
+        let mut long = signature;
+        let mut long_wire = long.signature.to_vec();
+        long_wire.push(0);
+        long.signature = long_wire.into();
+        assert!(!tx.validate_signature(&long, canonical_hash));
+    }
+
     #[test]
     fn validate_rejects_malformed_envelopes() {
         let base = signed_vector();
@@ -1391,14 +1590,47 @@ mod tests {
     }
 
     #[test]
+    fn value_transfer_cost_only_charges_explicit_external_targets() {
+        let sender = Address::repeat_byte(0x11);
+        let tx = TxFrame {
+            sender,
+            frames: vec![
+                // A missing target resolves to the sender and does not write a
+                // distinct recipient balance or emit a transfer log.
+                Frame { value: U256::ONE, target: None, ..Default::default() },
+                Frame { value: U256::ONE, target: Some(sender), ..Default::default() },
+                Frame {
+                    value: U256::ONE,
+                    target: Some(Address::repeat_byte(0x22)),
+                    ..Default::default()
+                },
+                Frame {
+                    value: U256::ZERO,
+                    target: Some(Address::repeat_byte(0x33)),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(tx.value_transfer_cost(), Some(gas::VALUE_COST));
+        assert_eq!(
+            tx.intrinsic_gas(),
+            Some(gas::INTRINSIC_COST + 4 * gas::PER_FRAME_COST + gas::VALUE_COST)
+        );
+    }
+
+    #[test]
     fn gas_limits_follow_the_reference_formula() {
         let tx = sample();
         let (standard, floor, max_gas) = tx.gas_limits().unwrap();
 
         // 4 bytes of frame data (2 zero-ish: 0x01,0x02,0x00,0x03 -> one zero)
         // plus the 65 signature bytes, all non-zero.
-        let tokens = tx.calldata_tokens().unwrap();
-        assert_eq!(tokens, (1 + 3 * 4) + 65 * 4);
+        let standard_tokens = tx.calldata_tokens().unwrap();
+        let floor_tokens = tx.calldata_floor_tokens().unwrap();
+        assert_eq!(standard_tokens, (1 + 3 * 4) + 65 * 4);
+        assert_eq!(floor_tokens, (4 + 65) * 4);
 
         // One value-bearing frame charges TX_VALUE_COST inside the intrinsic.
         let base = 2 * gas::PER_FRAME_COST
@@ -1406,12 +1638,59 @@ mod tests {
             + gas::SIGNATURE_SECP256K1
             + gas::VALUE_COST;
         // Frame execution limits sum to 71_000, state limits to 200_000.
-        assert_eq!(standard, base + tokens * gas::STANDARD_TOKEN_COST + 71_000 + 200_000);
-        assert_eq!(floor, base + tokens * gas::COST_FLOOR_PER_TOKEN);
+        assert_eq!(standard, base + standard_tokens * gas::STANDARD_TOKEN_COST + 71_000 + 200_000);
+        assert_eq!(floor, base + floor_tokens * gas::COST_FLOOR_PER_TOKEN);
         // State gas never absorbs into the data floor.
         assert_eq!(max_gas, standard.max(floor + 200_000));
         assert_eq!(tx.max_gas(), max_gas);
-        assert_eq!(tx.intrinsic_gas().unwrap(), base + tokens * gas::STANDARD_TOKEN_COST);
+        assert_eq!(tx.intrinsic_gas().unwrap(), base + standard_tokens * gas::STANDARD_TOKEN_COST);
+    }
+
+    #[test]
+    fn calldata_floor_prices_zero_and_nonzero_bytes_uniformly() {
+        let transaction = |byte| TxFrame {
+            frames: vec![Frame { data: Bytes::from(vec![byte; 2]), ..Default::default() }],
+            signatures: vec![FrameSignature {
+                scheme: scheme::ARBITRARY,
+                signer: Bytes::new(),
+                msg: Bytes::new(),
+                signature: Bytes::from(vec![byte; 2]),
+            }],
+            ..Default::default()
+        };
+        let zero = transaction(0);
+        let nonzero = transaction(0xff);
+
+        assert_eq!(zero.calldata_tokens(), Some(4));
+        assert_eq!(nonzero.calldata_tokens(), Some(16));
+        assert_eq!(zero.calldata_floor_tokens(), Some(16));
+        assert_eq!(nonzero.calldata_floor_tokens(), Some(16));
+
+        let base = gas::INTRINSIC_COST + gas::PER_FRAME_COST + gas::SIGNATURE_ARBITRARY;
+        assert_eq!(zero.intrinsic_gas(), Some(base + 4 * gas::STANDARD_TOKEN_COST));
+        assert_eq!(nonzero.intrinsic_gas(), Some(base + 16 * gas::STANDARD_TOKEN_COST));
+        assert_eq!(zero.gas_limits().unwrap().1, base + 16 * gas::COST_FLOOR_PER_TOKEN);
+        assert_eq!(zero.gas_limits().unwrap().1, nonzero.gas_limits().unwrap().1);
+    }
+
+    #[test]
+    fn uniform_calldata_floor_enforces_the_transaction_gas_cap() {
+        let base = gas::INTRINSIC_COST + gas::PER_FRAME_COST;
+        let gas_per_floor_byte = gas::TOKEN_PER_NON_ZERO_BYTE * gas::COST_FLOOR_PER_TOKEN;
+        let max_floor_bytes = ((gas::TX_MAX_GAS_LIMIT - base) / gas_per_floor_byte) as usize;
+        let transaction = |length| TxFrame {
+            frames: vec![Frame { data: Bytes::from(vec![0; length]), ..Default::default() }],
+            ..Default::default()
+        };
+
+        let at_cap = transaction(max_floor_bytes);
+        assert!(at_cap.gas_limits().unwrap().1 <= gas::TX_MAX_GAS_LIMIT);
+        at_cap.validate().unwrap();
+
+        let above_cap = transaction(max_floor_bytes + 1);
+        assert!(above_cap.intrinsic_gas().unwrap() < gas::TX_MAX_GAS_LIMIT);
+        assert!(above_cap.gas_limits().unwrap().1 > gas::TX_MAX_GAS_LIMIT);
+        assert_eq!(above_cap.validate(), Err(FrameTxError::GasCapExceeded));
     }
 
     #[test]

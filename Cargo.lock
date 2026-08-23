@@ -328,7 +328,8 @@ dependencies = [
 [[package]]
 name = "alloy-evm"
 version = "0.38.0"
-source = "git+https://github.com/leekt/evm?branch=feat%2Feip8141-frame-tx#aa78cba20c9c03370a8923c49f1c5fd7b20df94c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b307a52f91f7f3aad56b5cb4f54e5eb17dd0b3f4b2c82823301499fe1c6fdaf"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -1291,6 +1292,7 @@ dependencies = [
  "hyper",
  "imbl",
  "itertools 0.15.0",
+ "ml-dsa",
  "monad-revm",
  "op-alloy-consensus",
  "op-alloy-rpc-types",
@@ -5540,7 +5542,7 @@ dependencies = [
 [[package]]
 name = "foundry-block-explorers"
 version = "0.24.0"
-source = "git+https://github.com/foundry-rs/foundry-core?rev=eabd2e218a7606505430d84bfeacd145e2c1eff3#eabd2e218a7606505430d84bfeacd145e2c1eff3"
+source = "git+https://github.com/leekt/foundry-core?rev=f415f6fef0a62f44c7faa83daa8e37b14f0e009b#f415f6fef0a62f44c7faa83daa8e37b14f0e009b"
 dependencies = [
  "alloy-chains",
  "alloy-json-abi",
@@ -5783,7 +5785,7 @@ dependencies = [
 [[package]]
 name = "foundry-compilers"
 version = "0.21.0"
-source = "git+https://github.com/foundry-rs/foundry-core?rev=eabd2e218a7606505430d84bfeacd145e2c1eff3#eabd2e218a7606505430d84bfeacd145e2c1eff3"
+source = "git+https://github.com/leekt/foundry-core?rev=f415f6fef0a62f44c7faa83daa8e37b14f0e009b#f415f6fef0a62f44c7faa83daa8e37b14f0e009b"
 dependencies = [
  "alloy-json-abi",
  "alloy-primitives",
@@ -5814,7 +5816,7 @@ dependencies = [
 [[package]]
 name = "foundry-compilers-artifacts"
 version = "0.21.0"
-source = "git+https://github.com/foundry-rs/foundry-core?rev=eabd2e218a7606505430d84bfeacd145e2c1eff3#eabd2e218a7606505430d84bfeacd145e2c1eff3"
+source = "git+https://github.com/leekt/foundry-core?rev=f415f6fef0a62f44c7faa83daa8e37b14f0e009b#f415f6fef0a62f44c7faa83daa8e37b14f0e009b"
 dependencies = [
  "foundry-compilers-artifacts-solc",
  "foundry-compilers-artifacts-vyper",
@@ -5823,7 +5825,7 @@ dependencies = [
 [[package]]
 name = "foundry-compilers-artifacts-solc"
 version = "0.21.0"
-source = "git+https://github.com/foundry-rs/foundry-core?rev=eabd2e218a7606505430d84bfeacd145e2c1eff3#eabd2e218a7606505430d84bfeacd145e2c1eff3"
+source = "git+https://github.com/leekt/foundry-core?rev=f415f6fef0a62f44c7faa83daa8e37b14f0e009b#f415f6fef0a62f44c7faa83daa8e37b14f0e009b"
 dependencies = [
  "alloy-json-abi",
  "alloy-primitives",
@@ -5843,7 +5845,7 @@ dependencies = [
 [[package]]
 name = "foundry-compilers-artifacts-vyper"
 version = "0.21.0"
-source = "git+https://github.com/foundry-rs/foundry-core?rev=eabd2e218a7606505430d84bfeacd145e2c1eff3#eabd2e218a7606505430d84bfeacd145e2c1eff3"
+source = "git+https://github.com/leekt/foundry-core?rev=f415f6fef0a62f44c7faa83daa8e37b14f0e009b#f415f6fef0a62f44c7faa83daa8e37b14f0e009b"
 dependencies = [
  "alloy-json-abi",
  "alloy-primitives",
@@ -5856,7 +5858,7 @@ dependencies = [
 [[package]]
 name = "foundry-compilers-core"
 version = "0.21.0"
-source = "git+https://github.com/foundry-rs/foundry-core?rev=eabd2e218a7606505430d84bfeacd145e2c1eff3#eabd2e218a7606505430d84bfeacd145e2c1eff3"
+source = "git+https://github.com/leekt/foundry-core?rev=f415f6fef0a62f44c7faa83daa8e37b14f0e009b#f415f6fef0a62f44c7faa83daa8e37b14f0e009b"
 dependencies = [
  "alloy-primitives",
  "dunce",
@@ -6194,9 +6196,10 @@ dependencies = [
 [[package]]
 name = "foundry-fork-db"
 version = "0.27.0"
-source = "git+https://github.com/foundry-rs/foundry-core?rev=eabd2e218a7606505430d84bfeacd145e2c1eff3#eabd2e218a7606505430d84bfeacd145e2c1eff3"
+source = "git+https://github.com/leekt/foundry-core?rev=f415f6fef0a62f44c7faa83daa8e37b14f0e009b#f415f6fef0a62f44c7faa83daa8e37b14f0e009b"
 dependencies = [
  "alloy-chains",
+ "alloy-consensus",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types",
@@ -6251,6 +6254,7 @@ dependencies = [
  "alloy-serde",
  "alloy-signer",
  "derive_more",
+ "ml-dsa",
  "op-alloy-consensus",
  "op-alloy-rpc-types",
  "op-revm",
@@ -6910,6 +6914,7 @@ version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
+ "ctutils 0.4.2",
  "subtle",
  "typenum",
  "zeroize",
@@ -7949,6 +7954,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ml-dsa"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "add6b9d92e496f16f4526d68ff29da1483aba4b119baeab8bed3b9e3544a6f3d"
+dependencies = [
+ "crypto-common 0.2.2",
+ "ctutils 0.4.2",
+ "hybrid-array",
+ "module-lattice",
+ "pkcs8 0.11.0",
+ "shake",
+ "signature 3.0.0",
+]
+
+[[package]]
 name = "mockall"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7993,6 +8013,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "module-lattice"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c61b87c9683ab7cb1c6871d261ad5479b6b10ceb52c4352aaca3b5d35a8febe"
+dependencies = [
+ "ctutils 0.4.2",
+ "hybrid-array",
+ "num-traits",
 ]
 
 [[package]]
@@ -10520,7 +10551,7 @@ dependencies = [
 [[package]]
 name = "revm"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "revm-bytecode",
  "revm-context",
@@ -10538,7 +10569,7 @@ dependencies = [
 [[package]]
 name = "revm-bytecode"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "bitvec",
  "paste",
@@ -10550,7 +10581,7 @@ dependencies = [
 [[package]]
 name = "revm-context"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "bitvec",
  "cfg-if",
@@ -10566,7 +10597,7 @@ dependencies = [
 [[package]]
 name = "revm-context-interface"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "alloy-eip2930",
  "alloy-eip7702",
@@ -10581,7 +10612,7 @@ dependencies = [
 [[package]]
 name = "revm-database"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "alloy-eips",
  "derive_more",
@@ -10596,7 +10627,7 @@ dependencies = [
 [[package]]
 name = "revm-database-interface"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "auto_impl",
  "either",
@@ -10609,7 +10640,7 @@ dependencies = [
 [[package]]
 name = "revm-handler"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "auto_impl",
  "derive-where",
@@ -10627,7 +10658,7 @@ dependencies = [
 [[package]]
 name = "revm-inspector"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "auto_impl",
  "either",
@@ -10664,7 +10695,7 @@ dependencies = [
 [[package]]
 name = "revm-interpreter"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "revm-bytecode",
  "revm-context-interface",
@@ -10676,7 +10707,7 @@ dependencies = [
 [[package]]
 name = "revm-precompile"
 version = "42.0.1"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -10700,7 +10731,7 @@ dependencies = [
 [[package]]
 name = "revm-primitives"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "alloy-primitives",
  "once_cell",
@@ -10710,7 +10741,7 @@ dependencies = [
 [[package]]
 name = "revm-state"
 version = "42.0.0"
-source = "git+https://github.com/leekt/revm?branch=feat%2Feip8141-frame-opcodes#734e5bb449f6edd99896f7e9aafc362cd92dede9"
+source = "git+https://github.com/leekt/revm?rev=cad0e9fc012f790719791ff274b76eb852689559#cad0e9fc012f790719791ff274b76eb852689559"
 dependencies = [
  "alloy-eip7928",
  "bitflags 2.13.1",
@@ -11615,6 +11646,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shake"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
+dependencies = [
+ "digest 0.11.3",
+ "keccak 0.2.0",
+ "sponge-cursor",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12124,6 +12166,12 @@ dependencies = [
  "base64ct",
  "der 0.8.1",
 ]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "sqlite-wasm-rs"

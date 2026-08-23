@@ -206,7 +206,7 @@ interface Vm {
 
     /// A signature entry of an EIP-8141 frame transaction, as reported by `SIGPARAM`.
     struct FrameTxSignature {
-        /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256.
+        /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256, or the experimental local value 3 ML_DSA_44.
         uint8 scheme;
         /// The signer, already resolved. Ignored for ARBITRARY entries, which have
         /// no protocol-assigned signer.

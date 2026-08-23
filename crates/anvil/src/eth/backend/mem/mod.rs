@@ -68,7 +68,7 @@ use alloy_eips::{
     eip7910::SystemContract,
 };
 use alloy_evm::{
-    Database, EthEvmFactory, Evm, EvmEnv, EvmFactory, FromTxWithEncoded,
+    Database, EthEvmFactory, Evm, EvmEnv, EvmFactory, RecoveredTx,
     block::{BlockExecutionError, BlockExecutionResult, BlockExecutor, StateDB},
     eth::EthEvmContext,
     overrides::{OverrideBlockHashes, apply_state_overrides},
@@ -2938,6 +2938,8 @@ impl<N: Network> Backend<N> {
                             .map(|outcome| AnvilExecutionOutcome {
                                 result: outcome.result,
                                 frame_receipt: Some(FrameReceiptData {
+                                    gas_used: outcome.gas_used,
+                                    state_gas_used: outcome.state_gas_used,
                                     payer: outcome.payer,
                                     frame_receipts: outcome.frame_receipts,
                                 }),

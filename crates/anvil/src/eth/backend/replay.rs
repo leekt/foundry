@@ -58,6 +58,8 @@ where
                     .map(|outcome| AnvilExecutionOutcome {
                         result: outcome.result,
                         frame_receipt: Some(FrameReceiptData {
+                            gas_used: outcome.gas_used,
+                            state_gas_used: outcome.state_gas_used,
                             payer: outcome.payer,
                             frame_receipts: outcome.frame_receipts,
                         }),

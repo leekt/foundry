@@ -117,6 +117,14 @@ pub enum FrameExecutionError {
 pub(crate) struct FrameTxOutcome<H> {
     /// The transaction-level result, as the block executor expects it.
     pub result: ResultAndState<H>,
+    /// Final transaction gas charged to the payer and accumulated in receipts.
+    ///
+    /// This is kept explicitly because [`ResultGas::tx_gas_used`] applies its
+    /// calldata floor to execution and state gas together, while EIP-8141
+    /// applies the floor to execution gas and adds state gas afterwards.
+    pub gas_used: u64,
+    /// Final state-gas component of [`Self::gas_used`].
+    pub state_gas_used: u64,
     /// The account that paid, established by an `APPROVE` of payment.
     pub payer: Address,
     /// Consensus receipts for every frame, in frame order.
@@ -140,6 +148,8 @@ pub trait SuspendFeeRules {
     fn begin_frame_transaction(&mut self, sender: Address) -> bool;
     /// Reports whether the persistent outer lifecycle is active.
     fn is_frame_transaction_active(&self) -> bool;
+    /// Whether an address is an active precompile for the current fork.
+    fn is_frame_transaction_precompile(&self, address: Address) -> bool;
     /// Reads an account from the live outer frame journal without warming it.
     fn frame_transaction_account_info(&mut self, address: Address) -> Result<AccountInfo, String>;
     /// Opens a journal checkpoint around a multi-frame atomic batch.
@@ -296,6 +306,10 @@ impl<DB: alloy_evm::Database, I, P> SuspendFeeRules for EthEvm<DB, I, P> {
 
     fn is_frame_transaction_active(&self) -> bool {
         self.ctx().journal().is_frame_transaction_active()
+    }
+
+    fn is_frame_transaction_precompile(&self, address: Address) -> bool {
+        self.ctx().journal().precompile_addresses().contains(&address)
     }
 
     fn frame_transaction_account_info(&mut self, address: Address) -> Result<AccountInfo, String> {
@@ -633,10 +647,10 @@ where
             };
             let resolved_target = frame.resolved_target(tx.sender);
 
-            let caller_nonce = evm
+            let caller_info = evm
                 .frame_transaction_account_info(caller)
-                .map_err(|message| FrameExecutionError::Evm { index, message })?
-                .nonce;
+                .map_err(|message| FrameExecutionError::Evm { index, message })?;
+            let caller_nonce = caller_info.nonce;
 
             // EIP-8037 frame gas pools. The toolkit meters the state dimension
             // for the charges EIP-8141 itself defines -- account creation by a
@@ -646,7 +660,15 @@ where
             let payer_before = approval.payer;
             let sender_missing = account_missing(evm, tx.sender, index)?;
             let mut halted_on_state_gas = false;
-            if !frame.value.is_zero() && account_missing(evm, resolved_target, index)? {
+            // A top-level frame checks the caller's balance after charging the
+            // target access and before charging state gas for recipient
+            // creation. The EVM performs the access and balance checks; this
+            // preflight only decides whether the later state charge applies.
+            let caller_can_transfer = caller_info.balance >= frame.value;
+            if !frame.value.is_zero()
+                && caller_can_transfer
+                && account_missing(evm, resolved_target, index)?
+            {
                 if state_gas_left < frame_gas::NEW_ACCOUNT_STATE_GAS {
                     // A charge exceeding its pool is an exceptional halt of the
                     // frame, consuming its execution pool.
@@ -710,6 +732,7 @@ where
                 let uses_default_verify = succeeded
                     && frame.mode == mode::VERIFY
                     && observed.attempts.is_empty()
+                    && !evm.is_frame_transaction_precompile(resolved_target)
                     && target_has_no_code(evm, resolved_target, index)?;
                 let default_scope = uses_default_verify
                     .then(|| default_verify_scope(tx, frame, resolved_target))
@@ -879,11 +902,18 @@ where
         gas: ResultGas::default()
             .with_total_gas_spent(gas_used_before_refund)
             .with_refunded(applied_refund)
-            .with_floor_gas(floor_gas),
+            .with_floor_gas(floor_gas)
+            .with_state_gas_spent(frame_state_total),
         logs,
         output: Output::Call(Default::default()),
     };
-    Ok(FrameTxOutcome { result: ResultAndState { result, state }, payer, frame_receipts })
+    Ok(FrameTxOutcome {
+        result: ResultAndState { result, state },
+        gas_used,
+        state_gas_used: frame_state_total,
+        payer,
+        frame_receipts,
+    })
 }
 
 /// Reports whether a frame's resolved target has no code of its own, which
@@ -1769,6 +1799,40 @@ mod tests {
     }
 
     #[test]
+    fn verify_frame_dispatches_active_precompile_before_default_code() {
+        let sender = Address::repeat_byte(0x41);
+        let identity_precompile = Address::with_last_byte(4);
+        let mut evm = test_evm([(
+            sender,
+            U256::MAX,
+            0,
+            approver_code(flags::APPROVE_EXECUTION_PAYMENT, false),
+        )]);
+        let tx = approval_tx(
+            sender,
+            0,
+            evm.chain_id(),
+            vec![
+                Frame {
+                    mode: mode::VERIFY,
+                    target: Some(identity_precompile),
+                    gas_limit: 10_000,
+                    data: b"identity".to_vec().into(),
+                    ..Default::default()
+                },
+                approval_frame(sender, mode::DEFAULT, flags::APPROVE_EXECUTION_PAYMENT, 0),
+            ],
+        );
+
+        let outcome = execute_frame_tx(&mut evm, &tx).unwrap();
+
+        assert_eq!(frame_statuses(&outcome), [STATUS_SUCCESS, STATUS_SUCCESS]);
+        // The precompile ran (rather than empty-account default verification),
+        // which would reject this scope-free VERIFY frame.
+        assert!(outcome.frame_receipts[0].execution_gas_used > 100);
+    }
+
+    #[test]
     fn atomic_rollback_restores_target_coldness() {
         let sender = Address::repeat_byte(0x05);
         let target = Address::repeat_byte(0x06);
@@ -1867,6 +1931,58 @@ mod tests {
         assert_eq!(outcome.result.result.logs().len(), 2);
     }
 
+    /// The calldata floor applies to the execution component only. State gas
+    /// remains additive in payer settlement, receipt gas and block accounting.
+    #[test]
+    fn calldata_floor_binding_keeps_nonzero_state_gas_additive() {
+        let sender = Address::repeat_byte(0x91);
+        let fresh = Address::repeat_byte(0x92);
+        let mut evm = test_evm([(
+            sender,
+            U256::MAX,
+            0,
+            approver_code(flags::APPROVE_EXECUTION_PAYMENT, false),
+        )]);
+        let tx = approval_tx(
+            sender,
+            0,
+            evm.chain_id(),
+            vec![
+                approval_frame(sender, mode::DEFAULT, flags::APPROVE_EXECUTION_PAYMENT, 0),
+                Frame {
+                    mode: mode::SENDER,
+                    target: Some(fresh),
+                    gas_limit: 30_000,
+                    state_gas_limit: frame_gas::NEW_ACCOUNT_STATE_GAS,
+                    value: U256::ONE,
+                    // Non-zero bytes make the EIP-7976 uniform calldata floor
+                    // dominate the transaction's actual execution gas.
+                    data: vec![0xff; 2_048].into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        let (standard_gas, floor_gas, _) = tx.gas_limits().unwrap();
+        let overhead = standard_gas - tx.sum_frame_gas().unwrap();
+
+        let outcome = execute_frame_tx(&mut evm, &tx).unwrap();
+        let frame_execution_gas =
+            outcome.frame_receipts.iter().map(|receipt| receipt.execution_gas_used).sum::<u64>();
+        let frame_state_gas =
+            outcome.frame_receipts.iter().map(|receipt| receipt.state_gas_used).sum::<u64>();
+        let gas_before_refund = overhead + frame_execution_gas + frame_state_gas;
+        let gas_after_refund = gas_before_refund - outcome.result.result.gas().inner_refunded();
+
+        assert_eq!(frame_state_gas, frame_gas::NEW_ACCOUNT_STATE_GAS);
+        assert!(
+            gas_after_refund - frame_state_gas < floor_gas,
+            "test transaction did not bind its calldata floor"
+        );
+        assert_eq!(outcome.gas_used, floor_gas + frame_state_gas);
+        assert_eq!(outcome.state_gas_used, frame_state_gas);
+        assert_eq!(outcome.result.result.gas().state_gas_spent_final(), frame_state_gas);
+    }
+
     /// The account-creation charge exceeding the frame's state budget is an
     /// exceptional halt: the execution pool is consumed and no state is used.
     #[test]
@@ -1903,6 +2019,55 @@ mod tests {
         assert_eq!(halted.execution_gas_used, 30_000);
         assert_eq!(halted.state_gas_used, 0);
         assert!(halted.logs.is_empty());
+    }
+
+    #[test]
+    fn insufficient_balance_precedes_new_account_state_charge() {
+        let sender = Address::repeat_byte(0x36);
+        let fresh = Address::repeat_byte(0x37);
+        let sponsor = Address::repeat_byte(0x38);
+        let mut evm = test_evm([
+            (sender, U256::ZERO, 0, approver_code(flags::APPROVE_EXECUTION, false)),
+            (sponsor, U256::MAX, 0, approver_code(flags::APPROVE_PAYMENT, false)),
+        ]);
+        let tx = approval_tx(
+            sender,
+            0,
+            evm.chain_id(),
+            vec![
+                approval_frame(
+                    sender,
+                    mode::DEFAULT,
+                    flags::APPROVE_EXECUTION,
+                    flags::APPROVE_EXECUTION as u64,
+                ),
+                Frame {
+                    mode: mode::SENDER,
+                    target: Some(fresh),
+                    gas_limit: 30_000,
+                    state_gas_limit: frame_gas::NEW_ACCOUNT_STATE_GAS - 1,
+                    value: U256::ONE,
+                    ..Default::default()
+                },
+                approval_frame(
+                    sponsor,
+                    mode::DEFAULT,
+                    flags::APPROVE_PAYMENT,
+                    flags::APPROVE_PAYMENT as u64,
+                ),
+            ],
+        );
+
+        let outcome = execute_frame_tx(&mut evm, &tx).unwrap();
+
+        assert_eq!(frame_statuses(&outcome), [STATUS_SUCCESS, STATUS_FAILED, STATUS_SUCCESS]);
+        let underfunded = &outcome.frame_receipts[1];
+        // Only the cold target access is consumed. If the state charge ran
+        // first, the under-provisioned pool would consume all 30,000 gas.
+        assert_eq!(underfunded.execution_gas_used, 2_600);
+        assert_eq!(underfunded.state_gas_used, 0);
+        assert!(underfunded.logs.is_empty());
+        assert!(evm.db_mut().basic(fresh).unwrap().is_none());
     }
 
     #[test]

@@ -464,6 +464,7 @@ inturn = "0.2.0"
 itertools = "0.15"
 jsonpath_lib = "0.3"
 k256 = "0.13"
+ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc"] }
 mesc = "0.3"
 memchr = "2.7"
 markdown = "1.0"
@@ -571,27 +572,27 @@ idna_adapter = "=1.1.0"
 #
 # Every revm crate must be patched together: patching a subset puts two versions
 # of revm-state and revm-primitives in the graph, and their types stop unifying.
-revm = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-bytecode = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-context = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-context-interface = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-database = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-database-interface = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-handler = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-inspector = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-interpreter = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-precompile = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-primitives = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
-revm-state = { git = "https://github.com/leekt/revm", rev = "7f08164fc954021eae96bbc75c675486ff775f82" }
+revm = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-bytecode = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-context = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-context-interface = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-database = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-database-interface = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-handler = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-inspector = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-interpreter = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-precompile = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-primitives = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
+revm-state = { git = "https://github.com/leekt/revm", rev = "cad0e9fc012f790719791ff274b76eb852689559" }
 solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-cli = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-lint = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 
 ## foundry-core
 foundry-wallets = { git = "https://github.com/foundry-rs/foundry-core", rev = "eabd2e218a7606505430d84bfeacd145e2c1eff3" }
-foundry-compilers = { git = "https://github.com/leekt/foundry-core", rev = "3a0ad16e2c154c8131fd2791f418f561e1347ef2" }
-foundry-block-explorers = { git = "https://github.com/leekt/foundry-core", rev = "3a0ad16e2c154c8131fd2791f418f561e1347ef2" }
-foundry-fork-db = { git = "https://github.com/leekt/foundry-core", rev = "3a0ad16e2c154c8131fd2791f418f561e1347ef2" }
+foundry-compilers = { git = "https://github.com/leekt/foundry-core", rev = "f415f6fef0a62f44c7faa83daa8e37b14f0e009b" }
+foundry-block-explorers = { git = "https://github.com/leekt/foundry-core", rev = "f415f6fef0a62f44c7faa83daa8e37b14f0e009b" }
+foundry-fork-db = { git = "https://github.com/leekt/foundry-core", rev = "f415f6fef0a62f44c7faa83daa8e37b14f0e009b" }
 
 ## alloy-core
 # alloy-dyn-abi = { path = "../../alloy-rs/core/crates/dyn-abi" }

@@ -369,7 +369,7 @@
         {
           "name": "scheme",
           "ty": "uint8",
-          "description": "Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256."
+          "description": "Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256, or the experimental local value 3 ML_DSA_44."
         },
         {
           "name": "signer",

@@ -128,7 +128,6 @@ alloy-pubsub.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 foundry-test-utils.workspace = true
-ml-dsa.workspace = true
 p256 = "0.13"
 tokio = { workspace = true, features = ["full"] }
 

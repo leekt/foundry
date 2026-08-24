@@ -16,7 +16,7 @@ use crate::eth::backend::mem::inspector::{
 };
 use alloy_consensus::Transaction as _;
 use alloy_evm::{Evm, eth::EthEvm};
-use alloy_primitives::{Address, B256, Log, TxKind, U256, keccak256};
+use alloy_primitives::{Address, B256, Log, TxKind, U256};
 use foundry_primitives::{
     ENTRY_POINT_ADDRESS, Frame, FrameReceipt, TxFrame, flags, frame_gas, mode,
 };
@@ -412,14 +412,6 @@ struct ValidatedApproval {
     payer: Option<Address>,
 }
 
-/// Canonical EIP-8250 hash of the legacy nonce domain: one key whose value is zero.
-fn legacy_nonce_keys_hash() -> B256 {
-    // keccak256(uint256(key_count) || uint256(key_0)).
-    let mut preimage = [0u8; 64];
-    preimage[31] = 1;
-    keccak256(preimage)
-}
-
 /// `SYSTEM_ADDRESS` (EIP-4788), the emitter of EIP-7708 transfer logs.
 const SYSTEM_ADDRESS: Address =
     Address::new(alloy_primitives::hex!("fffffffffffffffffffffffffffffffffffffffe"));
@@ -491,11 +483,7 @@ fn build_context(
 
     FrameTxContext {
         sender: tx.sender,
-        // The current wire envelope has only the scalar legacy key-zero nonce domain.
         nonce: tx.nonce,
-        legacy_nonce: tx.nonce,
-        nonce_keys: vec![U256::ZERO],
-        nonce_keys_hash: legacy_nonce_keys_hash(),
         sig_hash: tx.signature_hash(),
         max_cost,
         max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
@@ -511,6 +499,7 @@ fn build_context(
         approvable_scopes: (tx.frames[frame_index].flags & flags::APPROVE_EXECUTION_PAYMENT) as u64,
         approved_scope: 0,
         event_index: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -1465,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn build_context_models_the_legacy_nonce_domain() {
+    fn build_context_maps_transaction_fields() {
         let tx = TxFrame {
             nonce: 42,
             sender: Address::repeat_byte(0x42),
@@ -1477,14 +1466,6 @@ mod tests {
 
         assert_eq!(context.nonce, 42);
         assert_eq!(context.max_cost, U256::from(123));
-        assert_eq!(context.legacy_nonce, 42);
-        assert_eq!(context.nonce_keys, [U256::ZERO]);
-        assert_eq!(
-            context.nonce_keys_hash,
-            alloy_primitives::b256!(
-                "ada5013122d395ba3c54772283fb069b10426056ef8ca54750cb9bb552a59e7d"
-            )
-        );
         assert!(context.recent_root_references.is_empty());
         assert_eq!(context.trace, Default::default());
         assert_eq!(context.frames[0].expected_caller, ENTRY_POINT_ADDRESS);

@@ -24,7 +24,7 @@ interface Vm {
     struct FrameTxAccountDiff { address account; bool nonceChanged; bytes32 codeHashBefore; bytes32 codeHashAfter; }
     struct FrameTxEvent { address emitter; bytes32[] topics; bytes data; }
     struct FrameTxTrace { FrameTxBalanceDiff[] balanceDiffs; FrameTxStorageDiff[] storageDiffs; FrameTxDeployedContract[] deployedContracts; FrameTxAccountDiff[] accountDiffs; FrameTxEvent[] events; uint256 gasPreCharge; address gasPayer; }
-    struct FrameTx { address sender; uint64 nonce; uint64 legacyNonce; uint256[] nonceKeys; bytes32 nonceKeysHash; uint64 stateGasLeft; bytes32 sigHash; uint256 maxCost; uint256 maxPriorityFeePerGas; uint256 maxFeePerGas; uint256 maxFeePerBlobGas; uint64 blobCount; uint64 frameIndex; FrameTxFrame[] frames; FrameTxSignature[] signatures; FrameTxRecentRootReference[] recentRootReferences; FrameTxTrace trace; uint64 approvableScopes; }
+    struct FrameTx { address sender; uint64 nonce; uint64 stateGasLeft; bytes32 sigHash; uint256 maxCost; uint256 maxPriorityFeePerGas; uint256 maxFeePerGas; uint256 maxFeePerBlobGas; uint64 blobCount; uint64 frameIndex; FrameTxFrame[] frames; FrameTxSignature[] signatures; FrameTxRecentRootReference[] recentRootReferences; FrameTxTrace trace; uint64 approvableScopes; }
     struct Wallet { address addr; uint256 publicKeyX; uint256 publicKeyY; uint256 privateKey; }
     struct FfiResult { int32 exitCode; bytes stdout; bytes stderr; }
     struct ChainInfo { uint256 forkId; uint256 chainId; }

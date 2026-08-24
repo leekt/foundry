@@ -206,7 +206,7 @@ interface Vm {
 
     /// A signature entry of an EIP-8141 frame transaction, as reported by `SIGPARAM`.
     struct FrameTxSignature {
-        /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256, or the experimental local value 3 ML_DSA_44.
+        /// Signature scheme: 0 ARBITRARY, 1 SECP256K1, or 2 P256.
         uint8 scheme;
         /// The signer, already resolved. Ignored for ARBITRARY entries, which have
         /// no protocol-assigned signer.
@@ -304,16 +304,8 @@ interface Vm {
     struct FrameTx {
         /// The declared sender.
         address sender;
-        /// Shared keyed-nonce sequence (`nonce_seq`), reported by `TXPARAM(0x01)`.
+        /// The transaction's scalar wire nonce, reported by `TXPARAM(0x01)`.
         uint64 nonce;
-        /// Sender's legacy account nonce in the transaction pre-state, reported by
-        /// fixture `TXPARAM(0x80)`.
-        uint64 legacyNonce;
-        /// Canonically ordered EIP-8250 nonce keys. Their count is reported by
-        /// fixture `TXPARAM(0x81)` and the first key by fixture `TXPARAM(0x84)`.
-        uint256[] nonceKeys;
-        /// Canonical hash of `nonceKeys`, reported by fixture `TXPARAM(0x82)`.
-        bytes32 nonceKeysHash;
         /// State gas remaining in the currently executing frame, reported by
         /// `TXPARAM(0x0C)`.
         uint64 stateGasLeft;
@@ -335,8 +327,7 @@ interface Vm {
         FrameTxFrame[] frames;
         /// Every signature entry, in order.
         FrameTxSignature[] signatures;
-        /// Verified recent-root references in transaction order. Their count is
-        /// reported by fixture `TXPARAM(0x83)`.
+        /// Verified recent-root references in transaction order.
         FrameTxRecentRootReference[] recentRootReferences;
         /// Transaction-local state diff and event trace as of the current frame.
         FrameTxTrace trace;

@@ -688,9 +688,6 @@ impl Cheatcode for setFrameTxCall {
         revm::interpreter::instructions::frame_tx::set_frame_tx_context(Some(FrameTxContext {
             sender: frameTx.sender,
             nonce: frameTx.nonce,
-            legacy_nonce: frameTx.legacyNonce,
-            nonce_keys: frameTx.nonceKeys.clone(),
-            nonce_keys_hash: frameTx.nonceKeysHash,
             sig_hash: frameTx.sigHash,
             max_cost: frameTx.maxCost,
             max_priority_fee_per_gas: frameTx.maxPriorityFeePerGas,
@@ -706,6 +703,7 @@ impl Cheatcode for setFrameTxCall {
             approvable_scopes: frameTx.approvableScopes,
             approved_scope: 0,
             event_index: Default::default(),
+            ..Default::default()
         }));
         Ok(Default::default())
     }

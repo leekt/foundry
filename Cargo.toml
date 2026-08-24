@@ -464,7 +464,6 @@ inturn = "0.2.0"
 itertools = "0.15"
 jsonpath_lib = "0.3"
 k256 = "0.13"
-ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc"] }
 mesc = "0.3"
 memchr = "2.7"
 markdown = "1.0"
@@ -572,18 +571,18 @@ idna_adapter = "=1.1.0"
 #
 # Every revm crate must be patched together: patching a subset puts two versions
 # of revm-state and revm-primitives in the graph, and their types stop unifying.
-revm = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-bytecode = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-context = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-context-interface = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-database = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-database-interface = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-handler = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-inspector = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-interpreter = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-precompile = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-primitives = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
-revm-state = { git = "https://github.com/leekt/revm", rev = "3c82639a34a104af73d9aea0e9b50b005caace81" }
+revm = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-bytecode = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-context = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-context-interface = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-database = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-database-interface = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-handler = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-inspector = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-interpreter = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-precompile = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-primitives = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
+revm-state = { git = "https://github.com/leekt/revm", rev = "21ace0ade666d99f3e1c6e95ba173972164d0ceb" }
 solar-compiler = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-cli = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }
 solar-lint = { git = "https://github.com/paradigmxyz/solar", rev = "a38f69e4f2e2267c549555a980aef6b0b1f249eb" }

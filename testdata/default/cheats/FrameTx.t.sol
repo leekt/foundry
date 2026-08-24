@@ -11,7 +11,6 @@ contract FrameTxTest is Test {
     address internal constant EMITTER = address(0x4004);
     address internal constant GAS_PAYER = address(0x5005);
 
-    bytes32 internal constant NONCE_KEYS_HASH = bytes32(uint256(0xA001));
     bytes32 internal constant SIG_HASH = bytes32(uint256(0xA002));
     bytes32 internal constant SOURCE_ID = bytes32(uint256(0xA003));
     bytes32 internal constant RECENT_ROOT = bytes32(uint256(0xA004));
@@ -36,11 +35,6 @@ contract FrameTxTest is Test {
         assertEq(uint256(_txparam(0x0A)), 0);
         assertEq(uint256(_txparam(0x0B)), 2);
         assertEq(uint256(_txparam(0x0C)), 41);
-        assertEq(uint256(_txparam(0x80)), 19);
-        assertEq(uint256(_txparam(0x81)), 2);
-        assertEq(_txparam(0x82), NONCE_KEYS_HASH);
-        assertEq(uint256(_txparam(0x83)), 1);
-        assertEq(uint256(_txparam(0x84)), 31);
 
         assertEq(_signatureData(1, 1, 4), hex"bbcc0000");
 
@@ -86,11 +80,6 @@ contract FrameTxTest is Test {
     function _frameTx() internal pure returns (Vm.FrameTx memory frameTx) {
         frameTx.sender = SENDER;
         frameTx.nonce = 17;
-        frameTx.legacyNonce = 19;
-        frameTx.nonceKeys = new uint256[](2);
-        frameTx.nonceKeys[0] = 31;
-        frameTx.nonceKeys[1] = 32;
-        frameTx.nonceKeysHash = NONCE_KEYS_HASH;
         frameTx.stateGasLeft = 41;
         frameTx.sigHash = SIG_HASH;
         frameTx.maxCost = 24;

@@ -22,10 +22,6 @@ use alloy_primitives::{
     Address, B256, Bytes, ChainId, Sealable, TxKind, U256, keccak256, private::alloy_rlp::Buf,
 };
 use alloy_rlp::{BufMut, Decodable, Encodable, Header, length_of_length};
-use ml_dsa::{
-    EncodedVerifyingKey as MlDsaEncodedVerifyingKey, MlDsa44, Signature as MlDsaSignature,
-    Verifier as _, VerifyingKey as MlDsaVerifyingKey,
-};
 use serde::{Deserialize, Serialize};
 
 /// Transaction type id of an EIP-8141 frame transaction.
@@ -61,11 +57,6 @@ pub mod scheme {
     pub const SECP256K1: u8 = 0x1;
     /// P256, encoded `r || s || qx || qy`.
     pub const P256: u8 = 0x2;
-    /// Experimental local ML-DSA-44 extension, encoded `signature || public_key`.
-    ///
-    /// Upstream EIP-8141 reserves this value. It is enabled here only as a
-    /// toolkit fixture while Ethereum's post-quantum wire format remains open.
-    pub const ML_DSA_44: u8 = 0x3;
 }
 
 /// Gas constants, following the EIP-8141 parameter tables.
@@ -85,8 +76,6 @@ pub mod gas {
     pub const SIGNATURE_SECP256K1: u64 = 2800;
     /// Cost of verifying a P256 signature entry.
     pub const SIGNATURE_P256: u64 = 6700;
-    /// Provisional cost of the experimental local ML-DSA-44 verifier.
-    pub const SIGNATURE_ML_DSA_44: u64 = 50_000;
     /// Cost of a structurally-checked arbitrary signature entry.
     pub const SIGNATURE_ARBITRARY: u64 = 100;
     /// Token cost per non-zero byte (EIP-7623/7976).
@@ -253,8 +242,7 @@ impl Decodable for Frame {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameSignature {
-    /// Signature scheme: 0 `ARBITRARY`, 1 `SECP256K1`, 2 `P256`, or the
-    /// experimental local value 3 `ML_DSA_44`.
+    /// Signature scheme: 0 `ARBITRARY`, 1 `SECP256K1`, or 2 `P256`.
     pub scheme: u8,
     /// Empty (meaning `tx.sender`) or a 20-byte address.
     pub signer: Bytes,
@@ -280,7 +268,6 @@ impl FrameSignature {
         match self.scheme {
             scheme::SECP256K1 => Some(gas::SIGNATURE_SECP256K1),
             scheme::P256 => Some(gas::SIGNATURE_P256),
-            scheme::ML_DSA_44 => Some(gas::SIGNATURE_ML_DSA_44),
             scheme::ARBITRARY => Some(gas::SIGNATURE_ARBITRARY),
             _ => None,
         }
@@ -602,7 +589,7 @@ impl TxFrame {
 
         for sig in &self.signatures {
             match sig.scheme {
-                scheme::SECP256K1 | scheme::P256 | scheme::ML_DSA_44 => {
+                scheme::SECP256K1 | scheme::P256 => {
                     if !sig.signer.is_empty() && sig.signer.len() != 20 {
                         return Err(FrameTxError::SignerLength(sig.signer.len()));
                     }
@@ -722,7 +709,6 @@ impl TxFrame {
         match sig.scheme {
             scheme::SECP256K1 => verify_secp256k1(&sig.signature, msg, resolved),
             scheme::P256 => verify_p256(&sig.signature, msg, resolved),
-            scheme::ML_DSA_44 => verify_ml_dsa_44(&sig.signature, msg, resolved),
             // An ARBITRARY entry is interpreted by the frame code, not the
             // protocol; it is only required to name no signer.
             scheme::ARBITRARY => sig.signer.is_empty(),
@@ -739,12 +725,6 @@ const SECP256K1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
 const SECP256R1_N: U256 = U256::from_be_bytes(alloy_primitives::hex!(
     "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
 ));
-
-/// Fixed FIPS 204 ML-DSA-44 wire sizes. The local FrameTx encoding places the
-/// detached signature first, followed by the raw public key.
-const ML_DSA_44_SIGNATURE_SIZE: usize = 2420;
-const ML_DSA_44_PUBLIC_KEY_SIZE: usize = 1312;
-const ML_DSA_44_WIRE_SIZE: usize = ML_DSA_44_SIGNATURE_SIZE + ML_DSA_44_PUBLIC_KEY_SIZE;
 
 /// Verifies a secp256k1 entry, whose 65 bytes are encoded `v || r || s` with
 /// `v` the recovery id (0 or 1) -- note this is *not* the usual `r || s || v`.
@@ -799,44 +779,6 @@ fn verify_p256(signature: &[u8], msg: B256, resolved: Address) -> bool {
     input[..32].copy_from_slice(msg.as_slice());
     input[32..].copy_from_slice(&signature[..128]);
     revm::precompile::secp256r1::verify_impl(&input)
-}
-
-/// Verifies the toolkit's experimental ML-DSA-44 scheme.
-///
-/// This is pure FIPS 204 ML-DSA with an empty context over the existing
-/// 32-byte FrameTx message. The raw public key is carried with every signature
-/// because ML-DSA does not support public-key recovery. Prefixing it with the
-/// scheme byte before hashing keeps its 20-byte identity in a separate domain
-/// from every other signature scheme.
-fn verify_ml_dsa_44(signature: &[u8], msg: B256, resolved: Address) -> bool {
-    if signature.len() != ML_DSA_44_WIRE_SIZE {
-        return false;
-    }
-    let (encoded_signature, public_key) = signature.split_at(ML_DSA_44_SIGNATURE_SIZE);
-
-    let mut identity_input = [0u8; 1 + ML_DSA_44_PUBLIC_KEY_SIZE];
-    identity_input[0] = scheme::ML_DSA_44;
-    identity_input[1..].copy_from_slice(public_key);
-    if Address::from_slice(&keccak256(identity_input)[12..]) != resolved {
-        return false;
-    }
-
-    let Ok(encoded_public_key) = MlDsaEncodedVerifyingKey::<MlDsa44>::try_from(public_key) else {
-        return false;
-    };
-    let verifying_key = MlDsaVerifyingKey::<MlDsa44>::decode(&encoded_public_key);
-    if verifying_key.encode().as_slice() != public_key {
-        return false;
-    }
-
-    let Ok(signature) = MlDsaSignature::<MlDsa44>::try_from(encoded_signature) else {
-        return false;
-    };
-    if signature.encode().as_slice() != encoded_signature {
-        return false;
-    }
-
-    verifying_key.verify(msg.as_slice(), &signature).is_ok()
 }
 
 /// Why a frame transaction envelope is invalid.
@@ -1069,7 +1011,6 @@ impl Transaction for TxFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ml_dsa::{Keypair as _, Seed, Signer as _, SigningKey};
 
     /// A minimal single-frame transaction: a DEFAULT frame with no target.
     fn sample() -> TxFrame {
@@ -1302,120 +1243,6 @@ mod tests {
         assert!(!sample().validate_signature(&signature, canonical_hash));
     }
 
-    fn ml_dsa_44_signer(public_key: &[u8]) -> Address {
-        assert_eq!(public_key.len(), ML_DSA_44_PUBLIC_KEY_SIZE);
-        let mut identity_input = [0u8; 1 + ML_DSA_44_PUBLIC_KEY_SIZE];
-        identity_input[0] = scheme::ML_DSA_44;
-        identity_input[1..].copy_from_slice(public_key);
-        Address::from_slice(&keccak256(identity_input)[12..])
-    }
-
-    fn ml_dsa_44_vector() -> (FrameSignature, B256) {
-        let seed = Seed::from([0x42; 32]);
-        let signing_key = SigningKey::<MlDsa44>::from_seed(&seed);
-        let public_key = signing_key.verifying_key().encode();
-        let canonical_hash = B256::repeat_byte(0x5a);
-        let signature: MlDsaSignature<MlDsa44> = signing_key.sign(canonical_hash.as_slice());
-
-        let mut wire = Vec::with_capacity(ML_DSA_44_WIRE_SIZE);
-        wire.extend_from_slice(signature.encode().as_slice());
-        wire.extend_from_slice(public_key.as_slice());
-        assert_eq!(wire.len(), ML_DSA_44_WIRE_SIZE);
-
-        (
-            FrameSignature {
-                scheme: scheme::ML_DSA_44,
-                signer: Bytes::copy_from_slice(ml_dsa_44_signer(public_key.as_slice()).as_slice()),
-                msg: Bytes::new(),
-                signature: wire.into(),
-            },
-            canonical_hash,
-        )
-    }
-
-    #[test]
-    fn accepts_a_canonical_ml_dsa_44_wire_signature() {
-        let (signature, canonical_hash) = ml_dsa_44_vector();
-
-        assert_eq!(signature.verification_cost(), Some(gas::SIGNATURE_ML_DSA_44));
-        assert!(sample().validate_signature(&signature, canonical_hash));
-    }
-
-    #[test]
-    fn rejects_ml_dsa_44_wrong_hash_and_signer() {
-        let (signature, canonical_hash) = ml_dsa_44_vector();
-        let tx = sample();
-
-        assert!(!tx.validate_signature(&signature, B256::repeat_byte(0x42)));
-
-        let mut wrong_signer = signature;
-        wrong_signer.signer = Bytes::from(vec![0x42; 20]);
-        assert!(!tx.validate_signature(&wrong_signer, canonical_hash));
-    }
-
-    #[test]
-    fn rejects_corrupt_ml_dsa_44_signature_and_public_key() {
-        let (signature, canonical_hash) = ml_dsa_44_vector();
-        let tx = sample();
-
-        let mut corrupt_signature = signature.clone();
-        let mut corrupt_signature_wire = corrupt_signature.signature.to_vec();
-        corrupt_signature_wire[0] ^= 1;
-        corrupt_signature.signature = corrupt_signature_wire.into();
-        assert!(!tx.validate_signature(&corrupt_signature, canonical_hash));
-
-        // Recompute the identity for the corrupted key so the negative case
-        // reaches ML-DSA verification instead of stopping at signer matching.
-        let mut corrupt_public_key = signature;
-        let mut corrupt_public_key_wire = corrupt_public_key.signature.to_vec();
-        corrupt_public_key_wire[ML_DSA_44_SIGNATURE_SIZE] ^= 1;
-        let public_key = &corrupt_public_key_wire[ML_DSA_44_SIGNATURE_SIZE..];
-        corrupt_public_key.signer = Bytes::copy_from_slice(ml_dsa_44_signer(public_key).as_slice());
-        corrupt_public_key.signature = corrupt_public_key_wire.into();
-        assert!(!tx.validate_signature(&corrupt_public_key, canonical_hash));
-    }
-
-    #[test]
-    fn rejects_non_canonical_or_wrong_length_ml_dsa_44_wire() {
-        let (signature, canonical_hash) = ml_dsa_44_vector();
-        let tx = sample();
-
-        // ML-DSA-44's final 84 signature bytes encode 80 hint indices and
-        // four cumulative cuts. Duplicate indices within a polynomial and
-        // decreasing cuts are both forbidden canonical encodings.
-        const HINT_OFFSET: usize = ML_DSA_44_SIGNATURE_SIZE - 84;
-        const HINT_CUTS_OFFSET: usize = HINT_OFFSET + 80;
-
-        let mut repeated_hint = signature.clone();
-        let mut repeated_hint_wire = repeated_hint.signature.to_vec();
-        repeated_hint_wire[HINT_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(0);
-        repeated_hint_wire[HINT_OFFSET] = 1;
-        repeated_hint_wire[HINT_OFFSET + 1] = 1;
-        repeated_hint_wire[HINT_CUTS_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(2);
-        repeated_hint.signature = repeated_hint_wire.into();
-        assert!(!tx.validate_signature(&repeated_hint, canonical_hash));
-
-        let mut decreasing_cuts = signature.clone();
-        let mut decreasing_cuts_wire = decreasing_cuts.signature.to_vec();
-        decreasing_cuts_wire[HINT_OFFSET..ML_DSA_44_SIGNATURE_SIZE].fill(0);
-        decreasing_cuts_wire[HINT_CUTS_OFFSET] = 2;
-        decreasing_cuts_wire[HINT_CUTS_OFFSET + 1] = 1;
-        decreasing_cuts_wire[HINT_CUTS_OFFSET + 2] = 1;
-        decreasing_cuts_wire[HINT_CUTS_OFFSET + 3] = 1;
-        decreasing_cuts.signature = decreasing_cuts_wire.into();
-        assert!(!tx.validate_signature(&decreasing_cuts, canonical_hash));
-
-        let mut short = signature.clone();
-        short.signature = Bytes::copy_from_slice(&short.signature[..ML_DSA_44_WIRE_SIZE - 1]);
-        assert!(!tx.validate_signature(&short, canonical_hash));
-
-        let mut long = signature;
-        let mut long_wire = long.signature.to_vec();
-        long_wire.push(0);
-        long.signature = long_wire.into();
-        assert!(!tx.validate_signature(&long, canonical_hash));
-    }
-
     #[test]
     fn validate_rejects_malformed_envelopes() {
         let base = signed_vector();
@@ -1459,9 +1286,17 @@ mod tests {
             Err(FrameTxError::AtomicBatchTerminator { index: 0 })
         );
 
-        let mut bad_scheme = base.clone();
-        bad_scheme.signatures[0].scheme = 9;
-        assert_eq!(bad_scheme.validate(), Err(FrameTxError::SignatureScheme(9)));
+        // Scheme 3 is reserved. Alternative and post-quantum signatures must
+        // be carried explicitly as ARBITRARY bytes and interpreted by frame
+        // code.
+        let mut reserved_scheme = base.clone();
+        reserved_scheme.signatures[0].scheme = 3;
+        assert_eq!(reserved_scheme.signatures[0].verification_cost(), None);
+        assert_eq!(reserved_scheme.validate(), Err(FrameTxError::SignatureScheme(3)));
+
+        let mut unknown_scheme = base.clone();
+        unknown_scheme.signatures[0].scheme = 9;
+        assert_eq!(unknown_scheme.validate(), Err(FrameTxError::SignatureScheme(9)));
 
         let mut named_arbitrary = base.clone();
         named_arbitrary.signatures[0].scheme = scheme::ARBITRARY;
@@ -1543,6 +1378,22 @@ mod tests {
         // Structurally a 32-byte msg is fine, but the zero digest is not.
         tx.validate().unwrap();
         assert!(tx.validate_signatures().is_err());
+    }
+
+    #[test]
+    fn arbitrary_signature_bytes_are_left_to_frame_code() {
+        let mut tx = signed_vector();
+        tx.signatures[0] = FrameSignature {
+            scheme: scheme::ARBITRARY,
+            signer: Bytes::new(),
+            msg: Bytes::new(),
+            // Large post-quantum signatures are opaque protocol payloads.
+            signature: Bytes::from(vec![0xa5; 3_732]),
+        };
+
+        assert_eq!(tx.signatures[0].verification_cost(), Some(gas::SIGNATURE_ARBITRARY));
+        tx.validate().unwrap();
+        tx.validate_signatures().unwrap();
     }
 
     #[test]

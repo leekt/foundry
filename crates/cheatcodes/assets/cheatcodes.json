@@ -369,7 +369,7 @@
         {
           "name": "scheme",
           "ty": "uint8",
-          "description": "Signature scheme: 0 ARBITRARY, 1 SECP256K1, 2 P256, or the experimental local value 3 ML_DSA_44."
+          "description": "Signature scheme: 0 ARBITRARY, 1 SECP256K1, or 2 P256."
         },
         {
           "name": "signer",
@@ -572,22 +572,7 @@
         {
           "name": "nonce",
           "ty": "uint64",
-          "description": "Shared keyed-nonce sequence (`nonce_seq`), reported by `TXPARAM(0x01)`."
-        },
-        {
-          "name": "legacyNonce",
-          "ty": "uint64",
-          "description": "Sender's legacy account nonce in the transaction pre-state, reported by\n fixture `TXPARAM(0x80)`."
-        },
-        {
-          "name": "nonceKeys",
-          "ty": "uint256[]",
-          "description": "Canonically ordered EIP-8250 nonce keys. Their count is reported by\n fixture `TXPARAM(0x81)` and the first key by fixture `TXPARAM(0x84)`."
-        },
-        {
-          "name": "nonceKeysHash",
-          "ty": "bytes32",
-          "description": "Canonical hash of `nonceKeys`, reported by fixture `TXPARAM(0x82)`."
+          "description": "The transaction's scalar wire nonce, reported by `TXPARAM(0x01)`."
         },
         {
           "name": "stateGasLeft",
@@ -642,7 +627,7 @@
         {
           "name": "recentRootReferences",
           "ty": "FrameTxRecentRootReference[]",
-          "description": "Verified recent-root references in transaction order. Their count is\n reported by fixture `TXPARAM(0x83)`."
+          "description": "Verified recent-root references in transaction order."
         },
         {
           "name": "trace",
@@ -11369,13 +11354,13 @@
         "declaration": "function setFrameTx(FrameTx calldata frameTx) external;",
         "visibility": "external",
         "mutability": "",
-        "signature": "setFrameTx((address,uint64,uint64,uint256[],bytes32,uint64,bytes32,uint256,uint256,uint256,uint256,uint64,uint64,(uint8,uint8,address,uint64,uint64,uint256,bytes,uint8,uint64,uint64)[],(uint8,address,bytes32,bytes)[],(bytes32,uint64,bytes32)[],((address,uint256,uint256)[],(address,uint256,uint256,uint256)[],(address,bytes32)[],(address,bool,bytes32,bytes32)[],(address,bytes32[],bytes)[],uint256,address),uint64))",
-        "selector": "0x79658304",
+        "signature": "setFrameTx((address,uint64,uint64,bytes32,uint256,uint256,uint256,uint256,uint64,uint64,(uint8,uint8,address,uint64,uint64,uint256,bytes,uint8,uint64,uint64)[],(uint8,address,bytes32,bytes)[],(bytes32,uint64,bytes32)[],((address,uint256,uint256)[],(address,uint256,uint256,uint256)[],(address,bytes32)[],(address,bool,bytes32,bytes32)[],(address,bytes32[],bytes)[],uint256,address),uint64))",
+        "selector": "0x0c9c5d43",
         "selectorBytes": [
-          121,
-          101,
-          131,
-          4
+          12,
+          156,
+          93,
+          67
         ]
       },
       "group": "evm",

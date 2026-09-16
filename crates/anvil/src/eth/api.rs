@@ -5048,6 +5048,14 @@ fn nonce_markers(
     on_chain_nonce: u64,
     from: Address,
 ) -> (Vec<TxMarker>, Vec<TxMarker>) {
+    // An EIP-8250 frame transaction on non-zero nonce keys is replay-protected
+    // by NONCE_MANAGER, not the account nonce, so it is never sequenced behind
+    // (or ahead of) the sender's linear transactions.
+    if crate::eth::backend::mem::is_keyed_frame_transaction(
+        pending_transaction.transaction.as_ref(),
+    ) {
+        return (vec![], vec![pending_transaction.hash().to_vec()]);
+    }
     tempo_parallel_nonce_markers(pending_transaction).unwrap_or_else(|| {
         (required_marker(nonce, on_chain_nonce, from), vec![to_marker(nonce, from)])
     })
@@ -5221,7 +5229,6 @@ impl TryFrom<Result<(InstructionResult, Option<Output>, u128, State)>> for GasEs
                 | InstructionResult::StackOverflow
                 | InstructionResult::OutOfOffset
                 | InstructionResult::CreateCollision
-                | InstructionResult::AddressCollision
                 | InstructionResult::OverflowPayment
                 | InstructionResult::PrecompileError
                 | InstructionResult::NonceOverflow

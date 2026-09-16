@@ -100,6 +100,25 @@ pub mod gas {
     /// `MAX_VERIFY_STATE_GAS`: state-gas budget of a public-mempool validation
     /// prefix.
     pub const MAX_VERIFY_STATE_GAS: u64 = 500_000;
+
+    // EIP-8250 keyed nonces.
+
+    /// `KEYED_NONCE_FIRST_USE_STATE_GAS`: charged to the approving frame for every
+    /// selected non-zero key whose slot is still absent.
+    pub const KEYED_NONCE_FIRST_USE_STATE_GAS: u64 = 64 * 1530;
+    /// `MAX_NONCE_KEYS`: most keys one envelope may select.
+    pub const MAX_NONCE_KEYS: usize = 16;
+    /// `MAX_NONCE_SEQ`: the exhausted sequence; a key at this value cannot advance.
+    pub const MAX_NONCE_SEQ: u64 = u64::MAX;
+
+    // EIP-8272 recent roots.
+
+    /// `MAX_RECENT_ROOT_REFERENCES`.
+    pub const MAX_RECENT_ROOT_REFERENCES: usize = 16;
+    /// `RECENT_ROOT_LENGTH`: ring size per root source.
+    pub const RECENT_ROOT_LENGTH: u64 = 8192;
+    /// `RECENT_ROOT_USABLE_WINDOW`: `current_slot - slot` must be within `1..=8191`.
+    pub const RECENT_ROOT_USABLE_WINDOW: u64 = 8191;
 }
 
 /// `ENTRY_POINT`: the caller of `DEFAULT` and `VERIFY` frames.
@@ -113,6 +132,115 @@ pub const EXPIRY_VERIFIER_ADDRESS: Address =
 /// Canonical EIP-8141 expiry verifier runtime installed at [`EXPIRY_VERIFIER_ADDRESS`].
 pub const EXPIRY_VERIFIER_RUNTIME_CODE: &[u8] =
     &alloy_primitives::hex!("60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd");
+
+/// `NONCE_MANAGER` (EIP-8250): protocol-managed keyed-nonce storage.
+pub const NONCE_MANAGER_ADDRESS: Address =
+    Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x82, 0x50]);
+
+/// `NONCE_MANAGER_CODE` (EIP-8250): `revert(0, 0)`, so ordinary calls fail.
+pub const NONCE_MANAGER_CODE: &[u8] = &alloy_primitives::hex!("60006000fd");
+
+/// `RECENT_ROOT_ADDRESS` (EIP-8272): recent-root commitments and verification.
+/// Canonical code is `TBD` upstream; the toolkit does not install this account.
+pub const RECENT_ROOT_ADDRESS: Address =
+    Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x82, 0x72]);
+
+/// EIP-8250 `slot(sender, nonce_key) = keccak256(left_pad_32(sender) || key)`.
+pub fn keyed_nonce_slot(sender: Address, nonce_key: U256) -> B256 {
+    let mut preimage = [0u8; 64];
+    preimage[12..32].copy_from_slice(sender.as_slice());
+    preimage[32..].copy_from_slice(&nonce_key.to_be_bytes::<32>());
+    keccak256(preimage)
+}
+
+/// EIP-8250 `nonce_keys_hash`: `keccak256(be32(len) || be32(k) for k in keys)`.
+pub fn nonce_keys_hash(nonce_keys: &[U256]) -> B256 {
+    let mut preimage = Vec::with_capacity(32 * (nonce_keys.len() + 1));
+    preimage.extend_from_slice(&U256::from(nonce_keys.len() as u64).to_be_bytes::<32>());
+    for key in nonce_keys {
+        preimage.extend_from_slice(&key.to_be_bytes::<32>());
+    }
+    keccak256(preimage)
+}
+
+/// Which wire layout a frame transaction was decoded from, and therefore
+/// re-encodes and hashes in.
+///
+/// The two layouts are distinguished on decode by the second payload item: a
+/// scalar `nonce` (baseline) or the `nonce_keys` list (keyed-nonce). Each
+/// transaction keeps the form it arrived in so its hash and canonical signature
+/// hash never move.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameEnvelope {
+    /// Pinned EIP-8141 master: `[chain_id, nonce, sender, frames, signatures,
+    /// fees, blob_versioned_hashes]` with `fees` a sublist.
+    #[default]
+    Baseline,
+    /// Current EIP-8250: `[chain_id, nonce_keys, nonce_seq, sender, frames,
+    /// signatures, fees, blob_versioned_hashes]`, with nested `fees`.
+    Keyed,
+}
+
+/// An EIP-8272 recent-root reference `[source_id, slot, root]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentRootReference {
+    /// `keccak256(source_address || salt)`.
+    pub source_id: B256,
+    /// Consensus slot the root was written in.
+    #[serde(with = "alloy_serde::quantity")]
+    pub slot: u64,
+    /// Opaque root committed by the source.
+    pub root: B256,
+}
+
+impl RecentRootReference {
+    /// `source_id = keccak256(source_address || salt)` (20 + 32 bytes).
+    pub fn source_id(source_address: Address, salt: B256) -> B256 {
+        let mut preimage = [0u8; 52];
+        preimage[..20].copy_from_slice(source_address.as_slice());
+        preimage[20..].copy_from_slice(salt.as_slice());
+        keccak256(preimage)
+    }
+
+    /// `keccak256(RECENT_ROOT_ENTRY_DOMAIN || source_id || uint64_be(slot) || root)`.
+    pub fn entry_hash(&self) -> B256 {
+        Self::entry_hash_for(self.source_id, self.slot, self.root)
+    }
+
+    /// [`Self::entry_hash`] for explicit fields.
+    pub fn entry_hash_for(source_id: B256, slot: u64, root: B256) -> B256 {
+        let mut preimage = [0u8; 32 + 32 + 8 + 32];
+        preimage[..32].copy_from_slice(keccak256(b"RECENT_ROOT_ENTRY").as_slice());
+        preimage[32..64].copy_from_slice(source_id.as_slice());
+        preimage[64..72].copy_from_slice(&slot.to_be_bytes());
+        preimage[72..].copy_from_slice(root.as_slice());
+        keccak256(preimage)
+    }
+
+    /// `keccak256(RECENT_ROOT_STORAGE_DOMAIN || source_id || uint64_be(slot mod
+    /// RECENT_ROOT_LENGTH))`: the ring cell this reference names.
+    pub fn storage_key(&self) -> B256 {
+        Self::storage_key_for(self.source_id, self.slot)
+    }
+
+    /// [`Self::storage_key`] for explicit fields.
+    pub fn storage_key_for(source_id: B256, slot: u64) -> B256 {
+        let mut preimage = [0u8; 32 + 32 + 8];
+        preimage[..32].copy_from_slice(keccak256(b"RECENT_ROOT_STORAGE").as_slice());
+        preimage[32..64].copy_from_slice(source_id.as_slice());
+        preimage[64..].copy_from_slice(&(slot % gas::RECENT_ROOT_LENGTH).to_be_bytes());
+        keccak256(preimage)
+    }
+
+    /// Encodes one verifier-frame tuple (source id, big-endian slot, root).
+    pub fn encode_calldata(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.source_id.as_slice());
+        out.extend_from_slice(&self.slot.to_be_bytes());
+        out.extend_from_slice(self.root.as_slice());
+    }
+}
 
 /// A single frame within a frame transaction.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -138,6 +266,28 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Builds the current EIP-8272 verifier frame. Execution requires a canonical
+    /// verifier deployment; upstream still leaves RECENT_ROOT_CODE TBD.
+    pub fn recent_root_verifier(
+        references: &[RecentRootReference],
+        gas_limit: u64,
+    ) -> Result<Self, FrameTxError> {
+        if references.is_empty() || references.len() > gas::MAX_RECENT_ROOT_REFERENCES {
+            return Err(FrameTxError::RecentRootTupleCount(references.len()));
+        }
+        let mut data = Vec::with_capacity(72 * references.len());
+        for reference in references {
+            reference.encode_calldata(&mut data);
+        }
+        Ok(Self {
+            mode: mode::VERIFY,
+            target: Some(RECENT_ROOT_ADDRESS),
+            gas_limit,
+            data: data.into(),
+            ..Default::default()
+        })
+    }
+
     /// Returns the target after resolving a null target to `sender`.
     pub fn resolved_target(&self, sender: Address) -> Address {
         self.target.unwrap_or(sender)
@@ -312,15 +462,22 @@ impl Decodable for FrameSignature {
 /// An EIP-8141 frame transaction.
 ///
 /// Field order matches the reference RLP payload exactly; changing it changes
-/// both the transaction hash and the canonical signature hash.
+/// both the transaction hash and the canonical signature hash. Two layouts are
+/// supported, selected by [`Self::envelope`]; see [`FrameEnvelope`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TxFrame {
     /// EIP-155 chain id.
     pub chain_id: U256,
-    /// Sender nonce.
+    /// Replay-protection sequence: the sender nonce of a baseline envelope, or
+    /// EIP-8250 `nonce_seq` of a keyed-nonce envelope.
     #[serde(with = "alloy_serde::quantity")]
     pub nonce: u64,
+    /// EIP-8250 `nonce_keys`. Empty means the baseline key set `[0]`, which
+    /// aliases the sender's account nonce. Only a keyed-nonce envelope may select
+    /// non-zero keys; see [`Self::wire_nonce_keys`].
+    #[serde(default)]
+    pub nonce_keys: Vec<U256>,
     /// The declared sender. A frame transaction carries no outer signature, so
     /// this is authoritative and must never be recovered from one.
     pub sender: Address,
@@ -339,9 +496,47 @@ pub struct TxFrame {
     pub max_fee_per_blob_gas: U256,
     /// EIP-4844 blob versioned hashes.
     pub blob_versioned_hashes: Vec<B256>,
+    /// The wire layout this transaction encodes and hashes in.
+    #[serde(default)]
+    pub envelope: FrameEnvelope,
+}
+
+fn validate_nonce_keys(keys: &[U256]) -> Result<(), FrameTxError> {
+    if keys.is_empty() || keys.len() > gas::MAX_NONCE_KEYS {
+        return Err(FrameTxError::NonceKeyCount(keys.len()));
+    }
+    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(FrameTxError::NonceKeysNotIncreasing);
+    }
+    if keys.len() > 1 && keys[0].is_zero() {
+        return Err(FrameTxError::ZeroNonceKeyNotAlone);
+    }
+    Ok(())
 }
 
 impl TxFrame {
+    /// Whether this transaction uses the keyed-nonce (EIP-8250) layout.
+    pub const fn is_keyed(&self) -> bool {
+        matches!(self.envelope, FrameEnvelope::Keyed)
+    }
+
+    /// The selected nonce key set as it appears on the wire: an empty
+    /// [`Self::nonce_keys`] is the baseline `[0]`.
+    pub fn wire_nonce_keys(&self) -> Vec<U256> {
+        if self.nonce_keys.is_empty() { vec![U256::ZERO] } else { self.nonce_keys.clone() }
+    }
+
+    /// Whether replay protection runs on `NONCE_MANAGER` keys rather than the
+    /// sender's account nonce (`nonce_keys != [0]`).
+    pub fn uses_keyed_nonces(&self) -> bool {
+        !(self.nonce_keys.is_empty() || self.nonce_keys == [U256::ZERO])
+    }
+
+    /// EIP-8250 `nonce_keys_hash(tx)` over [`Self::wire_nonce_keys`].
+    pub fn nonce_keys_hash(&self) -> B256 {
+        nonce_keys_hash(&self.wire_nonce_keys())
+    }
+
     /// Payload length of the nested `fees = [priority, max, blob]` list.
     fn fees_payload_length(&self) -> usize {
         self.max_priority_fee_per_gas.length()
@@ -350,30 +545,61 @@ impl TxFrame {
     }
 
     fn rlp_payload_length(&self) -> usize {
-        let fees = self.fees_payload_length();
-        self.chain_id.length()
-            + self.nonce.length()
-            + self.sender.length()
-            + self.frames.length()
-            + self.signatures.length()
-            + fees
-            + length_of_length(fees)
-            + self.blob_versioned_hashes.length()
+        match self.envelope {
+            FrameEnvelope::Baseline => {
+                let fees = self.fees_payload_length();
+                self.chain_id.length()
+                    + self.nonce.length()
+                    + self.sender.length()
+                    + self.frames.length()
+                    + self.signatures.length()
+                    + fees
+                    + length_of_length(fees)
+                    + self.blob_versioned_hashes.length()
+            }
+            FrameEnvelope::Keyed => {
+                self.chain_id.length()
+                    + self.wire_nonce_keys().length()
+                    + self.nonce.length()
+                    + self.sender.length()
+                    + self.frames.length()
+                    + self.signatures.length()
+                    + self.fees_payload_length()
+                    + length_of_length(self.fees_payload_length())
+                    + self.blob_versioned_hashes.length()
+            }
+        }
     }
 
-    /// Encodes the RLP payload (without the type byte).
+    /// Encodes the RLP payload (without the type byte) in [`Self::envelope`] form.
     pub fn encode_payload(&self, out: &mut dyn BufMut) {
         Header { list: true, payload_length: self.rlp_payload_length() }.encode(out);
         self.chain_id.encode(out);
-        self.nonce.encode(out);
-        self.sender.encode(out);
-        self.frames.encode(out);
-        self.signatures.encode(out);
-        Header { list: true, payload_length: self.fees_payload_length() }.encode(out);
-        self.max_priority_fee_per_gas.encode(out);
-        self.max_fee_per_gas.encode(out);
-        self.max_fee_per_blob_gas.encode(out);
-        self.blob_versioned_hashes.encode(out);
+        match self.envelope {
+            FrameEnvelope::Baseline => {
+                self.nonce.encode(out);
+                self.sender.encode(out);
+                self.frames.encode(out);
+                self.signatures.encode(out);
+                Header { list: true, payload_length: self.fees_payload_length() }.encode(out);
+                self.max_priority_fee_per_gas.encode(out);
+                self.max_fee_per_gas.encode(out);
+                self.max_fee_per_blob_gas.encode(out);
+                self.blob_versioned_hashes.encode(out);
+            }
+            FrameEnvelope::Keyed => {
+                self.wire_nonce_keys().encode(out);
+                self.nonce.encode(out);
+                self.sender.encode(out);
+                self.frames.encode(out);
+                self.signatures.encode(out);
+                Header { list: true, payload_length: self.fees_payload_length() }.encode(out);
+                self.max_priority_fee_per_gas.encode(out);
+                self.max_fee_per_gas.encode(out);
+                self.max_fee_per_blob_gas.encode(out);
+                self.blob_versioned_hashes.encode(out);
+            }
+        }
     }
 
     fn payload_length_with_header(&self) -> usize {
@@ -381,36 +607,88 @@ impl TxFrame {
         payload_length + length_of_length(payload_length)
     }
 
-    /// Decodes the RLP payload (without the type byte).
+    /// Decodes the RLP payload (without the type byte), accepting either layout.
+    ///
+    /// The second item decides: a scalar is the baseline `nonce`, a list is
+    /// EIP-8250 `nonce_keys` and the remaining fields follow the keyed-nonce layout.
     pub fn decode_payload(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         let mut payload = Header::decode_bytes(buf, true)?;
         let chain_id = U256::decode(&mut payload)?;
-        let nonce = u64::decode(&mut payload)?;
-        let sender = Address::decode(&mut payload)?;
-        let frames = Vec::<Frame>::decode(&mut payload)?;
-        let signatures = Vec::<FrameSignature>::decode(&mut payload)?;
-        let mut fees = Header::decode_bytes(&mut payload, true)?;
-        let max_priority_fee_per_gas = U256::decode(&mut fees)?;
-        let max_fee_per_gas = U256::decode(&mut fees)?;
-        let max_fee_per_blob_gas = U256::decode(&mut fees)?;
-        if !fees.is_empty() {
-            return Err(alloy_rlp::Error::UnexpectedLength);
-        }
-        let this = Self {
-            chain_id,
-            nonce,
-            sender,
-            frames,
-            signatures,
-            max_priority_fee_per_gas,
-            max_fee_per_gas,
-            max_fee_per_blob_gas,
-            blob_versioned_hashes: Vec::<B256>::decode(&mut payload)?,
+        let keyed = match payload.first() {
+            None => return Err(alloy_rlp::Error::InputTooShort),
+            Some(&first) => first >= alloy_rlp::EMPTY_LIST_CODE,
+        };
+        let this = if keyed {
+            let nonce_keys = Vec::<U256>::decode(&mut payload)?;
+            validate_nonce_keys(&nonce_keys)
+                .map_err(|_| alloy_rlp::Error::Custom("invalid nonce_keys"))?;
+            let nonce = u64::decode(&mut payload)?;
+            let sender = Address::decode(&mut payload)?;
+            let frames = Vec::<Frame>::decode(&mut payload)?;
+            let signatures = Vec::<FrameSignature>::decode(&mut payload)?;
+            let mut fees = Header::decode_bytes(&mut payload, true)?;
+            let max_priority_fee_per_gas = U256::decode(&mut fees)?;
+            let max_fee_per_gas = U256::decode(&mut fees)?;
+            let max_fee_per_blob_gas = U256::decode(&mut fees)?;
+            if !fees.is_empty() {
+                return Err(alloy_rlp::Error::UnexpectedLength);
+            }
+            let blob_versioned_hashes = Vec::<B256>::decode(&mut payload)?;
+            Self {
+                chain_id,
+                nonce,
+                nonce_keys,
+                sender,
+                frames,
+                signatures,
+                max_priority_fee_per_gas,
+                max_fee_per_gas,
+                max_fee_per_blob_gas,
+                blob_versioned_hashes,
+                envelope: FrameEnvelope::Keyed,
+            }
+        } else {
+            let nonce = u64::decode(&mut payload)?;
+            let sender = Address::decode(&mut payload)?;
+            let frames = Vec::<Frame>::decode(&mut payload)?;
+            let signatures = Vec::<FrameSignature>::decode(&mut payload)?;
+            let mut fees = Header::decode_bytes(&mut payload, true)?;
+            let max_priority_fee_per_gas = U256::decode(&mut fees)?;
+            let max_fee_per_gas = U256::decode(&mut fees)?;
+            let max_fee_per_blob_gas = U256::decode(&mut fees)?;
+            if !fees.is_empty() {
+                return Err(alloy_rlp::Error::UnexpectedLength);
+            }
+            Self {
+                chain_id,
+                nonce,
+                nonce_keys: Vec::new(),
+                sender,
+                frames,
+                signatures,
+                max_priority_fee_per_gas,
+                max_fee_per_gas,
+                max_fee_per_blob_gas,
+                blob_versioned_hashes: Vec::<B256>::decode(&mut payload)?,
+                envelope: FrameEnvelope::Baseline,
+            }
         };
         if !payload.is_empty() {
             return Err(alloy_rlp::Error::UnexpectedLength);
         }
         Ok(this)
+    }
+
+    /// EIP-8250 data pricing: `rlp(nonce_keys) || rlp(nonce_seq)`.
+    /// Empty for a baseline envelope, whose scalar nonce is not data.
+    fn envelope_calldata(&self) -> Vec<u8> {
+        if !self.is_keyed() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        self.wire_nonce_keys().encode(&mut out);
+        self.nonce.encode(&mut out);
+        out
     }
 
     /// Computes the canonical signature hash.
@@ -486,6 +764,7 @@ impl TxFrame {
                 total = total.checked_add(tokens_in(field))?;
             }
         }
+        total = total.checked_add(tokens_in(&self.envelope_calldata()))?;
         Some(total)
     }
 
@@ -501,18 +780,26 @@ impl TxFrame {
                 .into_iter()
                 .try_fold(total, |total, field| total.checked_add(field.len() as u64))
         })?;
+        let bytes = bytes.checked_add(self.envelope_calldata().len() as u64)?;
         bytes.checked_mul(gas::TOKEN_PER_NON_ZERO_BYTE)
     }
 
     /// `frame_tx_intrinsic_gas` in the EIP-2780 sense: derivable from the
     /// transaction fields alone, charged entirely in the execution dimension.
     pub fn intrinsic_gas(&self) -> Option<u64> {
-        let base = (self.frames.len() as u64)
+        let base = self.intrinsic_base()?;
+        base.checked_add(self.calldata_tokens()?.checked_mul(gas::STANDARD_TOKEN_COST)?)
+    }
+
+    /// The data-independent intrinsic base shared by the standard limit and the
+    /// calldata floor: per-frame and base costs, signature verification, value
+    /// transfers.
+    fn intrinsic_base(&self) -> Option<u64> {
+        (self.frames.len() as u64)
             .checked_mul(gas::PER_FRAME_COST)?
             .checked_add(gas::INTRINSIC_COST)?
             .checked_add(self.signature_verification_cost()?)?
-            .checked_add(self.value_transfer_cost()?)?;
-        base.checked_add(self.calldata_tokens()?.checked_mul(gas::STANDARD_TOKEN_COST)?)
+            .checked_add(self.value_transfer_cost()?)
     }
 
     /// Computes `(standard_gas_limit, calldata_floor_gas, max_gas)`.
@@ -524,11 +811,7 @@ impl TxFrame {
     /// with the declared state budgets added, since state gas never absorbs into
     /// the data floor.
     pub fn gas_limits(&self) -> Option<(u64, u64, u64)> {
-        let base = (self.frames.len() as u64)
-            .checked_mul(gas::PER_FRAME_COST)?
-            .checked_add(gas::INTRINSIC_COST)?
-            .checked_add(self.signature_verification_cost()?)?
-            .checked_add(self.value_transfer_cost()?)?;
+        let base = self.intrinsic_base()?;
         let standard_tokens = self.calldata_tokens()?;
         let floor_tokens = self.calldata_floor_tokens()?;
 
@@ -585,6 +868,23 @@ impl TxFrame {
         }
         if self.blob_versioned_hashes.is_empty() && !self.max_fee_per_blob_gas.is_zero() {
             return Err(FrameTxError::BlobFeeWithoutBlobs);
+        }
+
+        match self.envelope {
+            FrameEnvelope::Baseline => {
+                // The scalar EIP-8141 layout has no nonce-key field.
+                if self.uses_keyed_nonces() {
+                    return Err(FrameTxError::KeyedNoncesOnBaselineEnvelope);
+                }
+            }
+            FrameEnvelope::Keyed => {
+                // EIP-8250 static rules.
+                let keys = self.wire_nonce_keys();
+                validate_nonce_keys(&keys)?;
+                if self.nonce >= gas::MAX_NONCE_SEQ {
+                    return Err(FrameTxError::NonceSeqExhausted);
+                }
+            }
         }
 
         for sig in &self.signatures {
@@ -862,6 +1162,25 @@ pub enum FrameTxError {
         /// Index of the offending frame.
         index: usize,
     },
+    /// A baseline (EIP-8141 master) envelope selected non-zero nonce keys.
+    #[error("keyed nonces require the Keyed (EIP-8250) envelope")]
+    KeyedNoncesOnBaselineEnvelope,
+    /// Invalid number of tuples in an EIP-8272 verifier frame.
+    #[error("recent-root verifier requires 1..=16 tuples, got {0}")]
+    RecentRootTupleCount(usize),
+
+    /// `nonce_keys` is empty or longer than `MAX_NONCE_KEYS`.
+    #[error("invalid number of nonce keys: {0}")]
+    NonceKeyCount(usize),
+    /// `nonce_keys` is not strictly increasing.
+    #[error("nonce keys must be strictly increasing")]
+    NonceKeysNotIncreasing,
+    /// Key `0` may only appear as the sole key.
+    #[error("nonce key 0 must be the only key")]
+    ZeroNonceKeyNotAlone,
+    /// `nonce_seq == MAX_NONCE_SEQ` is the exhausted state.
+    #[error("nonce_seq is exhausted")]
+    NonceSeqExhausted,
     /// The declared gas figures do not fit in 64 bits.
     #[error("frame transaction gas overflow")]
     GasOverflow,
@@ -1048,6 +1367,7 @@ mod tests {
             max_fee_per_gas: U256::from(2_000_000_000u64),
             max_fee_per_blob_gas: U256::ZERO,
             blob_versioned_hashes: vec![],
+            ..Default::default()
         }
     }
 
@@ -1095,6 +1415,179 @@ mod tests {
     const SIGNED_SIG_HASH: &str =
         "0x10db3f07e098246cdf4056883c5a2754d90dff087c410b2bbc3af2a75891c7d9";
 
+    /// [`sample`] in the keyed-nonce layout with two non-zero keys and one reference.
+    fn keyed_sample() -> TxFrame {
+        TxFrame {
+            nonce_keys: vec![U256::from(1u64), U256::from(1u64) << 255],
+            envelope: FrameEnvelope::Keyed,
+            ..sample()
+        }
+    }
+
+    /// Byte-exact current EIP-8250 envelope from `tools/frametx_keyed_vector.py`.
+    const KEYED_RAW: &str = "06f8c7827a69e201a0800000000000000000000000000000000000000000000000000000000000000007941111111111111111111111111111111111111111f3ce010380c482c35080808401020003e30280942222222222222222222222222222222222222222c782520883030d408203e880f848f846018080b841abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababcb843b9aca00847735940080c0";
+
+    #[test]
+    fn rejects_legacy_flat_fee_root_envelope() {
+        let legacy = alloy_primitives::hex::decode("06f9010f827a69e201a0800000000000000000000000000000000000000000000000000000000000000007941111111111111111111111111111111111111111f3ce010380c482c35080808401020003e30280942222222222222222222222222222222222222222c782520883030d408203e880f848f846018080b841ababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab843b9aca00847735940080c0f847f845a05151515151515151515151515151515151515151515151515151515151515151821234a05252525252525252525252525252525252525252525252525252525252525252").unwrap();
+        assert!(TxFrame::decode_2718_exact(&legacy).is_err());
+    }
+
+    #[test]
+    fn keyed_layout_round_trips_and_is_detected_by_the_second_item() {
+        let tx = keyed_sample();
+        let mut encoded = Vec::new();
+        tx.encode_2718(&mut encoded);
+        assert_eq!(alloy_primitives::hex::encode(&encoded), KEYED_RAW);
+        let decoded = TxFrame::decode_2718_exact(&encoded).unwrap();
+        assert_eq!(decoded, tx);
+        assert_eq!(decoded.envelope, FrameEnvelope::Keyed);
+        assert!(decoded.uses_keyed_nonces());
+        // Second payload item is a list: 0xe2 = list of 34 bytes (two keys).
+        assert_eq!(encoded[..1], [FRAME_TX_TYPE_ID]);
+        let baseline = sample();
+        let mut baseline_bytes = Vec::new();
+        baseline.encode_2718(&mut baseline_bytes);
+        assert_eq!(
+            TxFrame::decode_2718_exact(&baseline_bytes).unwrap().envelope,
+            FrameEnvelope::Baseline
+        );
+        // The two layouts of the same fields hash differently, on purpose.
+        assert_ne!(tx.signature_hash(), baseline.signature_hash());
+        assert_ne!(tx.hash_slow(), baseline.hash_slow());
+    }
+
+    #[test]
+    fn keyed_baseline_key_set_encodes_as_a_one_element_list() {
+        // An empty `nonce_keys` is the alias `[0]`; it must not encode as an
+        // empty list, which the decoder rejects.
+        let tx = TxFrame { envelope: FrameEnvelope::Keyed, ..sample() };
+        let mut encoded = Vec::new();
+        tx.encode_2718(&mut encoded);
+        let decoded = TxFrame::decode_2718_exact(&encoded).unwrap();
+        assert_eq!(decoded.nonce_keys, vec![U256::ZERO]);
+        assert!(!decoded.uses_keyed_nonces());
+        assert_eq!(decoded.wire_nonce_keys(), tx.wire_nonce_keys());
+        assert_eq!(decoded.hash_slow(), tx.hash_slow());
+        assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn keyed_static_rules() {
+        let mut tx = keyed_sample();
+        assert!(tx.validate().is_ok());
+
+        tx.nonce_keys = vec![U256::from(2u64), U256::from(1u64)];
+        assert_eq!(tx.validate(), Err(FrameTxError::NonceKeysNotIncreasing));
+        tx.nonce_keys = vec![U256::from(1u64), U256::from(1u64)];
+        assert_eq!(tx.validate(), Err(FrameTxError::NonceKeysNotIncreasing));
+        tx.nonce_keys = vec![U256::ZERO, U256::from(1u64)];
+        assert_eq!(tx.validate(), Err(FrameTxError::ZeroNonceKeyNotAlone));
+        tx.nonce_keys = (1..=17u64).map(U256::from).collect();
+        assert_eq!(tx.validate(), Err(FrameTxError::NonceKeyCount(17)));
+        tx.nonce_keys = vec![U256::from(1u64)];
+        tx.nonce = u64::MAX;
+        assert_eq!(tx.validate(), Err(FrameTxError::NonceSeqExhausted));
+        tx.nonce = 0;
+        // The baseline layout cannot carry keyed nonces.
+        let keyed = TxFrame { nonce_keys: vec![U256::from(1u64)], ..sample() };
+        assert_eq!(keyed.validate(), Err(FrameTxError::KeyedNoncesOnBaselineEnvelope));
+    }
+
+    #[test]
+    fn decoder_rejects_invalid_key_sets_with_valid_outer_rlp() {
+        let raw = keyed_sample().encoded_2718();
+        let payload = Header::decode_bytes(&mut &raw[1..], true).unwrap();
+        let mut tail = payload;
+        U256::decode(&mut tail).unwrap();
+        let chain_length = payload.len() - tail.len();
+        Vec::<U256>::decode(&mut tail).unwrap();
+        for keys in [
+            vec![],
+            vec![U256::from(2u64), U256::from(1u64)],
+            vec![U256::from(1u64), U256::from(1u64)],
+            vec![U256::ZERO, U256::from(1u64)],
+            (1..=17u64).map(U256::from).collect(),
+        ] {
+            let mut body = payload[..chain_length].to_vec();
+            keys.encode(&mut body);
+            body.extend_from_slice(tail);
+            let mut malformed = vec![FRAME_TX_TYPE_ID];
+            Header { list: true, payload_length: body.len() }.encode(&mut malformed);
+            malformed.extend_from_slice(&body);
+            assert!(TxFrame::decode_2718_exact(&malformed).is_err(), "accepted keys: {keys:?}");
+        }
+    }
+
+    #[test]
+    fn keyed_envelope_fields_are_priced_as_data() {
+        let baseline = sample();
+        let keyed = TxFrame { envelope: FrameEnvelope::Keyed, ..sample() };
+        // `rlp([0]) || rlp(7)` = c1 80 07: three non-zero bytes.
+        assert_eq!(
+            keyed.calldata_tokens().unwrap(),
+            baseline.calldata_tokens().unwrap() + 3 * gas::TOKEN_PER_NON_ZERO_BYTE
+        );
+        assert_eq!(
+            keyed.calldata_floor_tokens().unwrap(),
+            baseline.calldata_floor_tokens().unwrap() + 3 * gas::TOKEN_PER_NON_ZERO_BYTE
+        );
+    }
+
+    #[test]
+    fn recent_root_verifier_uses_fixed_width_frame_calldata() {
+        let reference = RecentRootReference {
+            source_id: B256::repeat_byte(0x11),
+            slot: 0x0102030405060708,
+            root: B256::repeat_byte(0x22),
+        };
+        let frame = Frame::recent_root_verifier(&[reference, reference], 10_000).unwrap();
+        assert_eq!(frame.mode, mode::VERIFY);
+        assert_eq!(frame.target, Some(RECENT_ROOT_ADDRESS));
+        assert_eq!((frame.flags, frame.state_gas_limit, frame.value), (0, 0, U256::ZERO));
+        assert_eq!(frame.data.len(), 144);
+        assert_eq!(&frame.data[..32], reference.source_id.as_slice());
+        assert_eq!(&frame.data[32..40], &reference.slot.to_be_bytes());
+        assert_eq!(&frame.data[40..72], reference.root.as_slice());
+        assert_eq!(&frame.data[..72], &frame.data[72..]);
+        assert!(Frame::recent_root_verifier(&[], 10_000).is_err());
+        assert!(Frame::recent_root_verifier(&[reference; 17], 10_000).is_err());
+        assert!(Frame::recent_root_verifier(&[reference; 16], 10_000).is_ok());
+    }
+
+    #[test]
+    fn recent_root_derivations_follow_the_spec_layouts() {
+        let source = Address::repeat_byte(0xab);
+        let salt = B256::repeat_byte(0xcd);
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(source.as_slice());
+        preimage.extend_from_slice(salt.as_slice());
+        assert_eq!(RecentRootReference::source_id(source, salt), keccak256(&preimage));
+
+        let reference = RecentRootReference {
+            source_id: B256::repeat_byte(0x01),
+            slot: gas::RECENT_ROOT_LENGTH + 5,
+            root: B256::repeat_byte(0x02),
+        };
+        let mut entry = Vec::new();
+        entry.extend_from_slice(keccak256(b"RECENT_ROOT_ENTRY").as_slice());
+        entry.extend_from_slice(reference.source_id.as_slice());
+        entry.extend_from_slice(&(gas::RECENT_ROOT_LENGTH + 5).to_be_bytes());
+        entry.extend_from_slice(reference.root.as_slice());
+        assert_eq!(reference.entry_hash(), keccak256(&entry));
+        let mut key = Vec::new();
+        key.extend_from_slice(keccak256(b"RECENT_ROOT_STORAGE").as_slice());
+        key.extend_from_slice(reference.source_id.as_slice());
+        key.extend_from_slice(&5u64.to_be_bytes()); // slot mod 8192
+        assert_eq!(reference.storage_key(), keccak256(&key));
+
+        let sender = Address::repeat_byte(0x33);
+        let mut slot_preimage = [0u8; 64];
+        slot_preimage[12..32].copy_from_slice(sender.as_slice());
+        slot_preimage[63] = 9;
+        assert_eq!(keyed_nonce_slot(sender, U256::from(9u64)), keccak256(slot_preimage));
+    }
+
     /// The signed vector's envelope: one self-verifying frame, no state gas.
     fn signed_sample() -> TxFrame {
         TxFrame {
@@ -1122,6 +1615,7 @@ mod tests {
             max_fee_per_gas: U256::from(2_000_000_000u64),
             max_fee_per_blob_gas: U256::ZERO,
             blob_versioned_hashes: vec![],
+            ..Default::default()
         }
     }
 

@@ -494,7 +494,7 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
 /// carries only the transaction-wide fields, and the executor overrides the
 /// call-shaped ones per frame.
 pub fn frame_tx_env(tx: &TxFrame, caller: Address) -> TxEnv {
-    let mut tx_env = TxEnv {
+    let tx_env = TxEnv {
         tx_type: super::frame::FRAME_TX_TYPE_ID,
         caller,
         gas_limit: tx.max_gas(),
@@ -507,7 +507,6 @@ pub fn frame_tx_env(tx: &TxFrame, caller: Address) -> TxEnv {
         kind: alloy_primitives::TxKind::Call(tx.sender),
         ..Default::default()
     };
-    tx_env.set_eip7851_sender_ecdsa_authenticated(false);
     tx_env
 }
 

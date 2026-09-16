@@ -12,6 +12,7 @@ use foundry_evm::{
         TracingInspectorConfig, render_trace_arena_inner,
     },
 };
+use foundry_primitives::{NONCE_MANAGER_ADDRESS, frame_gas, keyed_nonce_slot};
 use revm::{
     Inspector,
     context::{ContextTr, JournalTr, journaled_state::account::JournaledAccountTr},
@@ -19,7 +20,8 @@ use revm::{
     inspector::JournalExt,
     interpreter::{
         CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, CreateScheme, FrameInput,
-        InstructionResult, Interpreter, InterpreterAction,
+        Gas, InstructionResult, Interpreter, InterpreterAction, InterpreterResult,
+        instructions::frame_tx::{frame_tx_context, set_frame_tx_context},
         interpreter::EthInterpreter,
         interpreter_types::{InputsTr, Jumps, LoopControl},
     },
@@ -132,6 +134,7 @@ pub(crate) struct FrameApprovalOutcome {
     pub(crate) state: ApprovalState,
     pub(crate) attempts: Vec<ApprovalAttempt>,
     pub(crate) refund_counter: i64,
+    pub(crate) state_gas_used: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -153,8 +156,14 @@ pub struct FrameApprovalWatcher {
     sender: Address,
     allowed_scope: u64,
     max_cost: U256,
+    /// EIP-8250 key set consumed by payment approval; `[0]` is the account nonce.
+    nonce_keys: Vec<U256>,
+    /// EIP-8250 `nonce_seq` written as `nonce_seq + 1` to every selected key.
+    nonce_seq: u64,
     state: ApprovalState,
-    frame_checkpoints: Vec<(ApprovalState, usize)>,
+    frame_checkpoints: Vec<(ApprovalState, usize, u64)>,
+    state_gas_limit: u64,
+    state_gas_used: u64,
     pending: Option<PendingApproval>,
     attempts: Vec<ApprovalAttempt>,
     refund_counter: i64,
@@ -175,6 +184,7 @@ impl AnvilInspector {
     }
 
     /// Arms the approval watcher for a frame targeting `resolved_target`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn watch_frame_approval(
         &mut self,
         resolved_target: Address,
@@ -182,12 +192,18 @@ impl AnvilInspector {
         allowed_scope: u64,
         max_cost: U256,
         state: ApprovalState,
+        nonce_keys: Vec<U256>,
+        nonce_seq: u64,
+        state_gas_limit: u64,
     ) {
         self.frame_approval = Some(FrameApprovalWatcher {
             resolved_target,
             sender,
             allowed_scope,
             max_cost,
+            nonce_keys,
+            nonce_seq,
+            state_gas_limit,
             state,
             ..Default::default()
         });
@@ -199,6 +215,7 @@ impl AnvilInspector {
             state: watcher.state,
             attempts: watcher.attempts,
             refund_counter: watcher.refund_counter,
+            state_gas_used: watcher.state_gas_used,
         })
     }
 }
@@ -242,7 +259,9 @@ where
         } else {
             ecx.journal_mut().load_account(watcher.sender)?.info.nonce
         };
-        if sender_nonce == u64::MAX {
+        if !super::super::frame_tx::uses_keyed_nonces(&watcher.nonce_keys)
+            && sender_nonce == u64::MAX
+        {
             return Ok(None);
         }
     }
@@ -253,32 +272,85 @@ where
     }))
 }
 
+/// Keep TXPARAM's frame state budget synchronized after nested approval or rollback.
+fn sync_state_gas_context(watcher: &FrameApprovalWatcher) {
+    if let Some(context) = frame_tx_context() {
+        let mut context = (*context).clone();
+        context.state_gas_left = watcher.state_gas_limit - watcher.state_gas_used;
+        set_frame_tx_context(Some(context));
+    }
+}
+
+/// How a validated `APPROVE` fared when its effects were applied.
+enum ApprovalApply {
+    /// Effects committed.
+    Applied,
+    /// A balance or nonce could not be updated; the frame reverts.
+    Rejected,
+    /// The EIP-8250 first-use surcharge exceeded the frame's remaining gas.
+    OutOfGas,
+}
+
+/// Commits payment-approval effects: the `max_cost` debit and EIP-8250
+/// `consume_nonce_set`, charging first-use keys to the frame state budget
+/// before anything is written.
 fn apply_frame_approval<CTX>(
-    watcher: &FrameApprovalWatcher,
+    watcher: &mut FrameApprovalWatcher,
     next_state: ApprovalState,
     ecx: &mut CTX,
-) -> Result<bool, <CTX::Db as revm::Database>::Error>
+    _gas: &mut Gas,
+) -> Result<ApprovalApply, <CTX::Db as revm::Database>::Error>
 where
     CTX: ContextTr,
 {
     let Some(payer) = next_state.payer.filter(|_| watcher.state.payer.is_none()) else {
-        return Ok(true);
+        return Ok(ApprovalApply::Applied);
     };
 
-    if payer == watcher.sender {
-        let mut account = ecx.journal_mut().load_account_mut(payer)?;
-        return Ok(account.decr_balance(watcher.max_cost) && account.bump_nonce());
+    let keyed = !(watcher.nonce_keys.is_empty() || watcher.nonce_keys == [U256::ZERO]);
+    let mut slots = Vec::with_capacity(watcher.nonce_keys.len());
+    let mut surcharge = 0u64;
+    if keyed {
+        for key in &watcher.nonce_keys {
+            let slot: U256 = keyed_nonce_slot(watcher.sender, *key).into();
+            let Some(before) =
+                ecx.journal_mut().frame_transaction_storage(NONCE_MANAGER_ADDRESS, slot)?
+            else {
+                return Ok(ApprovalApply::Rejected);
+            };
+            if before.is_zero() {
+                surcharge += frame_gas::KEYED_NONCE_FIRST_USE_STATE_GAS;
+            }
+            slots.push(slot);
+        }
+        if surcharge > watcher.state_gas_limit - watcher.state_gas_used {
+            return Ok(ApprovalApply::OutOfGas);
+        }
     }
 
     let debited = ecx.journal_mut().load_account_mut(payer)?.decr_balance(watcher.max_cost);
+    if !debited {
+        return Ok(ApprovalApply::Rejected);
+    }
+    if keyed {
+        for slot in slots {
+            if !ecx.journal_mut().set_frame_transaction_storage(
+                NONCE_MANAGER_ADDRESS,
+                slot,
+                U256::from(watcher.nonce_seq + 1),
+            )? {
+                return Ok(ApprovalApply::Rejected);
+            }
+        }
+        watcher.state_gas_used += surcharge;
+        return Ok(ApprovalApply::Applied);
+    }
     let bumped = ecx.journal_mut().load_account_mut(watcher.sender)?.bump_nonce();
-    Ok(debited && bumped)
+    Ok(if bumped { ApprovalApply::Applied } else { ApprovalApply::Rejected })
 }
 
-fn reject_approval_return(interp: &mut Interpreter) {
-    let Some(InterpreterAction::Return(result)) = interp.bytecode.action().as_mut() else {
-        unreachable!("APPROVE return action exists at step end")
-    };
+/// Turns the pending `APPROVE` return into a revert.
+fn reject_approval_return(result: &mut InterpreterResult) {
     result.result = InstructionResult::Revert;
     result.output = Default::default();
 }
@@ -615,20 +687,30 @@ where
         {
             let mut succeeded = false;
             if interp.bytecode.instruction_result() == Some(InstructionResult::Return) {
+                let Some(InterpreterAction::Return(result)) = interp.bytecode.action().as_mut()
+                else {
+                    unreachable!("APPROVE return action exists at step end")
+                };
                 if let Some(next_state) = pending.next_state {
-                    match apply_frame_approval(watcher, next_state, ecx) {
-                        Ok(true) => {
+                    match apply_frame_approval(watcher, next_state, ecx, &mut result.gas) {
+                        Ok(ApprovalApply::Applied) => {
                             watcher.state = next_state;
+                            sync_state_gas_context(watcher);
                             succeeded = true;
                         }
-                        Ok(false) => reject_approval_return(interp),
+                        Ok(ApprovalApply::Rejected) => reject_approval_return(result),
+                        Ok(ApprovalApply::OutOfGas) => {
+                            result.result = InstructionResult::OutOfGas;
+                            result.output = Default::default();
+                            result.gas.spend_all();
+                        }
                         Err(err) => {
                             *ecx.error() = Err(err.into());
                             interp.halt_fatal();
                         }
                     }
                 } else {
-                    reject_approval_return(interp);
+                    reject_approval_return(result);
                 }
             }
             watcher.attempts.push(ApprovalAttempt { scope: Some(pending.scope), succeeded });
@@ -664,7 +746,11 @@ where
     fn call(&mut self, ecx: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let trace_depth_offset = usize::from(self.frame_trace_root);
         if let Some(watcher) = &mut self.frame_approval {
-            watcher.frame_checkpoints.push((watcher.state, watcher.attempts.len()));
+            watcher.frame_checkpoints.push((
+                watcher.state,
+                watcher.attempts.len(),
+                watcher.state_gas_used,
+            ));
         }
         if let Some(collector) = &mut self.simulation_logs {
             collector.sync_journal_logs(ecx.journal().logs());
@@ -691,11 +777,14 @@ where
 
     fn call_end(&mut self, ecx: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
         if let Some(watcher) = &mut self.frame_approval
-            && let Some((checkpoint, attempt_index)) = watcher.frame_checkpoints.pop()
+            && let Some((checkpoint, attempt_index, state_gas_used)) =
+                watcher.frame_checkpoints.pop()
         {
             let succeeded = outcome.instruction_result().is_ok();
             if !succeeded {
                 watcher.state = checkpoint;
+                watcher.state_gas_used = state_gas_used;
+                sync_state_gas_context(watcher);
                 for attempt in &mut watcher.attempts[attempt_index..] {
                     attempt.succeeded = false;
                 }
@@ -716,7 +805,11 @@ where
     fn create(&mut self, ecx: &mut CTX, inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         let trace_depth_offset = usize::from(self.frame_trace_root);
         if let Some(watcher) = &mut self.frame_approval {
-            watcher.frame_checkpoints.push((watcher.state, watcher.attempts.len()));
+            watcher.frame_checkpoints.push((
+                watcher.state,
+                watcher.attempts.len(),
+                watcher.state_gas_used,
+            ));
         }
         if let Some(collector) = &mut self.simulation_logs {
             collector.sync_journal_logs(ecx.journal().logs());
@@ -744,10 +837,13 @@ where
 
     fn create_end(&mut self, ecx: &mut CTX, inputs: &CreateInputs, outcome: &mut CreateOutcome) {
         if let Some(watcher) = &mut self.frame_approval
-            && let Some((checkpoint, attempt_index)) = watcher.frame_checkpoints.pop()
+            && let Some((checkpoint, attempt_index, state_gas_used)) =
+                watcher.frame_checkpoints.pop()
             && !(outcome.instruction_result().is_ok() && outcome.address.is_some())
         {
             watcher.state = checkpoint;
+            watcher.state_gas_used = state_gas_used;
+            sync_state_gas_context(watcher);
             for attempt in &mut watcher.attempts[attempt_index..] {
                 attempt.succeeded = false;
             }

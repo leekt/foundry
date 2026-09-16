@@ -28,11 +28,9 @@ use revm::{
 const EC_RECOVER: Address = address!("0000000000000000000000000000000000000001");
 const PROBE: Address = address!("0000000000000000000000000000000000008151");
 const REVERTING_PROBE: Address = address!("0000000000000000000000000000000000008152");
-const DELEGATE: Address = address!("000000000000000000000000000000000000dE1e");
 const DELEGATION_TARGET: Address = address!("000000000000000000000000000000000000dEaD");
 const OVERRIDE_ADDRESS: Address = address!("0000000000000000000000000000000000000bad");
 const ZERO_WORD: [u8; 32] = [0; 32];
-const SETSELFDELEGATE: u8 = 0xf7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProbeResult {
@@ -72,18 +70,6 @@ fn delegation(version: u8, target: Address) -> Bytes {
     let mut code = Vec::with_capacity(23);
     code.extend_from_slice(&[0xef, 0x01, version]);
     code.extend_from_slice(target.as_slice());
-    code.into()
-}
-
-fn setselfdelegate_runtime(target: Address) -> Bytes {
-    let mut code = Vec::with_capacity(29);
-    code.push(0x73); // PUSH20
-    code.extend_from_slice(target.as_slice());
-    code.extend_from_slice(&[
-        SETSELFDELEGATE,
-        0x50, // POP
-        0x00, // STOP
-    ]);
     code.into()
 }
 
@@ -423,36 +409,6 @@ async fn call_transaction_estimate_and_trace_replay_agree() {
         .unwrap();
     let GethTrace::Default(trace) = trace else { panic!("expected default transaction trace") };
     assert_eq!(trace.return_value, call_output);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn eip7851_transition_from_ef0100_to_ef0101_disables_recovery() {
-    let signer = PrivateKeySigner::random();
-    let (recovered, _, _, input) = ecrecover_input(&signer);
-    let config = enabled_config().enable_eip7851(true);
-    let (api, handle) = spawn(config).await;
-    let provider = handle.http_provider();
-    install_probe(&api, &[5_600]).await;
-    api.anvil_set_code(DELEGATE, setselfdelegate_runtime(DELEGATION_TARGET)).await.unwrap();
-    api.anvil_set_code(recovered, delegation(0, DELEGATE)).await.unwrap();
-
-    assert_allowed(call_probe(&provider, input.clone(), None).await[0], recovered);
-    let receipt = provider
-        .send_transaction(
-            TransactionRequest::default()
-                .with_from(handle.dev_accounts().next().unwrap())
-                .with_to(recovered)
-                .with_gas_limit(100_000)
-                .into(),
-        )
-        .await
-        .unwrap()
-        .get_receipt()
-        .await
-        .unwrap();
-    assert!(receipt.status());
-    assert_eq!(provider.get_code_at(recovered).await.unwrap(), delegation(1, DELEGATION_TARGET));
-    assert_rejected(call_probe(&provider, input, None).await[0]);
 }
 
 #[derive(Debug)]

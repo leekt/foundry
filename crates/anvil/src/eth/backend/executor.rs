@@ -230,6 +230,9 @@ pub(crate) struct FrameReceiptData {
     pub(crate) gas_used: u64,
     /// Final state-gas component of `gas_used`.
     pub(crate) state_gas_used: u64,
+    /// Gas counted toward the block and receipt cumulative totals: pre-refund
+    /// execution gas plus final state gas (EIP-7778 via EIP-8141).
+    pub(crate) block_gas_used: u64,
     pub(crate) payer: Address,
     pub(crate) frame_receipts: Vec<FrameReceipt>,
 }
@@ -455,10 +458,13 @@ where
         // `ResultGas` models the ordinary transaction-total calldata floor.
         // Frame transactions instead floor only their execution component and
         // add final state gas afterwards, so use the settlement values retained
-        // by the frame executor for receipts and block accounting.
+        // by the frame executor for receipts and block accounting. EIP-8141
+        // requires EIP-7778, so the block (and the receipts' cumulative total)
+        // count a frame transaction's execution gas before the storage refund,
+        // while the payer is charged the post-refund `gas_used`.
         let (gas_used, state_gas_used) = frame_receipt.as_ref().map_or_else(
             || (result.tx_gas_used(), result.gas().block_state_gas_used()),
-            |frame| (frame.gas_used, frame.state_gas_used),
+            |frame| (frame.block_gas_used, frame.state_gas_used),
         );
         self.gas_used += gas_used;
 
@@ -791,23 +797,6 @@ where
     ExecutedPoolTransactions { included, invalid, not_yet_valid, tx_info, txs: transactions }
 }
 
-/// Returns whether a pending transaction's authoritative sender came from its protocol ECDSA
-/// envelope rather than impersonation or another custom authentication path.
-pub(crate) fn is_eip7851_sender_ecdsa_authenticated(
-    tx: &PendingTransaction<FoundryTxEnvelope>,
-) -> bool {
-    !tx.transaction.is_impersonated()
-        && matches!(
-            tx.transaction.as_ref(),
-            FoundryTxEnvelope::Legacy(_)
-                | FoundryTxEnvelope::Eip2930(_)
-                | FoundryTxEnvelope::Eip1559(_)
-                | FoundryTxEnvelope::Eip4844(_)
-                | FoundryTxEnvelope::Eip7702(_)
-        )
-        && tx.transaction.as_ref().recover().is_ok_and(|sender| sender == *tx.sender())
-}
-
 /// Builds the EVM transaction env from a pending pool transaction.
 pub fn build_tx_env_for_pending<T>(
     tx: &PendingTransaction<FoundryTxEnvelope>,
@@ -819,7 +808,6 @@ where
     let encoded = tx.transaction.encoded_2718().into();
     let mut tx_env: T =
         FromTxWithEncoded::from_encoded_tx(tx.transaction.as_ref(), *tx.sender(), encoded);
-    tx_env.set_eip7851_sender_ecdsa_authenticated(is_eip7851_sender_ecdsa_authenticated(tx));
 
     if let Some(signed_auths) = tx.transaction.authorization_list()
         && cheats.has_recover_overrides()
@@ -854,15 +842,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_eips::{
         eip6110::MAINNET_DEPOSIT_CONTRACT_ADDRESS, eip7002::WITHDRAWAL_REQUEST_TYPE,
         eip7251::CONSOLIDATION_REQUEST_TYPE,
     };
-    use alloy_network::TxSignerSync;
-    use alloy_signer_local::PrivateKeySigner;
     use alloy_sol_types::{SolEvent, sol};
-    use revm::context::{Transaction as RevmTransaction, TxEnv};
 
     sol! {
         event DepositEvent(
@@ -872,31 +856,6 @@ mod tests {
             bytes signature,
             bytes index
         );
-    }
-
-    #[test]
-    fn pending_tx_env_preserves_protocol_ecdsa_authentication() {
-        let signer = PrivateKeySigner::random();
-        let mut tx = TxEip1559 { chain_id: 31337, gas_limit: 21_000, ..Default::default() };
-        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
-        let envelope = FoundryTxEnvelope::Eip1559(tx.into_signed(signature));
-
-        let signed = PendingTransaction::new(envelope.clone()).unwrap();
-        let signed_env: TxEnv = build_tx_env_for_pending(&signed, &CheatsManager::default());
-        assert!(RevmTransaction::is_eip7851_sender_ecdsa_authenticated(&signed_env));
-
-        let impersonated =
-            PendingTransaction::with_impersonated(envelope.clone(), signer.address());
-        let impersonated_env: TxEnv =
-            build_tx_env_for_pending(&impersonated, &CheatsManager::default());
-        assert!(!RevmTransaction::is_eip7851_sender_ecdsa_authenticated(&impersonated_env));
-
-        let custom = PendingTransaction::with_sender(
-            MaybeImpersonatedTransaction::new(envelope),
-            Address::ZERO,
-        );
-        let custom_env: TxEnv = build_tx_env_for_pending(&custom, &CheatsManager::default());
-        assert!(!RevmTransaction::is_eip7851_sender_ecdsa_authenticated(&custom_env));
     }
 
     #[test]

@@ -25,7 +25,8 @@ use foundry_common::provider::RetryProvider;
 use foundry_evm::hardfork::EthereumHardfork;
 use foundry_primitives::{
     EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE, FoundryNetwork, FoundryReceiptEnvelope,
-    Frame, FrameReceipt, FrameSignature, TxFrame, flags, frame_gas as gas, mode, scheme,
+    Frame, FrameEnvelope, FrameReceipt, FrameSignature, NONCE_MANAGER_ADDRESS, RECENT_ROOT_ADDRESS,
+    TxFrame, flags, frame_gas as gas, keyed_nonce_slot, mode, scheme,
 };
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, signature::hazmat::PrehashSigner,
@@ -60,13 +61,6 @@ const P256_ACCOUNT_RUNTIME: Bytes = bytes!(
 const MULTISIG_ACCOUNT_RUNTIME: Bytes = bytes!(
     "608060405260043610610036575f3560e01c806325b90494146100415780632f54bf6e1461006257806342cde4e8146100a5575f5ffd5b3661003d57005b5f5ffd5b34801561004c575f5ffd5b5061006061005b366004610224565b6100c8565b005b34801561006d575f5ffd5b5061009061007c366004610295565b5f6020819052908152604090205460ff1681565b60405190151581526020015b60405180910390f35b3480156100b0575f5ffd5b506100ba60015481565b60405190815260200161009c565b5f80805b838110156101c5575f8585838181106100e7576100e76102c2565b9050602002013590505f6100fc82600190b490565b905060018114158015610110575060028114155b801561011d575060038114155b156101295750506101bd565b600282b4156101395750506101bd565b5f8083b46001600160a01b03165f8181526020819052604090205490915060ff16610166575050506101bd565b8481116101b25760405162461bcd60e51b81526020600482015260156024820152741bdddb995c881cda59dcc81b9bdd081cdbdc9d1959605a1b60448201526064015b60405180910390fd5b600190950194935050505b6001016100cc565b5060015482101561020c5760405162461bcd60e51b81526020600482015260116024820152701d1a1c995cda1bdb19081b9bdd081b595d607a1b60448201526064016101a9565b61021e6006600ab0b3805f5faa805f5faa5b50505050565b5f5f60208385031215610235575f5ffd5b823567ffffffffffffffff81111561024b575f5ffd5b8301601f8101851361025b575f5ffd5b803567ffffffffffffffff811115610271575f5ffd5b8560208260051b8401011115610285575f5ffd5b6020919091019590945092505050565b5f602082840312156102a5575f5ffd5b81356001600160a01b03811681146102bb575f5ffd5b9392505050565b634e487b7160e01b5f52603260045260245ffd"
 );
-
-fn eip7851_designation(target: Address) -> Bytes {
-    let mut code = Vec::with_capacity(23);
-    code.extend_from_slice(&[0xef, 0x01, 0x01]);
-    code.extend_from_slice(target.as_slice());
-    code.into()
-}
 
 fn frame_node_config() -> NodeConfig {
     NodeConfig::test().with_frame_transactions(true)
@@ -241,6 +235,7 @@ fn frame_tx(
         max_fee_per_gas: U256::from(max_fee_per_gas),
         max_fee_per_blob_gas: U256::ZERO,
         blob_versioned_hashes: vec![],
+        ..Default::default()
     }
 }
 
@@ -288,6 +283,7 @@ async fn fresh_node_installs_the_canonical_expiry_verifier() {
     let code = provider.get_code_at(EXPIRY_VERIFIER_ADDRESS).await.unwrap();
 
     assert_eq!(code.as_ref(), EXPIRY_VERIFIER_RUNTIME_CODE);
+    assert_eq!(provider.get_transaction_count(RECENT_ROOT_ADDRESS).await.unwrap(), 0);
     let activated_state_root = api.state_root().await.unwrap();
 
     api.anvil_set_code(EXPIRY_VERIFIER_ADDRESS, Bytes::new()).await.unwrap();
@@ -310,6 +306,112 @@ async fn frame_profile_is_inactive_by_default() {
     sign_entry(&mut tx, 0, &wallet);
     let err = provider.send_raw_transaction(&tx.encoded_2718()).await.unwrap_err().to_string();
     assert!(err.contains("--enable-frame-transactions"), "unexpected error: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_keyed_nonces_charge_first_use_and_preserve_the_legacy_nonce() {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap();
+    let sender = wallet.address();
+    let writer = deploy(&provider, sender, STORAGE_WRITER_INITCODE).await;
+    let reverter = deploy(&provider, sender, REVERTER_INITCODE).await;
+    let legacy_nonce = provider.get_transaction_count(sender).await.unwrap();
+    let keys = vec![U256::from(5u64), U256::from(1u64) << 200];
+
+    // First use charges state gas for each key; reuse has no state allocation charge.
+    for sequence in 0..=1 {
+        let fees = provider.estimate_eip1559_fees().await.unwrap();
+        let mut tx = frame_tx(
+            sender,
+            sequence,
+            &[(writer, 0)],
+            fees.max_fee_per_gas,
+            fees.max_priority_fee_per_gas,
+        );
+        tx.envelope = FrameEnvelope::Keyed;
+        tx.nonce_keys = keys.clone();
+        let state_charge = if sequence == 0 { 2 * gas::KEYED_NONCE_FIRST_USE_STATE_GAS } else { 0 };
+        tx.frames[0].state_gas_limit = state_charge;
+        sign_entry(&mut tx, 0, &wallet);
+        let hash = submit_and_mine(&api, &provider, &tx).await;
+        assert_eq!(hash, tx.hash_slow());
+        let receipt =
+            provider.get_transaction_receipt(hash).await.unwrap().expect("keyed transaction mined");
+        assert!(receipt.status());
+        let frames = receipt
+            .0
+            .other
+            .get_deserialized::<Vec<FrameReceipt<alloy_rpc_types::Log>>>("frameReceipts")
+            .transpose()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frames[0].state_gas_used, state_charge);
+        assert_eq!(provider.get_transaction_count(sender).await.unwrap(), legacy_nonce);
+        for key in &keys {
+            assert_eq!(
+                provider
+                    .get_storage_at(NONCE_MANAGER_ADDRESS, keyed_nonce_slot(sender, *key).into())
+                    .await
+                    .unwrap(),
+                U256::from(sequence + 1)
+            );
+        }
+        assert!(wrote_magic(&provider, writer).await);
+    }
+
+    // A later atomic batch failure rolls back its body but keeps consumed keys.
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut rejected_body = frame_tx(
+        sender,
+        2,
+        &[(writer, flags::ATOMIC_BATCH), (reverter, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    rejected_body.envelope = FrameEnvelope::Keyed;
+    rejected_body.nonce_keys = keys.clone();
+    rejected_body.frames[1].data = U256::from(MAGIC + 1).to_be_bytes::<32>().into();
+    sign_entry(&mut rejected_body, 0, &wallet);
+    let hash = submit_and_mine(&api, &provider, &rejected_body).await;
+    let receipt = provider.get_transaction_receipt(hash).await.unwrap().unwrap();
+    // A valid FrameTx receipt is successful even when an execution frame fails.
+    assert!(receipt.status());
+    let frames = receipt
+        .0
+        .other
+        .get_deserialized::<Vec<FrameReceipt<alloy_rpc_types::Log>>>("frameReceipts")
+        .transpose()
+        .unwrap()
+        .unwrap();
+    assert_eq!(frames.iter().map(|frame| frame.status).collect::<Vec<_>>(), [1, 1, 0]);
+    for key in &keys {
+        assert_eq!(
+            provider
+                .get_storage_at(NONCE_MANAGER_ADDRESS, keyed_nonce_slot(sender, *key).into())
+                .await
+                .unwrap(),
+            U256::from(3u64)
+        );
+    }
+    assert_eq!(provider.get_transaction_count(sender).await.unwrap(), legacy_nonce);
+    assert!(wrote_magic(&provider, writer).await, "failed batch left a storage change");
+
+    // The zero key aliases the actual account nonce even in the new wire layout.
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = frame_tx(
+        sender,
+        legacy_nonce,
+        &[(writer, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    tx.envelope = FrameEnvelope::Keyed;
+    tx.nonce_keys = vec![U256::ZERO];
+    sign_entry(&mut tx, 0, &wallet);
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    assert!(provider.get_transaction_receipt(hash).await.unwrap().unwrap().status());
+    assert_eq!(provider.get_transaction_count(sender).await.unwrap(), legacy_nonce + 1);
 }
 
 /// Runs one custom-code frame whose target and declared sender are the same funded contract.
@@ -348,6 +450,7 @@ async fn run_contract_approval_frame(
         max_fee_per_gas: U256::from(fees.max_fee_per_gas),
         max_fee_per_blob_gas: U256::ZERO,
         blob_versioned_hashes: vec![],
+        ..Default::default()
     };
     let max_gas = tx.max_gas();
     let hash = submit_and_mine(&api, &provider, &tx).await;
@@ -709,46 +812,6 @@ async fn multisig_owner_reuses_its_execution_signature_to_pay_via_default_eoa_co
         "paying through default EOA code must not consume the owner's account nonce"
     );
     assert!(wrote_magic(&provider, writer).await, "multisig-authorized SENDER frame did not run");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn eip7851_delegation_remains_active_for_frame_transactions() {
-    let config = frame_node_config()
-        .with_hardfork(Some(EthereumHardfork::Prague.into()))
-        .enable_eip7851(true);
-    let (api, handle) = spawn(config).await;
-    let provider = http_provider(&handle.http_endpoint());
-    let wallet = handle.dev_wallets().next().unwrap();
-    let sender = wallet.address();
-    let approver = deploy(&provider, sender, APPROVER_INITCODE).await;
-    let writer = deploy(&provider, sender, STORAGE_WRITER_INITCODE).await;
-    let authority = Address::repeat_byte(0x42);
-
-    // The sender's delegated VERIFY frame approves payment and execution. The delegated SENDER
-    // target then writes in the authority's storage context.
-    api.anvil_set_code(sender, eip7851_designation(approver)).await.unwrap();
-    api.anvil_set_code(authority, eip7851_designation(writer)).await.unwrap();
-
-    let nonce = provider.get_transaction_count(sender).await.unwrap();
-    let fees = provider.estimate_eip1559_fees().await.unwrap();
-    let mut tx = frame_tx(
-        sender,
-        nonce,
-        &[(authority, 0)],
-        fees.max_fee_per_gas,
-        fees.max_priority_fee_per_gas,
-    );
-    sign_entry(&mut tx, 0, &wallet);
-
-    let hash = submit_and_mine(&api, &provider, &tx).await;
-    let receipt = provider
-        .get_transaction_receipt(hash)
-        .await
-        .unwrap()
-        .expect("Frame transaction from EIP-7851 authority was not mined");
-    assert!(receipt.status(), "Frame transaction from EIP-7851 authority reverted");
-    assert!(wrote_magic(&provider, authority).await, "delegated Frame target did not execute");
-    assert_eq!(provider.get_storage_at(writer, U256::ZERO).await.unwrap(), U256::ZERO);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1329,6 +1392,128 @@ async fn run_sponsored_payment(displace_sponsor_signature: bool) -> (bool, bool,
         );
     }
     (mined, wrote_magic(&provider, writer).await, sponsor)
+}
+
+/// Deploys `60015f5faa`: `APPROVE(APPROVE_PAYMENT)` for whoever the sender is,
+/// with no signature check, no storage read and no external call -- the shape of
+/// an open, code-bearing gas sponsor (the `pay` frame targets a contract, not a
+/// default-code EOA). The same contract, written in Yul, is what the ethrex
+/// Hegotá devnet uses to demonstrate sponsorship through its public mempool.
+const OPEN_SPONSOR_INITCODE: Bytes = bytes!("6460015f5faa5f526005601bf3");
+
+/// The canonical-paymaster prefix `[only_verify, pay]` with a *contract* payer:
+/// the sender's default code approves execution from its own signature, the
+/// sponsor contract's code approves payment, and the SENDER frame then runs with
+/// the sponsor -- not the sender -- named as payer and charged. Only the sender
+/// signs; the sponsor needs no envelope entry because its code is the policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_pay_frame_sponsors_a_zero_balance_sender() {
+    run_contract_sponsorship(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_pay_frame_consumes_keyed_nonces_without_creating_the_sender() {
+    run_contract_sponsorship(true).await;
+}
+
+async fn run_contract_sponsorship(keyed: bool) {
+    let (api, handle) = spawn(frame_node_config()).await;
+    let provider = http_provider(&handle.http_endpoint());
+    let mut wallets = handle.dev_wallets();
+    let wallet = wallets.next().unwrap();
+    let deployer = wallets.next().unwrap().address();
+    let sender = wallet.address();
+    let writer = deploy(&provider, deployer, STORAGE_WRITER_INITCODE).await;
+    let sponsor_funding = U256::from(10u64).pow(U256::from(18u64));
+    let sponsor =
+        deploy_with_value(&provider, deployer, OPEN_SPONSOR_INITCODE, sponsor_funding).await;
+    api.anvil_set_balance(sender, U256::ZERO).await.unwrap();
+
+    let nonce = provider.get_transaction_count(sender).await.unwrap();
+    let fees = provider.estimate_eip1559_fees().await.unwrap();
+    let mut tx = frame_tx(
+        sender,
+        nonce,
+        &[(writer, 0)],
+        fees.max_fee_per_gas,
+        fees.max_priority_fee_per_gas,
+    );
+    if keyed {
+        tx.envelope = FrameEnvelope::Keyed;
+        tx.nonce_keys = vec![U256::from(5u64)];
+    }
+    let state_charge =
+        if keyed { gas::KEYED_NONCE_FIRST_USE_STATE_GAS } else { gas::NEW_ACCOUNT_STATE_GAS };
+    // only_verify: the sender's default code approves execution from signature 0.
+    tx.frames[0].flags = flags::APPROVE_EXECUTION;
+    // pay: the sponsor contract approves payment. Its calldata is irrelevant to
+    // this runtime, but it is still committed by the sender's signature. The
+    // sender has never transacted and holds nothing, so it does not exist under
+    // EIP-8037: approving payment increments its nonce, which creates the
+    // account, and that charge comes out of the *approving* frame's state
+    // budget. Without it the pay frame halts and the transaction is invalid.
+    tx.frames.insert(
+        1,
+        Frame {
+            mode: mode::VERIFY,
+            flags: flags::APPROVE_PAYMENT,
+            target: Some(sponsor),
+            gas_limit: 40_000,
+            state_gas_limit: state_charge,
+            value: U256::ZERO,
+            data: Bytes::new(),
+        },
+    );
+    sign_entry(&mut tx, 0, &wallet);
+
+    let hash = submit_and_mine(&api, &provider, &tx).await;
+    let receipt = provider
+        .get_transaction_receipt(hash)
+        .await
+        .unwrap()
+        .expect("contract-sponsored frame transaction was not mined");
+    assert!(receipt.status(), "frame transaction reverted");
+    let payer = receipt
+        .0
+        .other
+        .get_deserialized::<Address>("payer")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has payer");
+    assert_eq!(payer, sponsor, "the sponsor contract was not recorded as payer");
+    let frame_receipts = receipt
+        .0
+        .other
+        .get_deserialized::<Vec<FrameReceipt<alloy_rpc_types::Log>>>("frameReceipts")
+        .transpose()
+        .unwrap()
+        .expect("frame receipt has nested receipts");
+    assert_eq!(frame_receipts.iter().map(|frame| frame.status).collect::<Vec<_>>(), [1, 1, 1]);
+    // The sponsor pays for the keyed slot or legacy account creation.
+    assert_eq!(frame_receipts[1].state_gas_used, state_charge);
+    assert_eq!(provider.get_transaction_count(sender).await.unwrap(), if keyed { 0 } else { 1 });
+    if keyed {
+        assert_eq!(
+            provider
+                .get_storage_at(
+                    NONCE_MANAGER_ADDRESS,
+                    keyed_nonce_slot(sender, U256::from(5u64)).into()
+                )
+                .await
+                .unwrap(),
+            U256::from(1u64)
+        );
+    }
+    assert!(wrote_magic(&provider, writer).await, "the SENDER frame did not run");
+    assert_eq!(
+        provider.get_balance(sender).await.unwrap(),
+        U256::ZERO,
+        "the gas-less sender was charged"
+    );
+    assert!(
+        provider.get_balance(sponsor).await.unwrap() < sponsor_funding,
+        "the sponsor was named payer but paid nothing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

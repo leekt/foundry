@@ -372,7 +372,6 @@ impl FoundryEvmFactory for MonadEvmFactory {
         mut evm_env: EvmEnv<Self::Spec, Self::BlockEnv>,
         chain_context: Self::Chain,
     ) -> Self::Evm<DB, revm::inspector::NoOpInspector> {
-        evm_env.cfg_env.enable_eip7851 = false;
         evm_env.cfg_env.enable_eip8151 = false;
         let mut evm = self.create_evm(db, evm_env);
         evm.ctx_mut().chain = chain_context;
@@ -386,7 +385,6 @@ impl FoundryEvmFactory for MonadEvmFactory {
         chain_context: Self::Chain,
         inspector: I,
     ) -> Self::FoundryEvm<'db, I> {
-        evm_env.cfg_env.enable_eip7851 = false;
         evm_env.cfg_env.enable_eip8151 = false;
         let mut monad_evm = self.create_evm_with_inspector(db, evm_env, inspector);
         monad_evm.ctx_mut().chain = chain_context;

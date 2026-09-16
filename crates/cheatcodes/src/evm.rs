@@ -686,6 +686,7 @@ impl Cheatcode for setFrameTxCall {
             gas_payer: frameTx.trace.gasPayer,
         };
         revm::interpreter::instructions::frame_tx::set_frame_tx_context(Some(FrameTxContext {
+            legacy_nonce: frameTx.nonce,
             sender: frameTx.sender,
             nonce: frameTx.nonce,
             sig_hash: frameTx.sigHash,

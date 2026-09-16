@@ -18,7 +18,8 @@ use alloy_consensus::Transaction as _;
 use alloy_evm::{Evm, eth::EthEvm};
 use alloy_primitives::{Address, B256, Log, TxKind, U256};
 use foundry_primitives::{
-    ENTRY_POINT_ADDRESS, Frame, FrameReceipt, TxFrame, flags, frame_gas, mode,
+    ENTRY_POINT_ADDRESS, Frame, FrameReceipt, NONCE_MANAGER_ADDRESS, TxFrame, flags, frame_gas,
+    keyed_nonce_slot, mode,
 };
 #[cfg(test)]
 use foundry_primitives::{EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE};
@@ -102,6 +103,17 @@ pub enum FrameExecutionError {
         /// Account whose balance could not be credited.
         address: Address,
     },
+    /// An EIP-8250 keyed nonce did not match its `NONCE_MANAGER` sequence.
+    #[error("keyed nonce {key} mismatch: tx {tx}, state {state}")]
+    KeyedNonceMismatch {
+        /// The selected nonce key.
+        key: U256,
+        /// `nonce_seq` declared by the transaction.
+        tx: u64,
+        /// Sequence currently stored for the key.
+        state: U256,
+    },
+
     /// The EVM itself failed, which is not a frame-level failure.
     #[error("frame {index} could not be executed: {message}")]
     Evm {
@@ -125,6 +137,12 @@ pub(crate) struct FrameTxOutcome<H> {
     pub gas_used: u64,
     /// Final state-gas component of [`Self::gas_used`].
     pub state_gas_used: u64,
+    /// Gas counted toward the block: the execution dimension *before* the
+    /// storage refund (EIP-7778, required by EIP-8141) plus final state gas.
+    ///
+    /// The refund lowers what the payer is charged ([`Self::gas_used`]) but does
+    /// not free the block capacity the transaction occupied.
+    pub block_gas_used: u64,
     /// The account that paid, established by an `APPROVE` of payment.
     pub payer: Address,
     /// Consensus receipts for every frame, in frame order.
@@ -152,19 +170,28 @@ pub trait SuspendFeeRules {
     fn is_frame_transaction_precompile(&self, address: Address) -> bool;
     /// Reads an account from the live outer frame journal without warming it.
     fn frame_transaction_account_info(&mut self, address: Address) -> Result<AccountInfo, String>;
+    /// Reads a storage slot from the live outer frame journal without warming it.
+    fn frame_transaction_storage(&mut self, address: Address, slot: U256) -> Result<U256, String>;
     /// Opens a journal checkpoint around a multi-frame atomic batch.
     fn frame_transaction_checkpoint(&mut self) -> JournalCheckpoint;
     /// Commits the latest atomic-batch checkpoint.
     fn frame_transaction_checkpoint_commit(&mut self);
     /// Reverts an atomic batch to its checkpoint.
     fn frame_transaction_checkpoint_revert(&mut self, checkpoint: JournalCheckpoint);
-    /// Applies the default-code payment precharge and sender nonce bump in the journal.
+    /// Applies the default-code payment precharge and nonce consumption in the
+    /// journal (EIP-8141 `APPROVE` payment effects, with EIP-8250
+    /// `consume_nonce_set`). Returns the EIP-8250 first-use surcharge charged to
+    /// the frame, or `None` when payment could not be approved -- including when
+    /// the surcharge exceeds `gas_available`.
     fn apply_default_payment_approval(
         &mut self,
         payer: Address,
         sender: Address,
         max_cost: U256,
-    ) -> Result<bool, String>;
+        nonce_keys: &[U256],
+        nonce_seq: u64,
+        gas_available: u64,
+    ) -> Result<Option<u64>, String>;
     /// Credits an account through journaled balance mutation.
     fn credit_frame_transaction_account(
         &mut self,
@@ -179,6 +206,7 @@ pub trait SuspendFeeRules {
 
 /// Inspector operations required by the frame executor.
 pub(crate) trait FrameTransactionInspector {
+    #[allow(clippy::too_many_arguments)]
     fn watch_frame_approval(
         &mut self,
         resolved_target: Address,
@@ -186,6 +214,9 @@ pub(crate) trait FrameTransactionInspector {
         allowed_scope: u64,
         max_cost: U256,
         state: ApprovalState,
+        nonce_keys: Vec<U256>,
+        nonce_seq: u64,
+        state_gas_limit: u64,
     );
     fn take_frame_approval(&mut self) -> Option<FrameApprovalOutcome>;
     fn begin_frame_transaction_trace(&mut self, sender: Address, gas_limit: u64);
@@ -200,6 +231,9 @@ impl FrameTransactionInspector for AnvilInspector {
         allowed_scope: u64,
         max_cost: U256,
         state: ApprovalState,
+        nonce_keys: Vec<U256>,
+        nonce_seq: u64,
+        state_gas_limit: u64,
     ) {
         AnvilInspector::watch_frame_approval(
             self,
@@ -208,6 +242,9 @@ impl FrameTransactionInspector for AnvilInspector {
             allowed_scope,
             max_cost,
             state,
+            nonce_keys,
+            nonce_seq,
+            state_gas_limit,
         );
     }
 
@@ -232,8 +269,20 @@ impl<I> FrameTransactionInspector for (AnvilInspector, I) {
         allowed_scope: u64,
         max_cost: U256,
         state: ApprovalState,
+        nonce_keys: Vec<U256>,
+        nonce_seq: u64,
+        state_gas_limit: u64,
     ) {
-        self.0.watch_frame_approval(resolved_target, sender, allowed_scope, max_cost, state);
+        self.0.watch_frame_approval(
+            resolved_target,
+            sender,
+            allowed_scope,
+            max_cost,
+            state,
+            nonce_keys,
+            nonce_seq,
+            state_gas_limit,
+        );
     }
 
     fn take_frame_approval(&mut self) -> Option<FrameApprovalOutcome> {
@@ -257,6 +306,9 @@ impl<I: 'static> FrameTransactionInspector for FrameInspector<'_, I> {
         allowed_scope: u64,
         max_cost: U256,
         state: ApprovalState,
+        nonce_keys: Vec<U256>,
+        nonce_seq: u64,
+        state_gas_limit: u64,
     ) {
         self.approval_mut().watch_frame_approval(
             resolved_target,
@@ -264,6 +316,9 @@ impl<I: 'static> FrameTransactionInspector for FrameInspector<'_, I> {
             allowed_scope,
             max_cost,
             state,
+            nonce_keys,
+            nonce_seq,
+            state_gas_limit,
         );
     }
 
@@ -322,6 +377,16 @@ impl<DB: alloy_evm::Database, I, P> SuspendFeeRules for EthEvm<DB, I, P> {
             })
     }
 
+    fn frame_transaction_storage(&mut self, address: Address, slot: U256) -> Result<U256, String> {
+        self.ctx_mut()
+            .journal_mut()
+            .frame_transaction_storage(address, slot)
+            .map_err(|err| err.to_string())
+            .and_then(|value| {
+                value.ok_or_else(|| "frame transaction storage lookup is unsupported".to_owned())
+            })
+    }
+
     fn frame_transaction_checkpoint(&mut self) -> JournalCheckpoint {
         self.ctx_mut().journal_mut().frame_transaction_checkpoint()
     }
@@ -339,7 +404,10 @@ impl<DB: alloy_evm::Database, I, P> SuspendFeeRules for EthEvm<DB, I, P> {
         payer: Address,
         sender: Address,
         max_cost: U256,
-    ) -> Result<bool, String> {
+        nonce_keys: &[U256],
+        nonce_seq: u64,
+        gas_available: u64,
+    ) -> Result<Option<u64>, String> {
         let payer_info = self
             .ctx_mut()
             .journal_mut()
@@ -356,17 +424,32 @@ impl<DB: alloy_evm::Database, I, P> SuspendFeeRules for EthEvm<DB, I, P> {
                 .ok_or_else(|| "frame transaction account lookup is unsupported".to_owned())?
                 .nonce
         };
-        if payer_info.balance < max_cost || sender_nonce == u64::MAX {
-            return Ok(false);
+        let keyed = uses_keyed_nonces(nonce_keys);
+        if payer_info.balance < max_cost || (!keyed && sender_nonce == u64::MAX) {
+            return Ok(None);
         }
 
-        if payer == sender {
-            let mut account = self
-                .ctx_mut()
-                .journal_mut()
-                .load_account_mut(payer)
-                .map_err(|err| err.to_string())?;
-            return Ok(account.decr_balance(max_cost) && account.bump_nonce());
+        // EIP-8250: read every selected key first; a first use is a zero read.
+        // The surcharge is checked before any approval effect is committed.
+        let mut slots = Vec::with_capacity(nonce_keys.len());
+        let mut surcharge = 0u64;
+        if keyed {
+            for key in nonce_keys {
+                let slot: U256 = keyed_nonce_slot(sender, *key).into();
+                let before = self
+                    .ctx_mut()
+                    .journal_mut()
+                    .frame_transaction_storage(NONCE_MANAGER_ADDRESS, slot)
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| "frame transaction storage lookup is unsupported".to_owned())?;
+                if before.is_zero() {
+                    surcharge += frame_gas::KEYED_NONCE_FIRST_USE_STATE_GAS;
+                }
+                slots.push(slot);
+            }
+            if surcharge > gas_available {
+                return Ok(None);
+            }
         }
 
         let debited = self
@@ -375,13 +458,32 @@ impl<DB: alloy_evm::Database, I, P> SuspendFeeRules for EthEvm<DB, I, P> {
             .load_account_mut(payer)
             .map_err(|err| err.to_string())?
             .decr_balance(max_cost);
+        if !debited {
+            return Ok(None);
+        }
+        if keyed {
+            let journal = self.ctx_mut().journal_mut();
+            for slot in slots {
+                if !journal
+                    .set_frame_transaction_storage(
+                        NONCE_MANAGER_ADDRESS,
+                        slot,
+                        U256::from(nonce_seq + 1),
+                    )
+                    .map_err(|err| err.to_string())?
+                {
+                    return Err("frame transaction storage writes are unsupported".to_owned());
+                }
+            }
+            return Ok(Some(surcharge));
+        }
         let bumped = self
             .ctx_mut()
             .journal_mut()
             .load_account_mut(sender)
             .map_err(|err| err.to_string())?
             .bump_nonce();
-        Ok(debited && bumped)
+        Ok(bumped.then_some(0))
     }
 
     fn credit_frame_transaction_account(
@@ -494,7 +596,7 @@ fn build_context(
         frame_index: frame_index as u64,
         frames,
         signatures,
-        recent_root_references: Vec::new(),
+        nonce_keys: tx.nonce_keys.clone(),
         trace: Default::default(),
         approvable_scopes: (tx.frames[frame_index].flags & flags::APPROVE_EXECUTION_PAYMENT) as u64,
         approved_scope: 0,
@@ -511,7 +613,7 @@ fn max_cost(tx: &TxFrame, blob_base_fee: U256) -> Option<U256> {
 
 /// Builds the environment for a single frame's top-level call.
 fn frame_env(tx: &TxFrame, frame: &Frame, caller: Address, caller_nonce: u64) -> TxEnv {
-    let mut tx_env = TxEnv {
+    let tx_env = TxEnv {
         // Use the closest ordinary envelope so GASPRICE and BLOBHASH see the
         // original transaction fields. TXPARAM reads the frame context instead.
         tx_type: if tx.blob_versioned_hashes.is_empty() { 2 } else { 3 },
@@ -532,7 +634,6 @@ fn frame_env(tx: &TxFrame, frame: &Frame, caller: Address, caller_nonce: u64) ->
         chain_id: tx.chain_id(),
         ..Default::default()
     };
-    tx_env.set_eip7851_sender_ecdsa_authenticated(false);
     tx_env
 }
 
@@ -569,6 +670,44 @@ where
     outcome
 }
 
+/// Whether a key set runs on `NONCE_MANAGER` rather than the account nonce.
+pub(crate) fn uses_keyed_nonces(nonce_keys: &[U256]) -> bool {
+    !(nonce_keys.is_empty() || nonce_keys == [U256::ZERO])
+}
+
+/// Validates nonce state before any frame executes.
+fn validate_stateful<E>(evm: &mut E, tx: &TxFrame) -> Result<(), FrameExecutionError>
+where
+    E: Evm<Tx = TxEnv> + SuspendFeeRules,
+{
+    let sender_nonce = evm
+        .frame_transaction_account_info(tx.sender)
+        .map_err(|message| FrameExecutionError::Evm { index: 0, message })?
+        .nonce;
+    for key in tx.wire_nonce_keys() {
+        if key.is_zero() {
+            if tx.nonce != sender_nonce {
+                return Err(FrameExecutionError::NonceMismatch {
+                    tx: tx.nonce,
+                    state: sender_nonce,
+                });
+            }
+            continue;
+        }
+        let state = evm
+            .frame_transaction_storage(
+                NONCE_MANAGER_ADDRESS,
+                keyed_nonce_slot(tx.sender, key).into(),
+            )
+            .map_err(|message| FrameExecutionError::Evm { index: 0, message })?;
+        if state != U256::from(tx.nonce) {
+            return Err(FrameExecutionError::KeyedNonceMismatch { key, tx: tx.nonce, state });
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs every frame and settles the fee. Split from [`execute_frame_tx`] so the
 /// fee rules are restored and the state is unwound on every exit, including the
 /// error paths.
@@ -580,13 +719,7 @@ where
     E: Evm<Tx = TxEnv> + SuspendFeeRules,
     E::Inspector: FrameTransactionInspector,
 {
-    let sender_nonce = evm
-        .frame_transaction_account_info(tx.sender)
-        .map_err(|message| FrameExecutionError::Evm { index: 0, message })?
-        .nonce;
-    if tx.nonce != sender_nonce {
-        return Err(FrameExecutionError::NonceMismatch { tx: tx.nonce, state: sender_nonce });
-    }
+    validate_stateful(evm, tx)?;
 
     let (standard_gas, floor_gas, max_gas) =
         tx.gas_limits().ok_or(FrameExecutionError::GasOverflow)?;
@@ -594,6 +727,10 @@ where
     let max_cost = max_cost(tx, blob_base_fee).ok_or(FrameExecutionError::MaxCostOverflow)?;
     evm.inspector_mut().begin_frame_transaction_trace(tx.sender, max_gas);
 
+    let legacy_nonce = evm
+        .frame_transaction_account_info(tx.sender)
+        .map_err(|message| FrameExecutionError::Evm { index: 0, message })?
+        .nonce;
     let mut approval = ApprovalState::default();
     let mut statuses = vec![STATUS_FAILED; tx.frames.len()];
     let mut frame_receipts = Vec::with_capacity(tx.frames.len());
@@ -668,7 +805,7 @@ where
             }
 
             let mut succeeded;
-            let gross_gas_used;
+            let mut gross_gas_used;
             let mut frame_logs;
             if halted_on_state_gas {
                 succeeded = false;
@@ -684,16 +821,21 @@ where
                     (frame.flags & flags::APPROVE_EXECUTION_PAYMENT) as u64,
                     max_cost,
                     approval,
+                    tx.wire_nonce_keys(),
+                    tx.nonce,
+                    state_gas_left,
                 );
                 let outcome = {
-                    let _frame_context = install_frame_tx_context(build_context(
+                    let mut context = build_context(
                         tx,
                         index,
                         &statuses,
                         &frame_receipts,
                         state_gas_left,
                         max_cost,
-                    ));
+                    );
+                    context.legacy_nonce = legacy_nonce;
+                    let _frame_context = install_frame_tx_context(context);
                     evm.transact_raw(frame_env(tx, frame, caller, caller_nonce))
                 };
 
@@ -702,6 +844,7 @@ where
                     .take_frame_approval()
                     .expect("frame approval watcher was installed");
                 approval = observed.state;
+                state_gas_left -= observed.state_gas_used;
 
                 // `transact_raw` has already finalized this frame call through
                 // the active REVM lifecycle. Its returned state is observational
@@ -751,17 +894,24 @@ where
                     }
                 }
 
-                if let Some(validated) = validated_approval
-                    && !apply_default_approval(
+                if let Some(validated) = validated_approval {
+                    // EIP-8250's first-use surcharge is gas used by the approving
+                    // frame; default code has only the frame's remaining budget.
+                    match apply_default_approval(
                         evm,
                         validated,
-                        tx.sender,
+                        tx,
                         max_cost,
                         &mut approval,
                         index,
-                    )?
-                {
-                    succeeded = false;
+                        state_gas_left,
+                    )? {
+                        Some(surcharge) => state_gas_left -= surcharge,
+                        None => {
+                            succeeded = false;
+                            gross_gas_used = frame.gas_limit;
+                        }
+                    }
                 }
 
                 if succeeded {
@@ -779,7 +929,12 @@ where
             // approving frame's state budget. A pool that cannot cover the
             // charge invalidates the transaction, as approval effects cannot
             // stand without the charge.
-            if succeeded && sender_missing && payer_before.is_none() && approval.payer.is_some() {
+            if succeeded
+                && !tx.uses_keyed_nonces()
+                && sender_missing
+                && payer_before.is_none()
+                && approval.payer.is_some()
+            {
                 if state_gas_left < frame_gas::NEW_ACCOUNT_STATE_GAS {
                     return Err(FrameExecutionError::StateGasExhausted { index });
                 }
@@ -864,6 +1019,13 @@ where
     let gas_used_after_refund = gas_used_before_refund.saturating_sub(applied_refund);
     let tx_execution_gas = gas_used_after_refund.saturating_sub(frame_state_total).max(floor_gas);
     let gas_used = tx_execution_gas.saturating_add(frame_state_total).min(max_gas);
+    // Block-level accounting (EIP-7778): the execution dimension is counted
+    // before the refund, so a refund never frees block capacity. The state
+    // dimension stays net, since a refill reverses a charge for state that was
+    // never durably created.
+    let block_execution_gas =
+        gas_used_before_refund.saturating_sub(frame_state_total).max(floor_gas);
+    let block_gas_used = block_execution_gas.saturating_add(frame_state_total).min(max_gas);
 
     settle_fee(evm, tx, payer, gas_used, max_cost, blob_base_fee)?;
     let (state, journal_logs) = evm.finish_frame_transaction();
@@ -900,6 +1062,7 @@ where
         result: ResultAndState { result, state },
         gas_used,
         state_gas_used: frame_state_total,
+        block_gas_used,
         payer,
         frame_receipts,
     })
@@ -1025,7 +1188,7 @@ where
                 .map_err(|message| FrameExecutionError::Evm { index, message })?
                 .nonce
         };
-        if sender_nonce == u64::MAX {
+        if !tx.uses_keyed_nonces() && sender_nonce == u64::MAX {
             return Ok(None);
         }
     }
@@ -1036,32 +1199,43 @@ where
     }))
 }
 
-/// Applies default-code approval effects to the live outer journal.
+/// Applies default-code approval effects to the live outer journal. Returns the
+/// EIP-8250 first-use gas charged to the frame, or `None` when approval failed.
 fn apply_default_approval<E>(
     evm: &mut E,
     validated: ValidatedApproval,
-    sender: Address,
+    tx: &TxFrame,
     max_cost: U256,
     approval: &mut ApprovalState,
     index: usize,
-) -> Result<bool, FrameExecutionError>
+    gas_available: u64,
+) -> Result<Option<u64>, FrameExecutionError>
 where
     E: Evm<Tx = TxEnv> + SuspendFeeRules,
 {
     let ValidatedApproval { approves_execution, payer } = validated;
+    let mut surcharge = 0;
     if let Some(payer) = payer {
-        let applied = evm
-            .apply_default_payment_approval(payer, sender, max_cost)
-            .map_err(|message| FrameExecutionError::Evm { index, message })?;
-        if !applied {
-            return Ok(false);
-        }
+        let Some(charged) = evm
+            .apply_default_payment_approval(
+                payer,
+                tx.sender,
+                max_cost,
+                &tx.wire_nonce_keys(),
+                tx.nonce,
+                gas_available,
+            )
+            .map_err(|message| FrameExecutionError::Evm { index, message })?
+        else {
+            return Ok(None);
+        };
+        surcharge = charged;
         approval.payer = Some(payer);
     }
     if approves_execution {
         approval.sender_approved = true;
     }
-    Ok(true)
+    Ok(Some(surcharge))
 }
 
 /// Refunds the payer the difference between the collected `max_cost` and the
@@ -1122,6 +1296,7 @@ mod tests {
         mem::{in_memory_db::StateRootDb, state::state_root},
     };
     use alloy_evm::{EvmEnv, block::StateDB, eth::EthEvmBuilder, precompiles::PrecompilesMap};
+    use alloy_primitives::keccak256;
     use foundry_evm::inspectors::{TracingInspector, TracingInspectorConfig};
     use revm::{
         Database as _, DatabaseCommit, Inspector,
@@ -1151,18 +1326,6 @@ mod tests {
         EthEvmBuilder::new(db, EvmEnv::default())
             .activate_inspector(AnvilInspector::default())
             .build()
-    }
-
-    #[test]
-    fn frame_execution_preserves_eip7851() {
-        let mut evm = test_evm([]);
-        evm.ctx_mut().cfg.enable_eip7851 = true;
-
-        let saved = evm.suspend_fee_rules(true);
-        assert!(evm.ctx().cfg.enable_eip7851);
-
-        evm.restore_fee_rules(saved);
-        assert!(evm.ctx().cfg.enable_eip7851);
     }
 
     fn state_root_evm(
@@ -1492,6 +1655,72 @@ mod tests {
         assert!(!evm.is_frame_transaction_active());
         assert!(evm.ctx().journal().evm_state().is_empty());
         assert!(evm.ctx().journal().logs().is_empty());
+    }
+
+    #[test]
+    fn keyed_approval_charges_state_once_and_preserves_legacy_nonce() {
+        let sender = Address::repeat_byte(0x68);
+        let mut evm = test_evm([(
+            sender,
+            U256::MAX,
+            u64::MAX,
+            approver_code(flags::APPROVE_EXECUTION_PAYMENT, false),
+        )]);
+        let mut frame = approval_frame(sender, mode::VERIFY, flags::APPROVE_EXECUTION_PAYMENT, 0);
+        frame.state_gas_limit = 2 * frame_gas::KEYED_NONCE_FIRST_USE_STATE_GAS;
+        let mut tx = approval_tx(sender, 0, evm.chain_id(), vec![frame]);
+        tx.envelope = foundry_primitives::FrameEnvelope::Keyed;
+        tx.nonce_keys = vec![U256::from(7), U256::from(9)];
+        let outcome = execute_and_commit(&mut evm, &tx).unwrap();
+        assert_eq!(outcome.frame_receipts[0].state_gas_used, 195_840);
+        assert!(outcome.frame_receipts[0].execution_gas_used < 20_000);
+        assert_eq!(evm.db_mut().basic(sender).unwrap().unwrap().nonce, u64::MAX);
+        for key in &tx.nonce_keys {
+            assert_eq!(
+                evm.db_mut()
+                    .storage(NONCE_MANAGER_ADDRESS, keyed_nonce_slot(sender, *key).into())
+                    .unwrap(),
+                U256::from(1)
+            );
+        }
+        tx.nonce = 1;
+        tx.frames[0].state_gas_limit = 0;
+        let second = execute_and_commit(&mut evm, &tx).unwrap();
+        assert_eq!(second.state_gas_used, 0);
+        assert_eq!(
+            second.frame_receipts[0].execution_gas_used,
+            outcome.frame_receipts[0].execution_gas_used
+        );
+    }
+
+    #[test]
+    fn keyed_approval_state_budget_failure_discards_nonce_and_payment() {
+        let sender = Address::repeat_byte(0x69);
+        let initial_balance = U256::from(1_000_000_000u64);
+        let mut evm = test_evm([(
+            sender,
+            initial_balance,
+            8,
+            approver_code(flags::APPROVE_EXECUTION_PAYMENT, false),
+        )]);
+        let mut frame = approval_frame(sender, mode::VERIFY, flags::APPROVE_EXECUTION_PAYMENT, 0);
+        frame.state_gas_limit = frame_gas::KEYED_NONCE_FIRST_USE_STATE_GAS - 1;
+        let mut tx = approval_tx(sender, 0, evm.chain_id(), vec![frame]);
+        tx.envelope = foundry_primitives::FrameEnvelope::Keyed;
+        tx.nonce_keys = vec![U256::from(7)];
+        assert!(matches!(
+            execute_frame_tx(&mut evm, &tx),
+            Err(FrameExecutionError::VerifyFailed { index: 0 })
+        ));
+        assert_eq!(
+            evm.db_mut()
+                .storage(NONCE_MANAGER_ADDRESS, keyed_nonce_slot(sender, U256::from(7)).into())
+                .unwrap(),
+            U256::ZERO
+        );
+        let account = evm.db_mut().basic(sender).unwrap().unwrap();
+        assert_eq!(account.balance, initial_balance);
+        assert_eq!(account.nonce, 8);
     }
 
     #[test]
@@ -2111,6 +2340,16 @@ mod tests {
 
         assert_eq!(outcome.result.result.gas().inner_refunded(), 2_800);
         assert_eq!(evm.db_mut().storage(writer, U256::ZERO).unwrap(), U256::ONE);
+        // EIP-7778: the refund lowers the payer's charge but never frees block
+        // capacity, so the block counts the pre-refund total (no state gas here).
+        let gas = outcome.result.result.gas();
+        assert_eq!(outcome.block_gas_used, gas.total_gas_spent());
+        assert!(
+            outcome.gas_used < outcome.block_gas_used,
+            "payer charge {} should be below the block count {}",
+            outcome.gas_used,
+            outcome.block_gas_used
+        );
     }
 
     #[test]

@@ -21,7 +21,6 @@ use crate::{
                 FrameReceiptData, PoolTransactionHooks, PoolTxGasConfig,
                 apply_ethereum_post_execution_changes, apply_ethereum_pre_execution_changes,
                 build_tx_env_for_pending, execute_pool_transaction, execute_pool_transactions,
-                is_eip7851_sender_ecdsa_authenticated,
             },
             fork::{ClientFork, ForkEndpointIdentity},
             genesis::GenesisConfig,
@@ -153,7 +152,7 @@ use foundry_primitives::get_deposit_tx_parts;
 use foundry_primitives::{
     EXPIRY_VERIFIER_ADDRESS, EXPIRY_VERIFIER_RUNTIME_CODE, FRAME_TX_TYPE_ID, FoundryHeader,
     FoundryNetwork, FoundryReceiptEnvelope, FoundryTransactionRequest, FoundryTxEnvelope,
-    FoundryTxReceipt, TempoTransactionRequest, TxFrame,
+    FoundryTxReceipt, NONCE_MANAGER_ADDRESS, NONCE_MANAGER_CODE, TempoTransactionRequest, TxFrame,
 };
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 #[cfg(feature = "optimism")]
@@ -234,7 +233,6 @@ struct OpCallDepositInfo;
 
 /// Removes experimental EIPs that are supported only by the canonical Ethereum profile.
 const fn without_ethereum_experimental_eips<S>(mut cfg: CfgEnv<S>) -> CfgEnv<S> {
-    cfg.enable_eip7851 = false;
     cfg.enable_eip8151 = false;
     cfg
 }
@@ -527,6 +525,18 @@ const fn next_monad_context(_context: &mut MonadReplayContext) -> MonadExecution
 const fn noop_before_transaction<E, T>(_evm: &mut E, _tx: &T) {}
 
 const fn noop_on_execution_error<E>(_evm: &mut E) {}
+
+/// Installs the local development profile's EIP-8141 expiry verifier and
+/// EIP-8250 nonce manager. Balances and stored nonce sequences are preserved.
+/// This opt-in overlay does not model a network's activation boundary or its
+/// reserved-address collision audit. EIP-8272's canonical code remains TBD.
+fn install_frame_transaction_predeploys(db: &mut dyn Db) -> Result<(), DatabaseError> {
+    db.set_code(EXPIRY_VERIFIER_ADDRESS, Bytes::from_static(EXPIRY_VERIFIER_RUNTIME_CODE))?;
+    db.set_code(NONCE_MANAGER_ADDRESS, Bytes::from_static(NONCE_MANAGER_CODE))?;
+    let nonce = db.basic_ref(NONCE_MANAGER_ADDRESS)?.map_or(0, |account| account.nonce).max(1);
+    db.set_nonce(NONCE_MANAGER_ADDRESS, nonce)?;
+    Ok(())
+}
 
 /// Maximum cumulative gas available to one `eth_simulateV1` request.
 const SIMULATE_GAS_CAP: u64 = 50_000_000;
@@ -1590,10 +1600,7 @@ impl<N: Network> Backend<N> {
         {
             return Ok(());
         }
-        self.db
-            .write()
-            .await
-            .set_code(EXPIRY_VERIFIER_ADDRESS, Bytes::from_static(EXPIRY_VERIFIER_RUNTIME_CODE))
+        install_frame_transaction_predeploys(&mut **self.db.write().await)
     }
 
     /// Returns an error if op-stack deposits are not active
@@ -2940,6 +2947,7 @@ impl<N: Network> Backend<N> {
                                 frame_receipt: Some(FrameReceiptData {
                                     gas_used: outcome.gas_used,
                                     state_gas_used: outcome.state_gas_used,
+                                    block_gas_used: outcome.block_gas_used,
                                     payer: outcome.payer,
                                     frame_receipts: outcome.frame_receipts,
                                 }),
@@ -3081,7 +3089,6 @@ impl<N: Network> Backend<N> {
             blob_hashes,
             ..Default::default()
         };
-        tx_env.set_eip7851_sender_ecdsa_authenticated(false);
         tx_env.set_signed_authorization(authorization_list.unwrap_or_default());
 
         if let Some(nonce) = nonce {
@@ -4481,7 +4488,7 @@ impl<N: Network> Backend<N> {
 
         genesis.apply_genesis_json_alloc(db)?;
         if is_ethereum && enable_frame_transactions && SpecId::from(hardfork) < SpecId::AMSTERDAM {
-            db.set_code(EXPIRY_VERIFIER_ADDRESS, Bytes::from_static(EXPIRY_VERIFIER_RUNTIME_CODE))?;
+            install_frame_transaction_predeploys(db)?;
         }
         for (&address, &balance) in funded_accounts {
             let mut info = db.basic_ref(address)?.unwrap_or_default();
@@ -4663,10 +4670,7 @@ impl<N: Network> Backend<N> {
                 && matches!(staged_config.get_hardfork(), FoundryHardfork::Ethereum(_))
                 && SpecId::from(staged_config.get_hardfork()) < SpecId::AMSTERDAM
             {
-                staged_db.write().await.set_code(
-                    EXPIRY_VERIFIER_ADDRESS,
-                    Bytes::from_static(EXPIRY_VERIFIER_RUNTIME_CODE),
-                )?;
+                install_frame_transaction_predeploys(&mut **staged_db.write().await)?;
             }
 
             #[cfg(feature = "monad")]
@@ -4887,10 +4891,6 @@ impl<N: Network> Backend<N> {
         staged_cfg.limit_contract_code_size = staged_config.code_size_limit;
         staged_cfg.disable_eip3607 = true;
         staged_cfg.disable_block_gas_limit = staged_config.disable_block_gas_limit;
-        staged_cfg.enable_eip7819 = staged_config.enable_eip7819;
-        staged_cfg.enable_eip7851 = staged_config.enable_eip7851
-            && staged_config.networks.execution_network().is_ethereum()
-            && !staged_config.networks.is_celo();
         staged_cfg.enable_eip8151 = staged_config.enable_eip8151
             && staged_config.networks.execution_network().is_ethereum()
             && !staged_config.networks.is_celo();
@@ -9044,24 +9044,6 @@ where
         let account = self.get_account(address).await?;
         let evm_env = self.next_evm_env();
 
-        // EIP-7851 disables only protocol-level ECDSA authority. Frame, deposit, Tempo AA, and
-        // impersonated transactions have different authentication paths and must remain eligible.
-        if evm_env.cfg_env.enable_eip7851
-            && evm_env.cfg_env.spec >= SpecId::PRAGUE
-            && is_eip7851_sender_ecdsa_authenticated(tx)
-        {
-            let code = if let Some(code) = &account.code {
-                code.original_bytes()
-            } else if account.code_hash != KECCAK_EMPTY {
-                self.db.read().await.code_by_hash_ref(account.code_hash)?.original_bytes()
-            } else {
-                Bytes::new()
-            };
-            if code.len() == 23 && code.starts_with(&[0xef, 0x01, 0x01]) {
-                return Err(InvalidTransactionError::SenderNoEOA.into());
-            }
-        }
-
         // Tempo AA: validate time bounds and fee token balance (async checks)
         if let FoundryTxEnvelope::Tempo(aa_tx) = tx.transaction.as_ref() {
             let tempo_tx = aa_tx.tx();
@@ -9167,8 +9149,11 @@ where
         #[cfg(not(feature = "optimism"))]
         let is_deposit_tx = false;
         let is_tempo_tx = pending.transaction.as_ref().is_tempo();
+        // An EIP-8250 frame transaction on non-zero keys runs its own sequence in
+        // NONCE_MANAGER; `nonce()` is that sequence, not the account nonce.
+        let is_keyed_frame_tx = is_keyed_frame_transaction(tx.as_ref());
         let nonce = tx.nonce();
-        if nonce < account.nonce && !is_deposit_tx && !is_tempo_tx {
+        if nonce < account.nonce && !is_deposit_tx && !is_tempo_tx && !is_keyed_frame_tx {
             debug!(target: "backend", "[{:?}] nonce too low", tx.hash());
             return Err(InvalidTransactionError::NonceTooLow);
         }
@@ -9352,11 +9337,17 @@ where
         evm_env: &EvmEnv,
     ) -> Result<(), InvalidTransactionError> {
         self.validate_pool_transaction_for(tx, account, evm_env)?;
-        if tx.nonce() > account.nonce {
+        if tx.nonce() > account.nonce && !is_keyed_frame_transaction(tx.transaction.as_ref()) {
             return Err(InvalidTransactionError::NonceTooHigh);
         }
         Ok(())
     }
+}
+
+/// Whether `tx` is an EIP-8250 frame transaction whose replay protection runs
+/// on `NONCE_MANAGER` keys rather than the sender's account nonce.
+pub(crate) fn is_keyed_frame_transaction(tx: &FoundryTxEnvelope) -> bool {
+    tx.as_frame().is_some_and(TxFrame::uses_keyed_nonces)
 }
 
 /// Replaces the cached hash of a [`Signed`] transaction, preserving the inner tx and signature.

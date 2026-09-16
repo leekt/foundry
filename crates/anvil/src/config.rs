@@ -162,11 +162,6 @@ pub struct NodeConfig {
     pub disable_block_gas_limit: bool,
     /// If set to `true`, enables the tx gas limit as imposed by Osaka (EIP-7825)
     pub enable_tx_gas_limit: bool,
-    /// Enables the experimental EIP-7819 SETDELEGATE instruction.
-    pub enable_eip7819: bool,
-    /// Enables the experimental EIP-7851 SETSELFDELEGATE instruction on the canonical Ethereum
-    /// execution profile using toolkit-local opcode 0xf7 while upstream remains TBD.
-    pub enable_eip7851: bool,
     /// Enables experimental EIP-8151 account-code restricted ECRecover on the canonical Ethereum
     /// execution profile.
     pub enable_eip8151: bool,
@@ -569,8 +564,6 @@ impl Default for NodeConfig {
             gas_limit: None,
             disable_block_gas_limit: false,
             enable_tx_gas_limit: false,
-            enable_eip7819: false,
-            enable_eip7851: false,
             enable_eip8151: false,
             enable_frame_transactions: false,
             gas_price: None,
@@ -814,38 +807,11 @@ impl NodeConfig {
         self
     }
 
-    /// Enables the experimental EIP-7819 SETDELEGATE instruction.
-    #[must_use]
-    pub const fn enable_eip7819(mut self, enabled: bool) -> Self {
-        self.enable_eip7819 = enabled;
-        self
-    }
-
-    /// Enables experimental EIP-7851 SETSELFDELEGATE using toolkit-local opcode 0xf7.
-    #[must_use]
-    pub const fn enable_eip7851(mut self, enabled: bool) -> Self {
-        self.enable_eip7851 = enabled;
-        self
-    }
-
     /// Enables experimental EIP-8151 account-code restricted ECRecover.
     #[must_use]
     pub const fn enable_eip8151(mut self, enabled: bool) -> Self {
         self.enable_eip8151 = enabled;
         self
-    }
-
-    /// Rejects EIP-7851 outside the canonical Ethereum execution profile.
-    pub(crate) fn validate_eip7851_profile(&self) -> eyre::Result<()> {
-        let ethereum_profile =
-            self.networks.execution_network().is_ethereum() && !self.networks.is_celo();
-        if self.enable_eip7851 && !ethereum_profile {
-            eyre::bail!(
-                "EIP-7851 is only supported by the canonical Ethereum execution profile; active profile is `{}`",
-                self.networks.execution_profile_name()
-            );
-        }
-        Ok(())
     }
 
     /// Rejects EIP-8151 outside the canonical Ethereum execution profile.
@@ -1377,7 +1343,6 @@ impl NodeConfig {
     {
         // configure the revm environment
 
-        self.validate_eip7851_profile()?;
         self.validate_eip8151_profile()?;
 
         let mut cfg = CfgEnv::default();
@@ -1390,7 +1355,6 @@ impl NodeConfig {
         // caller is a contract. So we disable the check by default.
         cfg.disable_eip3607 = true;
         cfg.disable_block_gas_limit = self.disable_block_gas_limit;
-        cfg.enable_eip7819 = self.enable_eip7819;
 
         if !self.enable_tx_gas_limit {
             cfg.tx_gas_limit_cap = Some(u64::MAX);
@@ -1442,9 +1406,7 @@ impl NodeConfig {
 
         // Fork discovery can resolve an initially unspecified network to a custom execution
         // profile. Enable Ethereum-only experimental EIPs after that profile is final.
-        self.validate_eip7851_profile()?;
         self.validate_eip8151_profile()?;
-        evm_env.cfg_env.enable_eip7851 = self.enable_eip7851;
         evm_env.cfg_env.enable_eip8151 = self.enable_eip8151;
 
         // if provided use all settings of `genesis.json`
@@ -2577,27 +2539,6 @@ mod tests {
         assert_eq!(json["endpoint"], redact_url(&fork_url));
         assert!(!json.to_string().contains("password"));
         assert!(!json.to_string().contains("secret"));
-    }
-
-    #[test]
-    fn eip7851_is_limited_to_the_ethereum_execution_profile() {
-        NodeConfig::test().enable_eip7851(true).validate_eip7851_profile().unwrap();
-        NodeConfig::test()
-            .with_networks(NetworkConfigs::with_ethereum())
-            .enable_eip7851(true)
-            .validate_eip7851_profile()
-            .unwrap();
-
-        let assert_unsupported = |config: NodeConfig, profile: &str| {
-            let err = config.enable_eip7851(true).validate_eip7851_profile().unwrap_err();
-            assert!(err.to_string().contains(profile), "unexpected error: {err}");
-        };
-        assert_unsupported(NodeConfig::test_tempo(), "tempo");
-        assert_unsupported(NodeConfig::test().with_networks(NetworkConfigs::with_celo()), "celo");
-        #[cfg(feature = "optimism")]
-        assert_unsupported(NodeConfig::test().with_optimism(), "optimism");
-        #[cfg(feature = "monad")]
-        assert_unsupported(NodeConfig::test_monad(), "monad");
     }
 
     #[test]
